@@ -40,7 +40,10 @@ Accurate absolute quantification of pathogens is critical for:
 
 ## 🚀 Quick Start
 
-### Install locally:
+### Try it now (no installation):
+**[Launch Web App](https://mak2-plus.streamlit.app)**
+
+### Or install locally:
 ```bash
 # Clone repository
 git clone https://github.com/gboggy2/MAK2-plus.git
@@ -246,3 +249,14 @@ Email gjboggy@gmail.com with subject "MAK2+ Collaboration"
 ---
 
 *Making precision diagnostics accessible to every laboratory, everywhere.* 🌍
+
+## 🔓 Open Source Commitment
+
+MAK2+ is fully open source under the MIT License. We believe in:
+- Transparent methods (inspect the code!)
+- Community contributions (submit PRs!)
+- Scientific reproducibility (verify our approach!)
+- Global health equity (free for everyone!)
+
+⚠️ **Note:** This is early-stage software under active development. 
+Bugs are expected. Contributions welcome!

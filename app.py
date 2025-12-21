@@ -75,7 +75,7 @@ if not check_password():
 # MAIN APP (only runs if password is correct)
 # ============================================================================
 
-st.title("🧬 qPCR Model Fitting with MAK2")
+st.title("🧬 qPCR Model Fitting with MAK2+")
 st.markdown("""
 This tool fits the MAK2 mechanistic model to qPCR data, including primer depletion effects.
 
