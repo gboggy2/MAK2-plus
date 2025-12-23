@@ -179,7 +179,7 @@ class MAK2Optimizer:
                     # Convert scalar F_bg_estimate to dict format
                     F_bg_est = {
                         'intercept': F_bg_estimate_scalar,
-                        'SE_intercept': F_bg_estimate_scalar * 0.05,  # 5% uncertainty
+                        'SE_intercept': abs(F_bg_estimate_scalar) * 0.05,  # 5% uncertainty (use abs!)
                         'slope': 0.0,
                         'SE_slope': 0.001
                     }
@@ -209,12 +209,25 @@ class MAK2Optimizer:
                     }
                 
                 # Set default bounds (old method)
+                # For P0: estimate from maximum fluorescence
+                # At plateau: F_max ≈ D0 + P0 + F_bg
+                # Since D0 << P0 typically: P0 ≈ F_max - F_bg
+                F_max = np.max(fluorescence_fit)
+                F_bg_estimate_at_plateau = F_bg_est['intercept'] + F_bg_est['slope'] * len(fluorescence_fit)
+                P0_estimate = F_max - F_bg_estimate_at_plateau
+                
+                # Set bounds with reasonable margin
+                # Lower: allow 10% of estimate (primer could be in excess)
+                # Upper: allow 3x estimate (some primer depletion possible)
+                P0_lower = max(0.05, P0_estimate * 0.1)
+                P0_upper = max(P0_estimate * 3.0, 10.0)
+                
                 default_bounds = {
                     'D0': (D0_lower, D0_upper),
                     'k': (1e-4, 10.0),
-                    'P0': (0.5, 100.0),
+                    'P0': (P0_lower, P0_upper),  # Data-driven bounds!
                     'F_bg_intercept': (
-                        max(0, F_bg_est['intercept'] - 3*F_bg_est['SE_intercept']),
+                        F_bg_est['intercept'] - 3*F_bg_est['SE_intercept'],  # Allow negative
                         F_bg_est['intercept'] + 3*F_bg_est['SE_intercept']
                     ),
                     'F_bg_slope': (
@@ -222,6 +235,13 @@ class MAK2Optimizer:
                         F_bg_est['slope'] + 5*F_bg_est['SE_slope']
                     )
                 }
+                
+                if verbose:
+                    print(f"\nP0 bounds from data:")
+                    print(f"  F_max: {F_max:.4f}")
+                    print(f"  F_bg (at plateau): {F_bg_estimate_at_plateau:.4f}")
+                    print(f"  P0 estimate: {P0_estimate:.4f}")
+                    print(f"  P0 bounds: [{P0_lower:.4f}, {P0_upper:.4f}]")
                 
                 # Update with any user-provided bounds
                 default_bounds.update(bounds)
@@ -234,18 +254,36 @@ class MAK2Optimizer:
             if 'k' not in bounds:
                 bounds['k'] = (1e-4, 10.0)
             if 'P0' not in bounds:
-                bounds['P0'] = (0.5, 100.0)
+                # Set P0 bounds from maximum fluorescence
+                F_max = np.max(fluorescence_fit)
+                F_min = np.min(fluorescence_fit)
+                # Rough estimate: P0 ≈ F_max - F_min (assuming F_bg ≈ F_min)
+                P0_estimate = F_max - F_min
+                P0_lower = max(0.05, P0_estimate * 0.1)
+                P0_upper = max(P0_estimate * 3.0, 10.0)
+                bounds['P0'] = (P0_lower, P0_upper)
             if 'F_bg_intercept' not in bounds:
                 F_min = np.min(fluorescence_fit)
                 F_max = np.max(fluorescence_fit)
                 F_range = F_max - F_min
-                bounds['F_bg_intercept'] = (max(0, F_min - 0.1*F_range), F_min + 0.1*F_range)
+                bounds['F_bg_intercept'] = (F_min - 0.1*F_range, F_min + 0.1*F_range)  # Allow negative
             if 'F_bg_slope' not in bounds:
                 bounds['F_bg_slope'] = (-0.001, 0.001)
         
         if verbose:
             print(f"\n=== MAK2 Model Fitting ===")
             print(f"Target R²: ≥ {r2_threshold}")
+        
+        # Increase attempts for low-template wells (wide D0 bounds)
+        # These are harder to fit due to poor exponential estimates
+        D0_range_log = np.log10(bounds['D0'][1]) - np.log10(bounds['D0'][0])
+        if D0_range_log > 5:  # Very wide bounds (>100,000x range)
+            max_attempts = max(max_attempts, 10)  # At least 10 attempts
+            if verbose:
+                print(f"  Wide D0 bounds detected ({D0_range_log:.1f} orders of magnitude)")
+                print(f"  Increasing attempts to {max_attempts} for better coverage")
+        
+        if verbose:
             print(f"Max attempts: {max_attempts}")
         
         # Adaptive multi-start optimization with bounds adjustment
@@ -349,8 +387,12 @@ class MAK2Optimizer:
                         continue
                 
                 # If SSR is high and k is small, likely stuck in local minimum
-                # Try increasing k lower bound to force larger k values
-                if ssr_too_high and params['k'] < bounds['k'][1] * 0.1 and n_bounds_adjustments < max_bounds_adjustments:
+                # BUT: For low-template wells (wide D0 bounds), k SHOULD be small!
+                # Don't increase k bounds if D0 bounds span >5 orders of magnitude
+                D0_range_log = np.log10(bounds['D0'][1]) - np.log10(bounds['D0'][0])
+                is_low_template = D0_range_log > 5  # >100,000x range
+                
+                if ssr_too_high and params['k'] < bounds['k'][1] * 0.1 and n_bounds_adjustments < max_bounds_adjustments and not is_low_template:
                     if verbose:
                         print(f"    ⚠ High SSR + small k → Likely local minimum")
                         print(f"    → Increasing k lower bound to escape")
@@ -447,25 +489,62 @@ class MAK2Optimizer:
         ssr_threshold = 0.01 * (F_range ** 2)
         
         if ssr > ssr_threshold and 'retry_attempted' not in locals():
+            # Check if this is a low-template well (wide D0 bounds)
+            D0_range_log = np.log10(bounds['D0'][1]) - np.log10(bounds['D0'][0])
+            is_low_template = D0_range_log > 5  # >100,000x range (very conservative)
+            
             if verbose:
                 print(f"\n  🔄 Attempting retry with adjusted initial conditions...")
-                print(f"    - Increasing k bounds (shift upward by 5×)")
-                print(f"    - Decreasing P0 bounds (shift downward by 0.5×)")
+                if is_low_template:
+                    print(f"    - Low-template well detected (D0 range: {D0_range_log:.1f} orders)")
+                    print(f"    - Keeping k bounds narrow, adjusting D0/P0 only")
+                else:
+                    print(f"    - Increasing k bounds (shift upward by 5×)")
+                    print(f"    - Decreasing P0 bounds (shift downward by 0.5×)")
             
             # Adjust bounds to escape local minimum
-            # Increase k (local minimum often has k too small)
-            old_k_bounds = bounds['k']
-            bounds['k'] = (old_k_bounds[0] * 5, old_k_bounds[1] * 3)
-            
-            # Decrease P0 (compensate for larger k)
-            old_P0_bounds = bounds['P0']
-            bounds['P0'] = (old_P0_bounds[0] * 0.5, old_P0_bounds[1] * 0.7)
-            
-            if verbose:
-                print(f"    - Old k bounds: [{old_k_bounds[0]:.6f}, {old_k_bounds[1]:.6f}]")
-                print(f"    - New k bounds: [{bounds['k'][0]:.6f}, {bounds['k'][1]:.6f}]")
-                print(f"    - Old P0 bounds: [{old_P0_bounds[0]:.2f}, {old_P0_bounds[1]:.2f}]")
-                print(f"    - New P0 bounds: [{bounds['P0'][0]:.2f}, {bounds['P0'][1]:.2f}]")
+            if is_low_template:
+                # For low-template wells: k should be small (0.02-0.2)
+                # Don't increase k bounds, just reset to reasonable range
+                bounds['k'] = (0.001, 0.5)  # Keep k modest
+                
+                # For P0: check if this is high-plateau sample
+                # If F_max > 5, keep P0 upper bound high enough
+                if F_max > 5.0:
+                    # High plateau - keep P0 range wide
+                    P0_lower_retry = max(0.05, bounds['P0'][0] * 0.5)
+                    P0_upper_retry = max(bounds['P0'][1], F_max * 2.0)
+                    bounds['P0'] = (P0_lower_retry, P0_upper_retry)
+                else:
+                    # Low plateau - allow smaller P0 (primer in excess)
+                    bounds['P0'] = (0.05, 10.0)
+                
+                # Sample even closer to perfect doubling D0
+                old_D0_bounds = bounds['D0']
+                log_D0_lower = np.log10(old_D0_bounds[0])
+                D0_range = np.log10(old_D0_bounds[1]) - log_D0_lower
+                # Sample from lower 10% only (even tighter than before)
+                bounds['D0'] = (old_D0_bounds[0], 10**(log_D0_lower + D0_range * 0.1))
+                
+                if verbose:
+                    print(f"    - k bounds: [0.001, 0.5]")
+                    print(f"    - P0 bounds: [0.05, 10.0] (allow small P0)")
+                    print(f"    - D0 bounds (lower 10%): [{bounds['D0'][0]:.2e}, {bounds['D0'][1]:.2e}]")
+            else:
+                # Original logic for normal wells
+                # Increase k (local minimum often has k too small)
+                old_k_bounds = bounds['k']
+                bounds['k'] = (old_k_bounds[0] * 5, old_k_bounds[1] * 3)
+                
+                # Decrease P0 (compensate for larger k)
+                old_P0_bounds = bounds['P0']
+                bounds['P0'] = (old_P0_bounds[0] * 0.5, old_P0_bounds[1] * 0.7)
+                
+                if verbose:
+                    print(f"    - Old k bounds: [{old_k_bounds[0]:.6f}, {old_k_bounds[1]:.6f}]")
+                    print(f"    - New k bounds: [{bounds['k'][0]:.6f}, {bounds['k'][1]:.6f}]")
+                    print(f"    - Old P0 bounds: [{old_P0_bounds[0]:.2f}, {old_P0_bounds[1]:.2f}]")
+                    print(f"    - New P0 bounds: [{bounds['P0'][0]:.2f}, {bounds['P0'][1]:.2f}]")
             
             # Mark that we've attempted retry to avoid infinite loop
             retry_attempted = True
@@ -572,10 +651,28 @@ class MAK2Optimizer:
             F_bg_slope_init = self.analytical_estimates['F_bg_slope']
         else:
             # Random initial guess within bounds
-            D0_init = 10**(np.random.uniform(
-                np.log10(bounds['D0'][0]), 
-                np.log10(bounds['D0'][1])
-            ))
+            # For D0, bias toward lower bound (perfect doubling estimate) when bounds are wide
+            D0_range_log = np.log10(bounds['D0'][1]) - np.log10(bounds['D0'][0])
+            
+            if D0_range_log > 5:  # Very wide bounds (>100,000x range)
+                # Strongly bias toward lower bound (perfect doubling)
+                # Sample from lower 25% of range in log space
+                log_D0_lower = np.log10(bounds['D0'][0])
+                log_D0_upper = log_D0_lower + D0_range_log * 0.25
+                D0_init = 10**(np.random.uniform(log_D0_lower, log_D0_upper))
+            elif D0_range_log > 3:  # Wide bounds (>1000x range)
+                # Moderately bias toward lower bound
+                # Sample from lower 50% of range in log space
+                log_D0_lower = np.log10(bounds['D0'][0])
+                log_D0_upper = log_D0_lower + D0_range_log * 0.5
+                D0_init = 10**(np.random.uniform(log_D0_lower, log_D0_upper))
+            else:  # Narrow bounds
+                # Use full range (original behavior)
+                D0_init = 10**(np.random.uniform(
+                    np.log10(bounds['D0'][0]), 
+                    np.log10(bounds['D0'][1])
+                ))
+            
             k_init = np.random.uniform(bounds['k'][0], bounds['k'][1])
             P0_init = np.random.uniform(bounds['P0'][0], bounds['P0'][1])
             F_bg_int_init = np.random.uniform(

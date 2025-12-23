@@ -1,0 +1,90 @@
+{
+  "datasets": {
+    "Boggy.csv": {
+      "display_name": "Boggy et al. - Dilution Series",
+      "description": "qPCR dilution series demonstrating MAK2 model fitting across a range of template concentrations. Six 2-fold dilution points (F1-F6) with duplicate technical replicates showing characteristic exponential amplification and plateau phases.",
+      "source": "Boggy, G.J., & Woolf, P.J. (2010). A Mechanistic Model of PCR for Accurate Quantification of Quantitative PCR Data. PLOS ONE, 5(8), e12355.",
+      "n_samples": 12,
+      "n_cycles": 40,
+      "sample_description": {
+        "F1": "Highest concentration (2^0 dilution)",
+        "F2": "2^1 dilution",
+        "F3": "2^2 dilution",
+        "F4": "2^3 dilution",
+        "F5": "2^4 dilution",
+        "F6": "2^5 dilution (lowest)"
+      },
+      "technical_replicates": 2,
+      "characteristics": [
+        "Clean amplification curves",
+        "Wide concentration range (32-fold)",
+        "Demonstrates primer depletion at high concentration",
+        "Good for testing model across dynamic range"
+      ],
+      "expected_results": "Should show decreasing D0 estimates from F1 to F6, with tight confidence intervals and R\u00b2 > 0.995 for most wells"
+    },
+    "Rutledge.csv": {
+      "display_name": "Rutledge - High-Throughput Screen",
+      "description": "Large-scale qPCR dataset with 6 concentration levels (X1-X6) and 5 experimental replicates (R1-R5), each with 4 technical replicates. **Note:** This data is background-subtracted with many zero values in early cycles. X5-X6 (low template) wells often fail fitting - this is expected and demonstrates MAK2+ behavior on challenging data.",
+      "source": "Dataset adapted from Rutledge, R.G. qPCR amplification efficiency studies",
+      "n_samples": 120,
+      "n_cycles": 45,
+      "sample_description": {
+        "X1": "Concentration level 1 (highest)",
+        "X2": "Concentration level 2",
+        "X3": "Concentration level 3",
+        "X4": "Concentration level 4",
+        "X5": "Concentration level 5",
+        "X6": "Concentration level 6 (lowest)"
+      },
+      "experimental_replicates": 5,
+      "technical_replicates": 4,
+      "characteristics": [
+        "High-throughput format (120 wells)",
+        "Multiple concentration levels",
+        "Biological + technical replication",
+        "Some wells with late/weak amplification",
+        "Tests bootstrap convergence at low signal",
+        "Background-subtracted (many zero values)",
+        "Some wells will fail - this is expected"
+      ],
+      "expected_results": "X1-X3 wells should fit well (R\u00b2 > 0.99); X4 may have mixed results; X5-X6 expected to have many failures due to very low template and extensive zero baseline"
+    },
+    "reps.csv": {
+      "display_name": "Technical Replicates Study",
+      "description": "Seven concentration levels (F1-F7) with 4 technical replicates each, designed to assess measurement precision and reproducibility across a wide dynamic range. Demonstrates coefficient of variation analysis and quality control metrics.",
+      "source": "Internal validation dataset",
+      "n_samples": 28,
+      "n_cycles": 49,
+      "sample_description": {
+        "F1": "Highest concentration",
+        "F2": "High concentration",
+        "F3": "Medium-high concentration",
+        "F4": "Medium concentration",
+        "F5": "Medium-low concentration",
+        "F6": "Low concentration",
+        "F7": "Lowest concentration"
+      },
+      "technical_replicates": 4,
+      "characteristics": [
+        "Extended cycles (49 total)",
+        "Four replicates per condition",
+        "Good for CV analysis",
+        "Tests reproducibility metrics",
+        "Wide dynamic range (7 levels)"
+      ],
+      "expected_results": "Technical replicates should show CV < 5% for D0 at high concentrations (F1-F4), increasing CV at low concentrations (F6-F7)"
+    }
+  },
+  "usage_notes": {
+    "recommended_for_new_users": "Boggy.csv",
+    "recommended_for_batch_testing": "Rutledge.csv",
+    "recommended_for_reproducibility": "reps.csv",
+    "data_format": "All CSV files with first column 'Cycles' followed by fluorescence columns",
+    "column_naming": "Format: [Sample_ID].[Replicate_Number] (e.g., F1.1, F1.2)"
+  },
+  "citation": {
+    "software": "Boggy, G. (2024). MAK2+: Open-source computational tool for absolute nucleic acid quantification. GitHub. https://github.com/gboggy2/MAK2-plus",
+    "original_model": "Boggy, G.J., & Woolf, P.J. (2010). A Mechanistic Model of PCR for Accurate Quantification of Quantitative PCR Data. PLOS ONE, 5(8), e12355. https://doi.org/10.1371/journal.pone.0012355"
+  }
+}

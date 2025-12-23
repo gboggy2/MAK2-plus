@@ -391,8 +391,22 @@ def estimate_D0_bounds(
     import numpy as np
     
     # Find baseline (median of first ~20 cycles or 25% of data)
+    # For background-subtracted data, only consider cycles above a minimum threshold
     baseline_n = min(20, max(3, len(fluorescence) // 4))
-    baseline = np.median(fluorescence[:baseline_n])
+    
+    # IMPROVED: Filter out near-zero values when computing baseline
+    # This helps with background-subtracted data
+    min_baseline_threshold = 0.001
+    baseline_values = fluorescence[:baseline_n]
+    baseline_values_filtered = baseline_values[baseline_values > min_baseline_threshold]
+    
+    if len(baseline_values_filtered) > 0:
+        baseline = np.median(baseline_values_filtered)
+        print(f"  Baseline computed from {len(baseline_values_filtered)} cycles > {min_baseline_threshold}")
+    else:
+        # Fallback to all values if nothing above threshold
+        baseline = np.median(baseline_values)
+        print(f"  Warning: No cycles above {min_baseline_threshold}, using all baseline values")
     
     # SLIDING WINDOW SLOPE DETECTION
     # Fit linear model to windows of 5 points, advance 1 point at a time
@@ -404,12 +418,18 @@ def estimate_D0_bounds(
         return (1e-4, 1.0, baseline, {})
     
     # Calculate slopes for sliding windows
+    # IMPROVED: Only calculate slopes for windows where fluorescence is above threshold
     slopes = []
     window_centers = []
+    valid_windows = []
     
     for i in range(len(fluorescence) - window_size + 1):
         window_cycles = cycles[i:i+window_size]
         window_fluor = fluorescence[i:i+window_size]
+        
+        # Skip window if average fluorescence too low (noisy baseline)
+        if np.mean(window_fluor) < min_baseline_threshold:
+            continue
         
         # Fit linear model to this window
         coeffs = np.polyfit(window_cycles, window_fluor, 1)
@@ -417,55 +437,131 @@ def estimate_D0_bounds(
         
         slopes.append(slope)
         window_centers.append(np.mean(window_cycles))
+        valid_windows.append(i)
     
-    slopes = np.array(slopes)
-    window_centers = np.array(window_centers)
+    if len(slopes) < 5:
+        print(f"  Warning: Only {len(slopes)} valid windows above threshold")
+        # Fallback: use conservative default
+        baseline_end_idx = min(baseline_n, len(cycles) // 3)
+        slopes = np.array([])
+    else:
+        slopes = np.array(slopes)
+        window_centers = np.array(window_centers)
+        valid_windows = np.array(valid_windows)
     
     # Detect significant slope change
     # Compare each slope to the median of first few slopes (baseline)
-    baseline_window_count = min(5, len(slopes) // 3)
-    baseline_slope_median = np.median(slopes[:baseline_window_count])
-    baseline_slope_std = np.std(slopes[:baseline_window_count])
-    
-    # Use 5-sigma threshold (more conservative than 3-sigma)
-    slope_threshold = baseline_slope_median + 5 * baseline_slope_std
-    
-    # Require 3 consecutive windows above threshold (sustained increase)
-    baseline_end_idx = None
-    baseline_detected = False
-    consecutive_above = 0
-    first_above_idx = None
-    
-    for i in range(baseline_window_count, len(slopes)):
-        if slopes[i] > slope_threshold:
-            if consecutive_above == 0:
-                first_above_idx = i  # Remember where this started
-            consecutive_above += 1
+    if len(slopes) > 0:
+        baseline_window_count = min(5, len(slopes) // 3)
+        baseline_slope_median = np.median(slopes[:baseline_window_count])
+        baseline_slope_std = np.std(slopes[:baseline_window_count])
+        
+        # Use 5-sigma threshold (more conservative than 3-sigma)
+        slope_threshold = baseline_slope_median + 5 * baseline_slope_std
+        
+        # IMPROVED: For strong drifting baselines, detrend the data first
+        # Fit linear trend to early cycles and subtract it
+        baseline_fluor_cycles = min(10, len(fluorescence) // 4)
+        early_cycles = cycles[:baseline_fluor_cycles]
+        early_fluor = fluorescence[:baseline_fluor_cycles]
+        
+        # Fit linear trend to early data
+        if len(early_fluor) >= 2:
+            trend_coeffs = np.polyfit(early_cycles, early_fluor, 1)
+            trend_slope = trend_coeffs[0]
+            trend_intercept = trend_coeffs[1]
             
-            if consecutive_above >= 3:
-                # Sustained slope increase detected
-                # Use the START of the first window that exceeded threshold
-                baseline_end_idx = first_above_idx
-                baseline_detected = True
-                print(f"  Sliding window slope detection:")
-                print(f"    Baseline slope: {baseline_slope_median:.6f} ± {baseline_slope_std:.6f}")
-                print(f"    Slope threshold (5σ): {slope_threshold:.6f}")
-                print(f"    Sustained slope increase: windows {first_above_idx}-{i} (3 consecutive)")
-                print(f"    Baseline ends at cycle {baseline_end_idx}")
-                break
+            # Detrend ALL fluorescence data
+            fluorescence_detrended = fluorescence - (trend_intercept + trend_slope * cycles)
+            
+            # Calculate baseline stats from detrended data
+            baseline_fluor_values = fluorescence_detrended[:baseline_fluor_cycles]
+            baseline_fluor_median = np.median(baseline_fluor_values)
+            baseline_fluor_std = np.std(baseline_fluor_values)
+            
+            # Fluorescence must be at least 5σ above baseline (more conservative for detrended)
+            fluor_threshold = baseline_fluor_median + 5 * baseline_fluor_std
         else:
-            # Reset if slope drops back below threshold
-            consecutive_above = 0
-            first_above_idx = None
-    
-    if not baseline_detected:
-        # Fallback: use conservative default
+            # Fallback: no detrending
+            baseline_fluor_values = fluorescence[:baseline_fluor_cycles]
+            baseline_fluor_median = np.median(baseline_fluor_values)
+            baseline_fluor_std = np.std(baseline_fluor_values)
+            fluor_threshold = baseline_fluor_median + 3 * baseline_fluor_std
+            fluorescence_detrended = fluorescence
+        
+        # Require 3 consecutive windows above threshold (sustained increase)
+        baseline_end_idx = None
+        baseline_detected = False
+        consecutive_above = 0
+        first_above_idx = None
+        
+        for i in range(baseline_window_count, len(slopes)):
+            # Check fluorescence level at this window (use DETRENDED fluorescence)
+            window_idx = valid_windows[i]
+            window_fluor_mean = np.mean(fluorescence_detrended[window_idx:window_idx+window_size])
+            
+            # Require BOTH conditions: slope increase AND fluorescence increase
+            slope_above = slopes[i] > slope_threshold
+            fluor_above = window_fluor_mean > fluor_threshold
+            
+            if slope_above and fluor_above:
+                if consecutive_above == 0:
+                    first_above_idx = i  # Remember where this started
+                consecutive_above += 1
+                
+                if consecutive_above >= 3:
+                    # Sustained slope increase detected
+                    # Use the START of the first window that exceeded threshold
+                    # Map back to original window index
+                    baseline_end_idx = valid_windows[first_above_idx]
+                    baseline_detected = True
+                    print(f"  Sliding window slope detection:")
+                    print(f"    Baseline slope: {baseline_slope_median:.6f} ± {baseline_slope_std:.6f}")
+                    print(f"    Slope threshold (5σ): {slope_threshold:.6f}")
+                    print(f"    Baseline fluor (detrended): {baseline_fluor_median:.4f} ± {baseline_fluor_std:.4f}")
+                    print(f"    Fluor threshold (5σ): {fluor_threshold:.4f}")
+                    print(f"    Sustained increase: windows {first_above_idx}-{i} (3 consecutive)")
+                    print(f"    Baseline ends at cycle {baseline_end_idx}")
+                    break
+            else:
+                # Reset if either condition fails
+                consecutive_above = 0
+                first_above_idx = None
+        
+        if not baseline_detected:
+            # Fallback: use conservative default
+            baseline_end_idx = min(baseline_n, len(cycles) // 3)
+            print(f"  Warning: No sustained slope change detected, using default cycle {baseline_end_idx}")
+    else:
+        # No valid slopes computed - use default
         baseline_end_idx = min(baseline_n, len(cycles) // 3)
-        print(f"  Warning: No sustained slope change detected, using default cycle {baseline_end_idx}")
+        print(f"  Warning: No valid slope windows, using default cycle {baseline_end_idx}")
     
-    # Now fit background using ALL baseline points (cycles 0 to baseline_end_idx)
-    baseline_cycles_final = cycles[:baseline_end_idx]
-    baseline_fluor_final = fluorescence[:baseline_end_idx]
+    # For background fitting, use MORE cycles than baseline_end_idx
+    # Especially for background-subtracted data, we want to fit all the near-zero noise
+    # Use cycles up to where real signal starts (first_signal_cycle if available)
+    # This gives better background estimate even with negative intercepts
+    
+    # Calculate fluorescence range first (needed for threshold calculation)
+    F_min = fluorescence.min()
+    F_max = fluorescence.max()
+    F_range = F_max - F_min
+    
+    # Find where real signal starts (will be computed later, so estimate it here)
+    min_signal_for_bg = max(0.002, F_min + 0.02 * F_range)
+    signal_start_idx = np.where(fluorescence > min_signal_for_bg)[0]
+    if len(signal_start_idx) > 0:
+        bg_fit_end_idx = min(signal_start_idx[0], len(cycles) - 1)
+        # But don't use less than baseline_end_idx
+        bg_fit_end_idx = max(bg_fit_end_idx, baseline_end_idx)
+    else:
+        bg_fit_end_idx = baseline_end_idx
+    
+    # Now fit background using ALL baseline points (cycles 0 to bg_fit_end_idx)
+    baseline_cycles_final = cycles[:bg_fit_end_idx]
+    baseline_fluor_final = fluorescence[:bg_fit_end_idx]
+    
+    print(f"  Background fitting: using cycles 0-{bg_fit_end_idx} ({len(baseline_cycles_final)} points)")
     
     # Refit background with all baseline data
     bg_coeffs = np.polyfit(baseline_cycles_final, baseline_fluor_final, 1)
@@ -488,22 +584,53 @@ def estimate_D0_bounds(
     # Standard error of intercept: σ_intercept ≈ σ_residual * sqrt(1/n + x_mean²/(n*var(x)))
     intercept_uncertainty = residual_std * np.sqrt(1/n + x_mean**2/(n * x_var)) if x_var > 0 else residual_std
     
-    # Set tight bounds: ±3σ for intercept, ±5σ for slope
-    bg_intercept_min = max(0, bg_intercept_est - 3 * intercept_uncertainty)
-    bg_intercept_max = bg_intercept_est + 3 * intercept_uncertainty
-    bg_slope_min = bg_slope_est - 5 * slope_uncertainty
-    bg_slope_max = bg_slope_est + 5 * slope_uncertainty
+    # Set bounds with margin to avoid exact boundary hits
+    # ±3σ for intercept, ±5σ for slope, plus 50% margin for safety
+    # For background-subtracted data, allow negative intercepts
+    # Wider margin (50%) prevents "WARNING: at bound!" for noisy baseline data
+    margin_factor = 1.5  # 50% wider than pure statistical bounds
+    
+    intercept_range = 3 * intercept_uncertainty * margin_factor
+    bg_intercept_min = bg_intercept_est - intercept_range
+    bg_intercept_max = bg_intercept_est + intercept_range
+    
+    slope_range = 5 * slope_uncertainty * margin_factor
+    bg_slope_min = bg_slope_est - slope_range
+    bg_slope_max = bg_slope_est + slope_range
+    
+    # Safety check: ensure bounds are valid (lower < upper)
+    # Add minimum separation if bounds are too close
+    min_separation = 1e-6
+    if bg_intercept_max - bg_intercept_min < min_separation:
+        bg_intercept_min = bg_intercept_est - min_separation / 2
+        bg_intercept_max = bg_intercept_est + min_separation / 2
+        print(f"  Warning: Intercept bounds too tight, widening to [{bg_intercept_min:.6f}, {bg_intercept_max:.6f}]")
+    
+    if bg_slope_max - bg_slope_min < min_separation:
+        bg_slope_min = bg_slope_est - min_separation / 2
+        bg_slope_max = bg_slope_est + min_separation / 2
+        print(f"  Warning: Slope bounds too tight, widening to [{bg_slope_min:.6f}, {bg_slope_max:.6f}]")
     
     print(f"  Background from baseline fit (cycles {cycles[0]:.0f}-{baseline_cycles_final[-1]:.0f}):")
     print(f"    Intercept: {bg_intercept_est:.4f} ± {intercept_uncertainty:.4f} → bounds [{bg_intercept_min:.4f}, {bg_intercept_max:.4f}]")
     print(f"    Slope: {bg_slope_est:.6f} ± {slope_uncertainty:.6f} → bounds [{bg_slope_min:.6f}, {bg_slope_max:.6f}]")
     
-    # Calculate fluorescence range
-    F_min = fluorescence.min()
-    F_max = fluorescence.max()
-    F_range = F_max - F_min
+    # Find first cycle with real signal (for information only)
+    min_signal_threshold = max(0.001, F_min + 0.01 * F_range)
+    real_signal_idx = np.where(fluorescence > min_signal_threshold)[0]
     
-    # Now fit exponentials: from cycle 0 through some cycles into exponential phase
+    if len(real_signal_idx) > 0:
+        first_signal_cycle = real_signal_idx[0]
+        print(f"  First cycle with real signal (>{min_signal_threshold:.4f}): cycle {first_signal_cycle}")
+    else:
+        first_signal_cycle = 0
+        print(f"  Warning: No cycles above threshold {min_signal_threshold:.4f}")
+    
+    # Start exponential fitting from cycle 0 for all data types
+    # The model with background fitting can handle baseline cycles
+    exp_start_cycle = 0
+    
+    # Now fit exponentials: from cycle 0 through cycles into exponential phase
     # Efficiency: up to 30% of fluorescence range
     min_points = 5
     threshold_30 = F_min + 0.30 * F_range
@@ -514,18 +641,22 @@ def estimate_D0_bounds(
     else:
         exp_end_upper = min(baseline_end_idx + 10, len(cycles) - 1)
     
-    exp_region_upper = np.arange(0, exp_end_upper + 1)
+    # Make sure we have enough range from exp_start_cycle
+    if exp_end_upper - exp_start_cycle < min_points:
+        exp_end_upper = min(exp_start_cycle + min_points + 3, len(cycles) - 1)
+    
+    exp_region_upper = np.arange(exp_start_cycle, exp_end_upper + 1)
     
     # Perfect doubling: 4 cycles BEFORE efficiency endpoint
     # This captures the early exponential phase before efficiency < 2
-    exp_end_lower = max(min_points, exp_end_upper - 4)
-    exp_region_lower = np.arange(0, exp_end_lower + 1)
+    exp_end_lower = max(exp_start_cycle + min_points, exp_end_upper - 4)
+    exp_region_lower = np.arange(exp_start_cycle, exp_end_lower + 1)
     
     # Ensure minimum points
     if len(exp_region_lower) < min_points:
-        exp_region_lower = np.arange(0, min(min_points, len(cycles)))
+        exp_region_lower = np.arange(exp_start_cycle, min(exp_start_cycle + min_points, len(cycles)))
     if len(exp_region_upper) < min_points:
-        exp_region_upper = np.arange(0, min(min_points + 3, len(cycles)))
+        exp_region_upper = np.arange(exp_start_cycle, min(exp_start_cycle + min_points + 3, len(cycles)))
     
     threshold = fluorescence[baseline_end_idx] if baseline_end_idx < len(fluorescence) else baseline
     
@@ -536,7 +667,8 @@ def estimate_D0_bounds(
     cycles_upper = cycles[exp_region_upper]
     fluor_upper = fluorescence[exp_region_upper]
     
-    # Shift cycles to start at 0 for numerical stability
+    # Shift cycles so they start at n=0 for numerical stability
+    # Always use cycles[0] as offset for consistent behavior
     cycle_offset = cycles[0]
     cycles_lower_shifted = cycles_lower - cycle_offset
     cycles_upper_shifted = cycles_upper - cycle_offset
@@ -554,8 +686,8 @@ def estimate_D0_bounds(
         D0_guess = (F_range / 100) if F_range > 0 else 1e-3
         
         # Adaptive multi-start strategy for perfect doubling fit
-        # Target R² ≥ 0.90, max 5 attempts
-        max_attempts = 5
+        # Target R² ≥ 0.90, max 10 attempts with wide range of D0 guesses
+        max_attempts = 10
         r2_threshold = 0.90
         best_r2_lower = -np.inf
         best_params_lower = None
@@ -564,10 +696,17 @@ def estimate_D0_bounds(
         
         for attempt in range(1, max_attempts + 1):
             try:
-                # Vary D0 initial guess, keep background near estimates
-                D0_init = D0_guess * (0.1 + (attempt-1) * 0.4)  # 0.1x, 0.5x, 0.9x, 1.3x, 1.7x
-                bg_int_init = bg_intercept_est + (attempt - 3) * intercept_uncertainty * 0.5
-                bg_slope_init = bg_slope_est + (attempt - 3) * slope_uncertainty * 0.5
+                # Vary D0 initial guess across wide range
+                # For late baseline samples, need very small D0 (1e-12 to 1e-15)
+                if attempt <= 5:
+                    # Normal range
+                    D0_init = D0_guess * (0.1 + (attempt-1) * 0.4)  # 0.1x, 0.5x, 0.9x, 1.3x, 1.7x
+                else:
+                    # Very small D0 for late baseline samples
+                    D0_init = D0_guess * (10 ** (-(attempt-5) * 3))  # 1e-3x, 1e-6x, 1e-9x, 1e-12x, 1e-15x
+                
+                bg_int_init = bg_intercept_est + (attempt - 5) * intercept_uncertainty * 0.5
+                bg_slope_init = bg_slope_est + (attempt - 5) * slope_uncertainty * 0.5
                 
                 params, _ = curve_fit(
                     perfect_doubling,
@@ -575,7 +714,7 @@ def estimate_D0_bounds(
                     fluor_lower,
                     p0=[D0_init, bg_int_init, bg_slope_init],
                     bounds=(
-                        [1e-12, bg_intercept_min, bg_slope_min],  # Allow D0 down to 1e-12
+                        [1e-15, bg_intercept_min, bg_slope_min],  # Lower D0 bound for numerical stability
                         [10.0, bg_intercept_max, bg_slope_max]
                     ),
                     maxfev=5000
@@ -648,7 +787,7 @@ def estimate_D0_bounds(
                     fluor_upper,
                     p0=[D0_init, E_init, bg_int_init, bg_slope_init],
                     bounds=(
-                        [1e-12, 1.0, bg_intercept_min, bg_slope_min],  # Allow D0 down to 1e-12
+                        [1e-15, 1.0, bg_intercept_min, bg_slope_min],  # Lower D0 bound for numerical stability
                         [10.0, 2.0, bg_intercept_max, bg_slope_max]
                     ),
                     maxfev=5000

@@ -17,8 +17,9 @@ from plotly.subplots import make_subplots
 
 from mak2_model import MAK2Model, find_truncation_cycle, calculate_amplification_efficiency
 from optimizer import MAK2Optimizer
-from data_processing import prepare_example_data, export_results
+from data_processing import export_results
 from bootstrap import bootstrap_parameter_uncertainty, BootstrapAnalyzer
+from example_data_loader import ExampleDataLoader
 
 # Page config
 st.set_page_config(
@@ -91,6 +92,10 @@ Based on Boggy & Woolf (2010) with extensions for primer concentration tracking.
 # Sidebar for data input
 st.sidebar.header("Data Input")
 
+# Initialize example data loader (once)
+if 'example_loader' not in st.session_state:
+    st.session_state.example_loader = ExampleDataLoader(data_dir="example_data")
+
 data_source = st.sidebar.radio(
     "Choose data source:",
     ["Example Data", "Upload File", "Manual Entry"]
@@ -102,19 +107,95 @@ all_samples = {}  # For batch processing
 batch_mode = False
 
 if data_source == "Example Data":
-    examples = prepare_example_data()
-    example_name = st.sidebar.selectbox("Select example:", list(examples.keys()))
-    data = examples[example_name]
-    cycles = data['cycles']
-    fluorescence = data['fluorescence']
+    # Get available datasets
+    display_names, filename_map = st.session_state.example_loader.create_streamlit_selector()
     
-    st.sidebar.success(f"Loaded: {example_name}")
-    st.sidebar.write("True parameters:")
-    for param, value in data['true_params'].items():
-        if isinstance(value, float) and value > 1000:
-            st.sidebar.write(f"- {param}: {value:.2e}")
+    # Create dropdown selector
+    selected_display = st.sidebar.selectbox(
+        "Select example dataset:",
+        display_names,
+        key="example_dataset_selector"
+    )
+    
+    # Get the actual filename
+    selected_filename = filename_map[selected_display]
+    
+    # Show dataset info in an expander
+    dataset_info = st.session_state.example_loader.get_dataset_info(selected_filename)
+    
+    with st.sidebar.expander("ℹ️ About this dataset", expanded=False):
+        st.markdown(f"**{dataset_info['display_name']}**")
+        st.write(dataset_info['description'])
+        
+        col1, col2 = st.sidebar.columns(2)
+        col1.metric("Samples", dataset_info['n_samples'])
+        col2.metric("Cycles", dataset_info['n_cycles'])
+        
+        if 'characteristics' in dataset_info:
+            st.write("**Characteristics:**")
+            for char in dataset_info['characteristics']:
+                st.write(f"• {char}")
+        
+        if 'expected_results' in dataset_info:
+            st.info(f"**Expected:** {dataset_info['expected_results']}")
+    
+    # Load button
+    if st.sidebar.button("📥 Load Example Data", type="primary"):
+        try:
+            # Load the dataset
+            loaded_cycles, fluorescence_df, metadata = st.session_state.example_loader.load_dataset(
+                selected_filename
+            )
+            
+            # Store in session state immediately
+            st.session_state.loaded_cycles = loaded_cycles
+            st.session_state.fluorescence_df = fluorescence_df
+            st.session_state.dataset_name = selected_display
+            st.session_state.data_loaded = True
+            
+            # Check if multiple samples (batch mode)
+            if fluorescence_df.shape[1] > 1:
+                st.session_state.batch_mode_available = True
+            else:
+                st.session_state.batch_mode_available = False
+            
+            st.sidebar.success(f"✅ Loaded {selected_display}")
+            st.rerun()
+            
+        except Exception as e:
+            st.sidebar.error(f"Error loading dataset: {str(e)}")
+    
+    # After loading, handle batch mode and sample selection
+    if st.session_state.get('data_loaded', False):
+        loaded_cycles = st.session_state.loaded_cycles
+        fluorescence_df = st.session_state.fluorescence_df
+        
+        if st.session_state.get('batch_mode_available', False):
+            st.sidebar.info(f"📊 Loaded {fluorescence_df.shape[1]} samples")
+            batch_mode = st.sidebar.checkbox("Batch fit all samples", value=True, key="example_batch_mode")
+            
+            if batch_mode:
+                # Store all samples
+                cycles = loaded_cycles
+                for col in fluorescence_df.columns:
+                    all_samples[col] = fluorescence_df[col].values
+                st.sidebar.success(f"Loaded {len(all_samples)} samples")
+                
+                # Select one to preview
+                preview_sample = st.sidebar.selectbox("Preview sample:", list(all_samples.keys()))
+                fluorescence = all_samples[preview_sample]
+            else:
+                # Single sample mode - let user select
+                sample_col = st.sidebar.selectbox("Select sample column:", fluorescence_df.columns)
+                cycles = loaded_cycles
+                fluorescence = fluorescence_df[sample_col].values
         else:
-            st.sidebar.write(f"- {param}: {value}")
+            # Single sample dataset
+            cycles = loaded_cycles
+            fluorescence = fluorescence_df.iloc[:, 0].values
+    elif data_source == "Example Data":
+        # Show instruction if no data loaded yet
+        st.sidebar.info("👆 Click 'Load Example Data' to begin")
 
 elif data_source == "Upload File":
     uploaded_file = st.sidebar.file_uploader(
@@ -1414,6 +1495,15 @@ else:
     
     **Reference:** Boggy & Woolf (2010). A Mechanistic Model of PCR for Accurate Quantification 
     of Quantitative PCR Data. PLOS ONE 5(8): e12355.
+    
+    ### Example Datasets
+    
+    **Boggy et al.** - Classic dilution series from the original MAK2 paper  
+    **Rutledge** - High-throughput screen with 120 wells  
+    **Technical Replicates** - Precision study with quad replicates
+    
+    Each dataset includes detailed metadata and expected results.  
+    [View full documentation](https://github.com/gboggy2/MAK2-plus/tree/main/example_data)
     """)
 
 # Footer
