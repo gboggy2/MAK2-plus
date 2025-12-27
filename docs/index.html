@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Precision Access Diagnostics Initiative (PADI) - Making precision molecular diagnostics accessible to every laboratory, everywhere.">
+    <title>Precision Access Diagnostics Initiative (PADI)</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background: #ffffff;
+        }
+        
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 40px 20px;
+        }
+        
+        header {
+            text-align: center;
+            padding: 60px 0 40px;
+            border-bottom: 2px solid #0066cc;
+            margin-bottom: 50px;
+        }
+        
+        h1 {
+            font-size: 2.5em;
+            color: #0066cc;
+            margin-bottom: 15px;
+            font-weight: 600;
+        }
+        
+        .acronym {
+            font-size: 1.2em;
+            color: #666;
+            font-weight: 500;
+            margin-bottom: 25px;
+        }
+        
+        .tagline {
+            font-size: 1.4em;
+            color: #444;
+            max-width: 700px;
+            margin: 0 auto;
+            line-height: 1.5;
+        }
+        
+        .mission-box {
+            background: linear-gradient(135deg, #0066cc 0%, #0052a3 100%);
+            color: white;
+            padding: 40px;
+            border-radius: 12px;
+            margin: 50px 0;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        
+        .mission-box h2 {
+            font-size: 1.8em;
+            margin-bottom: 20px;
+            font-weight: 600;
+        }
+        
+        .mission-box p {
+            font-size: 1.15em;
+            line-height: 1.7;
+        }
+        
+        .section {
+            margin: 50px 0;
+        }
+        
+        .section h2 {
+            font-size: 1.8em;
+            color: #0066cc;
+            margin-bottom: 20px;
+            font-weight: 600;
+        }
+        
+        .section p {
+            font-size: 1.1em;
+            margin-bottom: 15px;
+            line-height: 1.7;
+        }
+        
+        .project-card {
+            background: #f8f9fa;
+            padding: 30px;
+            border-radius: 10px;
+            border-left: 4px solid #0066cc;
+            margin: 20px 0;
+        }
+        
+        .project-card h3 {
+            font-size: 1.5em;
+            color: #0066cc;
+            margin-bottom: 15px;
+        }
+        
+        .project-card p {
+            margin-bottom: 10px;
+        }
+        
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin: 30px 0;
+        }
+        
+        .stat-box {
+            background: #f8f9fa;
+            padding: 25px;
+            border-radius: 8px;
+            text-align: center;
+            border-top: 3px solid #0066cc;
+        }
+        
+        .stat-number {
+            font-size: 2.5em;
+            font-weight: bold;
+            color: #0066cc;
+            display: block;
+        }
+        
+        .stat-label {
+            color: #666;
+            margin-top: 10px;
+            font-size: 0.95em;
+        }
+        
+        .cta-button {
+            display: inline-block;
+            background: #0066cc;
+            color: white;
+            padding: 15px 35px;
+            text-decoration: none;
+            border-radius: 6px;
+            font-weight: 600;
+            font-size: 1.1em;
+            transition: background 0.3s ease;
+            margin: 10px 10px 10px 0;
+        }
+        
+        .cta-button:hover {
+            background: #0052a3;
+        }
+        
+        .cta-button.secondary {
+            background: transparent;
+            border: 2px solid #0066cc;
+            color: #0066cc;
+        }
+        
+        .cta-button.secondary:hover {
+            background: #0066cc;
+            color: white;
+        }
+        
+        .contact-box {
+            background: #f8f9fa;
+            padding: 40px;
+            border-radius: 10px;
+            margin: 50px 0;
+        }
+        
+        .contact-box h2 {
+            color: #0066cc;
+            margin-bottom: 20px;
+        }
+        
+        .contact-item {
+            margin: 15px 0;
+            font-size: 1.1em;
+        }
+        
+        .contact-item strong {
+            color: #0066cc;
+            display: inline-block;
+            width: 100px;
+        }
+        
+        a {
+            color: #0066cc;
+            text-decoration: none;
+        }
+        
+        a:hover {
+            text-decoration: underline;
+        }
+        
+        footer {
+            border-top: 2px solid #e0e0e0;
+            padding-top: 30px;
+            margin-top: 60px;
+            text-align: center;
+            color: #666;
+            font-size: 0.95em;
+        }
+        
+        .status-badge {
+            display: inline-block;
+            background: #28a745;
+            color: white;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 0.9em;
+            font-weight: 600;
+            margin: 20px 0;
+        }
+        
+        @media (max-width: 768px) {
+            h1 {
+                font-size: 2em;
+            }
+            
+            .tagline {
+                font-size: 1.2em;
+            }
+            
+            .mission-box {
+                padding: 25px;
+            }
+            
+            .stats {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Precision Access Diagnostics Initiative</h1>
+            <div class="acronym">(PADI)</div>
+            <p class="tagline">Making precision molecular diagnostics accessible to every laboratory, everywhere.</p>
+            <div class="status-badge">Active Development • Q1 2026</div>
+        </header>
+
+        <div class="mission-box">
+            <h2>Our Mission</h2>
+            <p>We democratize access to precision molecular diagnostics through free, open-source computational tools, eliminating expensive hardware barriers that prevent access in resource-limited settings.</p>
+        </div>
+
+        <div class="section">
+            <h2>The Problem</h2>
+            <p>Accurate absolute quantification of pathogens is critical for disease surveillance, clinical trials, and treatment monitoring. Current gold-standard technology—Droplet Digital PCR (ddPCR)—costs $60,000-100,000 per instrument, making it inaccessible to 85% of laboratories in disease-endemic countries.</p>
+            <p><strong>The result:</strong> Most labs in resource-limited settings cannot access the precision diagnostics they need most, limiting disease surveillance and research capacity exactly where it matters.</p>
+        </div>
+
+        <div class="stats">
+            <div class="stat-box">
+                <span class="stat-number">$60,000+</span>
+                <div class="stat-label">Cost of ddPCR System</div>
+            </div>
+            <div class="stat-box">
+                <span class="stat-number">85%</span>
+                <div class="stat-label">Labs Without Access</div>
+            </div>
+            <div class="stat-box">
+                <span class="stat-number">$0</span>
+                <div class="stat-label">Cost of Our Solution</div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>Our Solution</h2>
+            <div class="project-card">
+                <h3>MAK2+ Absolute Quantification Tool</h3>
+                <p><strong>Replace $60,000 hardware with free software</strong></p>
+                <p>MAK2+ provides ddPCR-equivalent absolute quantification using standard qPCR instruments already available in most laboratories. Using mechanistic kinetic modeling of the PCR amplification process, MAK2+ eliminates the need for expensive specialized equipment while maintaining diagnostic accuracy.</p>
+                <p><strong>Key Features:</strong></p>
+                <ul style="margin-left: 20px; margin-top: 10px;">
+                    <li>Works with any qPCR machine (no new hardware required)</li>
+                    <li>Free and open-source (MIT License)</li>
+                    <li>No standard curves needed (direct absolute quantification)</li>
+                    <li>Web-based interface (no complex installation)</li>
+                    <li>Validation study in progress (head-to-head vs ddPCR)</li>
+                </ul>
+                <div style="margin-top: 20px;">
+                    <a href="https://github.com/gboggy2/MAK2-plus" class="cta-button">View on GitHub</a>
+                    <a href="https://github.com/gboggy2/MAK2-plus#readme" class="cta-button secondary">Documentation</a>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>Current Focus</h2>
+            <p><strong>Malaria Parasitemia Quantification</strong></p>
+            <p>We are validating MAK2+ for Plasmodium quantification in collaboration with malaria research laboratories. Accurate parasite density measurement is critical for:</p>
+            <ul style="margin-left: 20px; margin-top: 10px; font-size: 1.1em; line-height: 1.7;">
+                <li>Malaria surveillance and elimination programs</li>
+                <li>Clinical trial endpoints (drug efficacy, vaccine studies)</li>
+                <li>Treatment monitoring and recrudescence detection</li>
+            </ul>
+            <p style="margin-top: 20px;"><strong>Timeline:</strong> Validation study ongoing • Publication expected Q1 2026 • Multi-country deployment planned for 2026-2027</p>
+        </div>
+
+        <div class="section">
+            <h2>Why Open Source?</h2>
+            <p>We believe precision diagnostics should be accessible to <strong>every laboratory</strong>, regardless of location or resources. By making our tools open source, we ensure:</p>
+            <ul style="margin-left: 20px; margin-top: 10px; font-size: 1.1em; line-height: 1.7;">
+                <li><strong>Transparency:</strong> Scientists can verify and improve our methods</li>
+                <li><strong>Trust:</strong> Peer-reviewed, citable, validated approaches</li>
+                <li><strong>Accessibility:</strong> Free for labs in resource-limited settings</li>
+                <li><strong>Innovation:</strong> Community contributions accelerate development</li>
+            </ul>
+        </div>
+
+        <div class="section">
+            <h2>Get Involved</h2>
+            <p><strong>We're actively seeking:</strong></p>
+            <div class="project-card">
+                <h3>Validation Partners</h3>
+                <p>Malaria research laboratories with ddPCR access for head-to-head comparison studies. Minimal time commitment, co-authorship opportunities, and contribute to global health impact.</p>
+                <p style="margin-top: 15px;"><a href="/cdn-cgi/l/email-protection#a5cccbc3cae5d5d7c0c6ccd6cccacbc4c6c6c0d6d68bcad7c29ad6d0c7cfc0c6d198f3c4c9ccc1c4d1cccacb85f5c4d7d1cbc0d7d6cdccd585eccbd4d0ccd7dc" class="cta-button">Partner With Us</a></p>
+            </div>
+            <div class="project-card">
+                <h3>Beta Testers</h3>
+                <p>Laboratories using qPCR for pathogen quantification. Test MAK2+ on your samples and provide feedback to improve the tool for the global community.</p>
+                <p style="margin-top: 15px;"><a href="https://github.com/gboggy2/MAK2-plus/issues" class="cta-button secondary">Join Beta Program</a></p>
+            </div>
+            <div class="project-card">
+                <h3>Contributors</h3>
+                <p>Software developers, computational biologists, documentation writers. Help us build better tools for global health diagnostics.</p>
+                <p style="margin-top: 15px;"><a href="https://github.com/gboggy2/MAK2-plus" class="cta-button secondary">Contribute on GitHub</a></p>
+            </div>
+        </div>
+
+        <div class="contact-box">
+            <h2>Contact Us</h2>
+            <div class="contact-item">
+                <strong>Email:</strong> <a href="/cdn-cgi/l/email-protection#86efe8e0e9c6f6f4e3e5eff5efe9e8e7e5e5e3f5f5a8e9f4e1"><span class="__cf_email__" data-cfemail="a6cfc8c0c9e6d6d4c3c5cfd5cfc9c8c7c5c5c3d5d588c9d4c1">[email&#160;protected]</span></a>
+            </div>
+            <div class="contact-item">
+                <strong>GitHub:</strong> <a href="https://github.com/gboggy2/MAK2-plus">github.com/gboggy2/MAK2-plus</a>
+            </div>
+            <div class="contact-item">
+                <strong>Founder:</strong> Gregory Boggy, Ph.D.
+            </div>
+            <p style="margin-top: 25px; font-size: 1.05em;">For collaboration inquiries, partnership opportunities, or questions about our tools, please reach out. We're always happy to connect with researchers, laboratories, and organizations committed to improving global health diagnostics.</p>
+        </div>
+
+        <footer>
+            <p><strong>Precision Access Diagnostics Initiative (PADI)</strong></p>
+            <p style="margin: 15px 0;">A nonprofit organization in formation (501(c)(3) application pending)</p>
+            <p style="margin: 15px 0;">All software released under the MIT License • Open source • Free forever</p>
+            <p style="margin-top: 25px; color: #999;">&copy; 2026 Precision Access Diagnostics Initiative</p>
+        </footer>
+    </div>
+</body>
+</html>
