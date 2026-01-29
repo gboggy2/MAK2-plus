@@ -20,6 +20,8 @@ from optimizer import MAK2Optimizer
 from data_processing import export_results
 from bootstrap import bootstrap_parameter_uncertainty, BootstrapAnalyzer
 from example_data_loader import ExampleDataLoader
+from qpcr_data_converter import load_qpcr_file, QPCRDataConverter
+from sample_selector_ui import create_sample_selector_widget
 
 # Page config
 st.set_page_config(
@@ -200,56 +202,259 @@ if data_source == "Example Data":
 elif data_source == "Upload File":
     uploaded_file = st.sidebar.file_uploader(
         "Upload CSV or Excel file",
-        type=['csv', 'xlsx', 'xls']
+        type=['csv', 'xlsx', 'xls'],
+        help="Supports various qPCR formats: simple, wide, Bio-Rad CFX, QuantStudio"
     )
+    
     if uploaded_file is not None:
-        # Clear fitted results when new file uploaded (use file_id to detect re-uploads)
-        file_id = id(uploaded_file)
-        if 'last_uploaded_file_id' not in st.session_state:
-            st.session_state['last_uploaded_file_id'] = file_id
-        elif st.session_state['last_uploaded_file_id'] != file_id:
-            st.session_state['last_uploaded_file_id'] = file_id
-            # Clear all previous results
-            if 'fitted_params' in st.session_state:
-                del st.session_state['fitted_params']
-            if 'optimizer' in st.session_state:
-                del st.session_state['optimizer']
-            if 'bootstrap_results' in st.session_state:
-                del st.session_state['bootstrap_results']
-            if 'batch_results' in st.session_state:
-                del st.session_state['batch_results']
+        # Clear fitted results when new file uploaded (use name+size to detect re-uploads)
+        # Note: id(uploaded_file) changes on every rerun, so we use name+size instead
+        file_key = f"{uploaded_file.name}_{uploaded_file.size}"
+        if 'last_uploaded_file_key' not in st.session_state:
+            st.session_state['last_uploaded_file_key'] = file_key
+        elif st.session_state['last_uploaded_file_key'] != file_key:
+            st.session_state['last_uploaded_file_key'] = file_key
+            # Clear all previous results for the new file
+            for key in ['fitted_params', 'optimizer', 'bootstrap_results', 'batch_results',
+                       'uploaded_cycles', 'uploaded_samples', 'uploaded_metadata',
+                       'selected_target', 'target_confirmed']:
+                if key in st.session_state:
+                    del st.session_state[key]
         
-        if uploaded_file.name.endswith('.csv'):
-            df = pd.read_csv(uploaded_file)
-        else:
-            df = pd.read_excel(uploaded_file)
-        
-        # Check if multiple columns (batch mode)
-        if df.shape[1] > 2:
-            st.sidebar.info(f"📊 Detected {df.shape[1]-1} samples")
-            batch_mode = st.sidebar.checkbox("Batch fit all samples", value=True)
-            
-            if batch_mode:
-                # Store all samples
-                cycles = df.iloc[:, 0].values
-                for col in df.columns[1:]:
-                    all_samples[col] = df[col].values
-                st.sidebar.success(f"Loaded {len(all_samples)} samples with {len(cycles)} cycles each")
+        # Process file with enhanced converter on first load
+        if 'uploaded_cycles' not in st.session_state:
+            try:
+                with st.sidebar.status("📂 Processing file...", expanded=True) as status:
+                    st.write("Reading file...")
+                    
+                    # Use enhanced converter
+                    converter = QPCRDataConverter(add_offset=True, offset_value=1e-5)
+                    loaded_cycles, loaded_samples, metadata = converter.load_from_file(uploaded_file)
+                    
+                    st.write(f"✅ Detected format: **{metadata['format']}**")
+                    st.write(f"✅ Loaded {metadata['n_samples']} samples")
+                    st.write(f"✅ {metadata['n_cycles']} cycles per sample")
+                    
+                    # Store in session state
+                    st.session_state.uploaded_cycles = loaded_cycles
+                    st.session_state.uploaded_samples = loaded_samples
+                    st.session_state.uploaded_metadata = metadata
+                    
+                    status.update(label="✅ File processed!", state="complete")
                 
-                # Select one to preview
-                preview_sample = st.sidebar.selectbox("Preview sample:", list(all_samples.keys()))
-                fluorescence = all_samples[preview_sample]
-            else:
-                # Single sample mode - let user select
-                sample_col = st.sidebar.selectbox("Select sample column:", df.columns[1:])
-                cycles = df.iloc[:, 0].values
-                fluorescence = df[sample_col].values
-        else:
-            # Single sample file
-            cycles = df.iloc[:, 0].values
-            fluorescence = df.iloc[:, 1].values
+            except Exception as e:
+                st.sidebar.error(f"Error loading file: {str(e)}")
+                st.sidebar.info("💡 Expected format: First column = cycles, other columns = samples")
+                import traceback
+                with st.sidebar.expander("🔍 Error Details"):
+                    st.code(traceback.format_exc())
         
-        st.sidebar.success(f"Loaded {len(cycles)} data points")
+        # After loading, show sample selector in main area
+        if 'uploaded_cycles' in st.session_state:
+            loaded_cycles = st.session_state.uploaded_cycles
+            loaded_samples = st.session_state.uploaded_samples
+            metadata = st.session_state.uploaded_metadata
+            
+            # DEBUG: Show what we loaded
+            st.sidebar.write("🔍 DEBUG:")
+            st.sidebar.write(f"- Cycles: {len(loaded_cycles) if loaded_cycles is not None else 'None'}")
+            st.sidebar.write(f"- Samples dict: {len(loaded_samples) if isinstance(loaded_samples, dict) else 'Not a dict'}")
+            st.sidebar.write(f"- Metadata n_samples: {metadata.get('n_samples', 'Missing')}")
+            
+            # Check if we need target selection first
+            if metadata.get('requires_target_selection', False) and 'selected_target' not in st.session_state:
+                # Show target selector
+                st.markdown("## 🎯 Select Target to Analyze")
+                st.info(f"📊 This file contains **multiplexed qPCR data** with multiple targets per well")
+                
+                extra_info = metadata['extra_info']
+                targets = extra_info['targets']
+                
+                st.markdown("### Available Targets")
+                
+                # Show target info
+                target_counts = {}
+                raw_df = extra_info['raw_df']
+                for target in targets:
+                    count = raw_df[raw_df['Target'] == target]['Well_Position'].nunique()
+                    target_counts[target] = count
+                
+                # Display as table
+                target_df = pd.DataFrame({
+                    'Target Name': targets,
+                    'Wells': [target_counts[t] for t in targets]
+                })
+                st.dataframe(target_df, use_container_width=True)
+                
+                # Selection with auto-trigger on change
+                st.markdown("### Choose Target")
+                
+                def on_target_change():
+                    """Callback when target selection changes"""
+                    target = st.session_state.target_selectbox
+                    st.session_state.target_confirmed = False  # Reset confirmation
+                
+                selected_target = st.selectbox(
+                    "Select which target/gene to analyze:",
+                    targets,
+                    key="target_selectbox",
+                    on_change=on_target_change,
+                    help="Choose the target gene you want to fit with MAK2+"
+                )
+                
+                col1, col2, col3 = st.columns([1, 2, 1])
+                with col2:
+                    # Use a separate button that just sets a flag
+                    if st.button("📥 Load Samples for This Target", type="primary", use_container_width=True, key="load_target_btn"):
+                        st.session_state.target_confirmed = True
+                
+                # Check if we should process (outside the button callback)
+                if st.session_state.get('target_confirmed', False):
+                    try:
+                        # Filter data by target
+                        with st.spinner(f"Loading {selected_target} data..."):
+                            converter = QPCRDataConverter(add_offset=True, offset_value=1e-5)
+                            filtered_cycles, filtered_samples = converter.filter_by_target(extra_info, selected_target)
+                            
+                            # Update session state with filtered data
+                            st.session_state.selected_target = selected_target
+                            st.session_state.uploaded_cycles = filtered_cycles
+                            st.session_state.uploaded_samples = filtered_samples
+                            
+                            # Create new metadata without extra_info (no longer needed)
+                            st.session_state.uploaded_metadata = {
+                                'format': metadata['format'],
+                                'n_samples': len(filtered_samples),
+                                'n_cycles': len(filtered_cycles),
+                                'sample_names': list(filtered_samples.keys()),
+                                'cycle_range': (filtered_cycles.min(), filtered_cycles.max()),
+                                'requires_target_selection': False
+                            }
+                            
+                            # Clear the confirmation flag
+                            st.session_state.target_confirmed = False
+                            
+                            st.success(f"✅ Loaded {len(filtered_samples)} samples for {selected_target}")
+                            st.rerun()
+                    except Exception as e:
+                        st.error(f"Error filtering target: {e}")
+                        import traceback
+                        st.code(traceback.format_exc())
+                        st.session_state.target_confirmed = False
+                
+                # Don't proceed further until target is selected
+                st.stop()
+            
+            # Show file info in sidebar
+            target_label = f" ({st.session_state.get('selected_target', 'all')})" if 'selected_target' in st.session_state else ""
+            st.sidebar.success(f"✅ {metadata['n_samples']} samples loaded{target_label}")
+            with st.sidebar.expander("📋 File Details"):
+                st.write(f"**Format:** {metadata['format']}")
+                st.write(f"**Cycles:** {metadata['n_cycles']}")
+                st.write(f"**Cycle range:** {metadata['cycle_range'][0]} - {metadata['cycle_range'][1]}")
+                if 'selected_target' in st.session_state:
+                    st.write(f"**Target:** {st.session_state.selected_target}")
+                
+                # Debug info
+                with st.expander("🔍 Debug Info"):
+                    st.write(f"loaded_samples dict size: {len(loaded_samples)}")
+                    st.write(f"metadata n_samples: {metadata['n_samples']}")
+                    st.write(f"requires_target_selection: {metadata.get('requires_target_selection', 'N/A')}")
+                    if len(loaded_samples) > 0:
+                        st.write(f"Sample names: {list(loaded_samples.keys())[:5]}")
+            
+            # Show sample selector in main area if no data fitted yet
+            if cycles is None or fluorescence is None:
+                # Check if we have samples loaded
+                if len(loaded_samples) == 0:
+                    st.warning("⚠️ No samples loaded. Please select a target first.")
+                    st.info("👆 Use the sidebar to upload a file and select a target")
+                else:
+                    st.markdown("## 📂 Select Samples to Analyze")
+                    st.info(f"📊 Loaded **{metadata['n_samples']} samples** from `{uploaded_file.name}`")
+                    
+                    # Create sample selector interface
+                    from sample_selector_ui import SampleSelector
+                    selector = SampleSelector(loaded_cycles, loaded_samples)
+                    
+                    # Show full interface
+                    mode_key, selected_samples = selector.create_full_interface(
+                        key_prefix="upload",
+                        show_preview=True
+                    )
+                    
+                    # Add "Ready to Fit" button
+                    if selected_samples:
+                        st.markdown("---")
+                        col1, col2, col3 = st.columns([1, 2, 1])
+                        with col2:
+                            if st.button("🚀 Ready to Fit Selected Samples", type="primary", use_container_width=True):
+                                # Store selected samples for fitting
+                                if mode_key == "batch":
+                                    # Batch mode
+                                    cycles = loaded_cycles
+                                    batch_mode = True
+                                    all_samples = {name: loaded_samples[name] for name in selected_samples}
+                                    # Set first sample as preview
+                                    fluorescence = loaded_samples[selected_samples[0]]
+                                    st.session_state.upload_ready_batch = True
+                                    st.session_state.upload_batch_samples = all_samples
+                                    st.session_state.upload_preview_sample = selected_samples[0]
+                                else:
+                                    # Single mode
+                                    cycles = loaded_cycles
+                                    fluorescence = loaded_samples[selected_samples[0]]
+                                    batch_mode = False
+                                    st.session_state.upload_ready_single = True
+                                
+                                st.session_state.upload_cycles = cycles
+                                st.session_state.upload_fluorescence = fluorescence
+                                st.session_state.upload_batch_mode = batch_mode
+                                st.rerun()
+            
+            # If already ready to fit, load from session state
+            if st.session_state.get('upload_ready_batch', False):
+                cycles = st.session_state.upload_cycles
+                all_samples = st.session_state.upload_batch_samples
+                batch_mode = True
+                preview_sample_name = st.session_state.get('upload_preview_sample')
+                fluorescence = all_samples[preview_sample_name]
+
+                # Show info in sidebar
+                st.sidebar.info(f"🎯 Ready to fit {len(all_samples)} samples (batch mode)")
+                # Allow changing preview sample
+                preview_sample_name = st.sidebar.selectbox(
+                    "Preview sample:",
+                    list(all_samples.keys()),
+                    index=list(all_samples.keys()).index(preview_sample_name) if preview_sample_name in all_samples else 0
+                )
+                fluorescence = all_samples[preview_sample_name]
+                st.session_state.upload_preview_sample = preview_sample_name
+
+                # Button to change selection/mode
+                if st.sidebar.button("↩️ Change Selection", key="change_selection_batch"):
+                    for key in ['upload_ready_batch', 'upload_ready_single', 'upload_batch_samples',
+                               'upload_preview_sample', 'upload_cycles', 'upload_fluorescence',
+                               'upload_batch_mode', 'fitted_params', 'optimizer', 'batch_results']:
+                        if key in st.session_state:
+                            del st.session_state[key]
+                    st.rerun()
+
+            elif st.session_state.get('upload_ready_single', False):
+                cycles = st.session_state.upload_cycles
+                fluorescence = st.session_state.upload_fluorescence
+                batch_mode = False
+
+                st.sidebar.success("🎯 Ready to fit single sample")
+
+                # Button to change selection/mode
+                if st.sidebar.button("↩️ Change Selection", key="change_selection_single"):
+                    for key in ['upload_ready_batch', 'upload_ready_single', 'upload_batch_samples',
+                               'upload_preview_sample', 'upload_cycles', 'upload_fluorescence',
+                               'upload_batch_mode', 'fitted_params', 'optimizer', 'batch_results']:
+                        if key in st.session_state:
+                            del st.session_state[key]
+                    st.rerun()
 
 elif data_source == "Manual Entry":
     manual_input = st.sidebar.text_area(
