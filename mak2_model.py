@@ -318,7 +318,7 @@ def find_slope_threshold_cycle(
         return len(fluorescence) - 1
 
     # Calculate first derivative using 5-point stencil formula
-    # f'[i] = (-f[i-2] + 8*f[i-1] - 8*f[i+1] + f[i+2]) / 12
+    # f'[i] = (f[i-2] - 8*f[i-1] + 8*f[i+1] - f[i+2]) / 12
     f = fluorescence
     n = len(f)
     f1 = np.zeros(n)
@@ -327,7 +327,7 @@ def find_slope_threshold_cycle(
     # f1[1] = 0 (boundary)
     # Calculate for interior points (i = 2 to n-3)
     for i in range(2, n - 2):
-        f1[i] = (-f[i-2] + 8*f[i-1] - 8*f[i+1] + f[i+2]) / 12.0
+        f1[i] = (f[i-2] - 8*f[i-1] + 8*f[i+1] - f[i+2]) / 12.0
     # f1[n-2] = 0 (boundary)
     # f1[n-1] = 0 (boundary)
 

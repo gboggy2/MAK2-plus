@@ -84,7 +84,7 @@ This tool fits the MAK2 mechanistic model to qPCR data, including primer depleti
 
 **Two Smart Truncation Methods:**
 - **Fluorescence threshold**: Truncate at % of max fluorescence (default: 85%)
-- **Slope threshold**: Truncate when growth rate drops to % of max slope (default: 10%)
+- **Slope threshold**: Truncate at max derivative + N cycles (default: 5 cycles)
 
 Both avoid deep plateau artifacts (enzyme degradation, dNTP depletion) not modeled by primer depletion.
 
@@ -653,11 +653,12 @@ if cycles is not None and fluorescence is not None:
         truncation_method = st.sidebar.radio(
             "Truncation method:",
             ["fluorescence", "slope"],
+            index=1,  # Default to slope method
             format_func=lambda x: {
                 "fluorescence": "Fluorescence threshold (% of max)",
-                "slope": "Slope threshold (% of max slope)"
+                "slope": "Slope threshold (max derivative + cycles)"
             }[x],
-            help="Fluorescence: truncate at % of max signal\nSlope: truncate when growth rate drops"
+            help="Fluorescence: truncate at % of max signal\nSlope: truncate at max derivative + N cycles"
         )
         
         if truncation_method == "fluorescence":
@@ -1202,7 +1203,7 @@ if cycles is not None and fluorescence is not None:
                         threshold_label = f"Max slope + {cycles_after_max} cycles"
                     else:
                         threshold_label = f"{max_slope_pct:.0f}% Max Slope"
-                
+
                 threshold_cycle_num = cycles[min(threshold_idx, len(cycles)-1)]
                 threshold_F = fluorescence[min(threshold_idx, len(cycles)-1)]
                 
