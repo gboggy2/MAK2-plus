@@ -281,58 +281,92 @@ def find_fluorescence_threshold_cycle(
 
 def find_slope_threshold_cycle(
     fluorescence: np.ndarray,
-    slope_pct: float = 10.0
+    slope_pct: float = None,
+    cycles_after_max: int = 5
 ) -> int:
     """
-    Find the cycle where slope drops below a percentage of maximum slope.
-    
-    This detects when amplification efficiency decreases significantly,
-    indicating transition into plateau phase. Looks for where the slope
-    first drops below the threshold AFTER reaching maximum slope.
-    
+    Find the cutoff cycle based on the maximum slope (first derivative).
+
+    By default, returns the cycle at maximum slope + cycles_after_max.
+    If slope_pct is provided (not None), falls back to the old behavior
+    of finding where slope drops below a percentage of maximum slope.
+
+    Uses a 5-point stencil formula for first derivative calculation:
+    f'[i] = (-f[i-2] + 8*f[i-1] - 8*f[i+1] + f[i+2]) / 12h
+    where h=1 for unit spacing. This provides better noise resistance
+    than simple finite differences.
+
     Parameters
     ----------
     fluorescence : np.ndarray
         Fluorescence values at each cycle
-    slope_pct : float
-        Percentage of maximum slope (default: 10.0%)
-        
+    slope_pct : float, optional
+        If provided, finds where slope drops below this percentage of maximum slope.
+        If None (default), uses cycles_after_max instead.
+    cycles_after_max : int
+        Number of cycles after maximum slope to use as cutoff (default: 5)
+        Only used when slope_pct is None.
+
     Returns
     -------
     threshold_cycle : int
-        First cycle (after max slope) where slope drops below threshold
+        Cutoff cycle index
         Returns last cycle if threshold never reached
     """
-    if len(fluorescence) < 2:
+    if len(fluorescence) < 5:
+        # Need at least 5 points for 5-point stencil
         return len(fluorescence) - 1
-    
-    # Calculate slope (first derivative)
-    slope = np.diff(fluorescence)
-    
-    if len(slope) == 0:
+
+    # Calculate first derivative using 5-point stencil formula
+    # f'[i] = (-f[i-2] + 8*f[i-1] - 8*f[i+1] + f[i+2]) / 12
+    f = fluorescence
+    n = len(f)
+    f1 = np.zeros(n)
+
+    # f1[0] = 0 (boundary)
+    # f1[1] = 0 (boundary)
+    # Calculate for interior points (i = 2 to n-3)
+    for i in range(2, n - 2):
+        f1[i] = (-f[i-2] + 8*f[i-1] - 8*f[i+1] + f[i+2]) / 12.0
+    # f1[n-2] = 0 (boundary)
+    # f1[n-1] = 0 (boundary)
+
+    slope = f1
+
+    # Find maximum slope and its position (only search interior points)
+    # Exclude boundary points where slope is set to 0
+    interior_slope = slope[2:-2]
+    if len(interior_slope) == 0:
         return len(fluorescence) - 1
-    
-    # Find maximum slope and its position
-    max_slope_idx = np.argmax(slope)
+
+    max_slope_idx = np.argmax(interior_slope) + 2  # +2 to account for offset
     max_slope = slope[max_slope_idx]
-    
+
     if max_slope <= 0:
         return len(fluorescence) - 1
-    
+
+    # Default behavior: return max slope cycle + cycles_after_max
+    if slope_pct is None:
+        cutoff_idx = max_slope_idx + cycles_after_max
+        # Ensure we don't exceed bounds
+        result = min(cutoff_idx, len(fluorescence) - 1)
+        return result
+
+    # Legacy behavior: find where slope drops below percentage threshold
     # Calculate threshold
     threshold_value = (slope_pct / 100.0) * max_slope
-    
+
     # Find first cycle AFTER max slope where slope drops below threshold
     # and stays below for at least 2 more cycles
-    for i in range(max_slope_idx, len(slope)):
+    for i in range(max_slope_idx, n - 2):
         if slope[i] < threshold_value:
             # Check if it stays low
-            if i + 2 < len(slope):
+            if i + 2 < n:
                 if np.all(slope[i:i+3] < threshold_value):
-                    return i + 1  # +1 because diff loses one element
+                    return i
             else:
-                return i + 1
-    
+                return i
+
     return len(fluorescence) - 1
 
 

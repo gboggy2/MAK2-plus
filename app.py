@@ -670,22 +670,47 @@ if cycles is not None and fluorescence is not None:
                 help="Truncate when fluorescence reaches this % of maximum. "
                      "85% captures early plateau, 100% uses all data."
             )
-            max_slope_pct = 10.0  # Default for slope method
+            max_slope_pct = None  # Default: use cycles_after_max mode
+            cycles_after_max = 5  # Default value
         else:  # slope method
-            max_slope_pct = st.sidebar.slider(
-                "Max slope (%)",
-                min_value=5.0,
-                max_value=50.0,
-                value=10.0,
-                step=5.0,
-                help="Truncate when slope drops below this % of maximum slope. "
-                     "10% is conservative, 25% includes more plateau data."
+            # Radio button to choose slope cutoff mode
+            st.sidebar.markdown("**Slope cutoff mode:**")
+            slope_mode = st.sidebar.radio(
+                "Slope cutoff mode:",
+                options=["Cycles after max slope (default)", "Percentage of max slope"],
+                index=0,
+                label_visibility="collapsed",
+                help="Choose how to determine the cutoff cycle"
             )
+
+            if slope_mode == "Cycles after max slope (default)":
+                cycles_after_max = st.sidebar.slider(
+                    "Cycles after max slope",
+                    min_value=0,
+                    max_value=10,
+                    value=5,
+                    step=1,
+                    help="Cutoff = cycle at maximum slope + this many cycles. "
+                         "Default: 5 cycles captures plateau onset."
+                )
+                max_slope_pct = None
+            else:
+                max_slope_pct = st.sidebar.slider(
+                    "Max slope (%)",
+                    min_value=5.0,
+                    max_value=50.0,
+                    value=10.0,
+                    step=5.0,
+                    help="Truncate when slope drops below this % of maximum slope. "
+                         "10% is conservative, 25% includes more plateau data."
+                )
+                cycles_after_max = 5  # Not used, but needs to be defined
             max_fluorescence_pct = 85.0  # Default for fluorescence method
     else:
         truncation_method = "fluorescence"
         max_fluorescence_pct = 100.0
-        max_slope_pct = 100.0
+        max_slope_pct = None
+        cycles_after_max = 5
         st.sidebar.warning("⚠️ Using all data may include non-primer plateau effects")
     
     if not auto_truncate:
@@ -818,6 +843,7 @@ if cycles is not None and fluorescence is not None:
                         truncation_method=truncation_method,
                         max_fluorescence_pct=max_fluorescence_pct,
                         max_slope_pct=max_slope_pct,
+                        cycles_after_max=cycles_after_max,
                         auto_truncate=auto_truncate,
                         truncate_cycle=truncate_cycle,
                         bounds=custom_bounds_dict,  # None for automatic, or custom dict
@@ -915,6 +941,7 @@ if cycles is not None and fluorescence is not None:
                                 truncation_method=truncation_method,
                                 max_fluorescence_pct=max_fluorescence_pct,
                                 max_slope_pct=max_slope_pct,
+                                cycles_after_max=cycles_after_max,
                                 auto_truncate=auto_truncate,
                                 truncate_cycle=truncate_cycle,
                                 bounds=informed_bounds,
@@ -1125,6 +1152,7 @@ if cycles is not None and fluorescence is not None:
                         truncation_method=truncation_method,
                         max_fluorescence_pct=max_fluorescence_pct,
                         max_slope_pct=max_slope_pct,
+                        cycles_after_max=cycles_after_max,
                         auto_truncate=auto_truncate,
                         truncate_cycle=truncate_cycle,
                         bounds=custom_bounds_dict,  # None for automatic, or custom dict
@@ -1167,9 +1195,13 @@ if cycles is not None and fluorescence is not None:
                     from mak2_model import find_slope_threshold_cycle
                     threshold_idx = find_slope_threshold_cycle(
                         fluorescence,
-                        slope_pct=max_slope_pct
+                        slope_pct=max_slope_pct,
+                        cycles_after_max=cycles_after_max
                     )
-                    threshold_label = f"{max_slope_pct:.0f}% Max Slope"
+                    if max_slope_pct is None:
+                        threshold_label = f"Max slope + {cycles_after_max} cycles"
+                    else:
+                        threshold_label = f"{max_slope_pct:.0f}% Max Slope"
                 
                 threshold_cycle_num = cycles[min(threshold_idx, len(cycles)-1)]
                 threshold_F = fluorescence[min(threshold_idx, len(cycles)-1)]

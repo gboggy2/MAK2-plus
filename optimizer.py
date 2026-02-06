@@ -56,7 +56,8 @@ class MAK2Optimizer:
         fluorescence: np.ndarray,
         truncation_method: str = 'fluorescence',
         max_fluorescence_pct: float = 85.0,
-        max_slope_pct: float = 50.0,
+        max_slope_pct: float = None,
+        cycles_after_max: int = 5,
         auto_truncate: bool = True,
         truncate_cycle: Optional[int] = None,
         bounds: Optional[Dict[str, Tuple[float, float]]] = None,
@@ -81,8 +82,11 @@ class MAK2Optimizer:
             'fluorescence' or 'slope' (default: 'fluorescence')
         max_fluorescence_pct : float
             Truncate at this % of max fluorescence (default: 85%)
-        max_slope_pct : float
-            Truncate when slope drops below this % of max (default: 50%)
+        max_slope_pct : float, optional
+            Truncate when slope drops below this % of max (default: None)
+            If None, uses cycles_after_max mode instead
+        cycles_after_max : int
+            When max_slope_pct is None, cutoff = cycle at max slope + this value (default: 5)
         auto_truncate : bool
             Apply automatic truncation (default: True)
         truncate_cycle : int, optional
@@ -126,7 +130,8 @@ class MAK2Optimizer:
             elif truncation_method == 'slope':
                 trunc_idx = find_slope_threshold_cycle(
                     fluorescence,
-                    slope_pct=max_slope_pct
+                    slope_pct=max_slope_pct,
+                    cycles_after_max=cycles_after_max
                 )
             else:
                 raise ValueError(f"Unknown truncation method: {truncation_method}")
