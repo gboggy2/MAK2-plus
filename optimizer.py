@@ -57,7 +57,7 @@ class MAK2Optimizer:
         truncation_method: str = 'fluorescence',
         max_fluorescence_pct: float = 85.0,
         max_slope_pct: float = None,
-        cycles_after_max: int = 5,
+        cycles_after_max: int = 3,
         auto_truncate: bool = True,
         truncate_cycle: Optional[int] = None,
         bounds: Optional[Dict[str, Tuple[float, float]]] = None,
@@ -86,7 +86,7 @@ class MAK2Optimizer:
             Truncate when slope drops below this % of max (default: None)
             If None, uses cycles_after_max mode instead
         cycles_after_max : int
-            When max_slope_pct is None, cutoff = cycle at max slope + this value (default: 5)
+            When max_slope_pct is None, cutoff = cycle at max slope + this value (default: 3)
         auto_truncate : bool
             Apply automatic truncation (default: True)
         truncate_cycle : int, optional

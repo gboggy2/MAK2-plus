@@ -282,7 +282,7 @@ def find_fluorescence_threshold_cycle(
 def find_slope_threshold_cycle(
     fluorescence: np.ndarray,
     slope_pct: float = None,
-    cycles_after_max: int = 5
+    cycles_after_max: int = 3
 ) -> int:
     """
     Find the cutoff cycle based on the maximum slope (first derivative).
@@ -304,7 +304,7 @@ def find_slope_threshold_cycle(
         If provided, finds where slope drops below this percentage of maximum slope.
         If None (default), uses cycles_after_max instead.
     cycles_after_max : int
-        Number of cycles after maximum slope to use as cutoff (default: 5)
+        Number of cycles after maximum slope to use as cutoff (default: 3)
         Only used when slope_pct is None.
 
     Returns

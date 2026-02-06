@@ -84,7 +84,7 @@ This tool fits the MAK2 mechanistic model to qPCR data, including primer depleti
 
 **Two Smart Truncation Methods:**
 - **Fluorescence threshold**: Truncate at % of max fluorescence (default: 85%)
-- **Slope threshold**: Truncate at max derivative + N cycles (default: 5 cycles)
+- **Slope threshold**: Truncate at max derivative + N cycles (default: 3 cycles)
 
 Both avoid deep plateau artifacts (enzyme degradation, dNTP depletion) not modeled by primer depletion.
 
@@ -672,7 +672,7 @@ if cycles is not None and fluorescence is not None:
                      "85% captures early plateau, 100% uses all data."
             )
             max_slope_pct = None  # Default: use cycles_after_max mode
-            cycles_after_max = 5  # Default value
+            cycles_after_max = 3  # Default value
         else:  # slope method
             # Radio button to choose slope cutoff mode
             st.sidebar.markdown("**Slope cutoff mode:**")
@@ -689,10 +689,10 @@ if cycles is not None and fluorescence is not None:
                     "Cycles after max slope",
                     min_value=0,
                     max_value=10,
-                    value=5,
+                    value=3,
                     step=1,
                     help="Cutoff = cycle at maximum slope + this many cycles. "
-                         "Default: 5 cycles captures plateau onset."
+                         "Default: 3 cycles captures plateau onset."
                 )
                 max_slope_pct = None
             else:
@@ -705,13 +705,13 @@ if cycles is not None and fluorescence is not None:
                     help="Truncate when slope drops below this % of maximum slope. "
                          "10% is conservative, 25% includes more plateau data."
                 )
-                cycles_after_max = 5  # Not used, but needs to be defined
+                cycles_after_max = 3  # Not used, but needs to be defined
             max_fluorescence_pct = 85.0  # Default for fluorescence method
     else:
         truncation_method = "fluorescence"
         max_fluorescence_pct = 100.0
         max_slope_pct = None
-        cycles_after_max = 5
+        cycles_after_max = 3
         st.sidebar.warning("⚠️ Using all data may include non-primer plateau effects")
     
     if not auto_truncate:
