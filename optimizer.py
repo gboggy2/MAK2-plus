@@ -606,8 +606,8 @@ class MAK2Optimizer:
                 print(f"    - SSR/(F_range²) = {ssr_ratio:.4f} (threshold: 0.01)")
                 print(f"    - Likely local minimum with poor parameters")
 
-        # Check for plateau saturation: model predicts lower plateau than actual data
-        # This indicates P0 is too low
+        # Analyze residual patterns to guide adaptive retry strategy
+        # Different residual patterns indicate different problems requiring different fixes
         if best_params is not None and best_r2 < r2_threshold:
             # Predict fluorescence for all fitted cycles
             predicted_F = self.model.simulate_to_cycle(
@@ -615,40 +615,70 @@ class MAK2Optimizer:
                 cycles_fit, best_params['F_bg_intercept'], best_params['F_bg_slope']
             )
 
-            # Find last 20% of data points (plateau region)
-            n_plateau = max(3, int(len(cycles_fit) * 0.2))
+            # Divide data into regions for residual pattern analysis
+            n_points = len(cycles_fit)
+            n_baseline = max(3, int(n_points * 0.3))  # First 30% - baseline region
+            n_plateau = max(3, int(n_points * 0.2))   # Last 20% - plateau region
+            # Middle region is exponential/elbow
+
+            baseline_data = fluorescence_fit[:n_baseline]
+            baseline_pred = predicted_F[:n_baseline]
+            baseline_residuals = baseline_data - baseline_pred
+
+            elbow_data = fluorescence_fit[n_baseline:-n_plateau]
+            elbow_pred = predicted_F[n_baseline:-n_plateau]
+            elbow_residuals = elbow_data - elbow_pred
+
             plateau_data = fluorescence_fit[-n_plateau:]
             plateau_pred = predicted_F[-n_plateau:]
-
-            # Check if model systematically undershoots plateau
-            # Focus on final data points - model saturates below them
             plateau_residuals = plateau_data - plateau_pred
+
+            # Calculate mean residuals in each region
+            mean_baseline_residual = np.mean(baseline_residuals)
+            mean_elbow_residual = np.mean(elbow_residuals) if len(elbow_residuals) > 0 else 0
             mean_plateau_residual = np.mean(plateau_residuals)
 
-            # Check final point specifically
+            # Analyze residual patterns to determine retry strategy
+            # Pattern 1: Positive baseline residuals → increase background
+            baseline_too_low = mean_baseline_residual > 0.01
+
+            # Pattern 2: Negative elbow, positive plateau → transition too late, decrease k & D0
+            late_transition = mean_elbow_residual < -0.01 and mean_plateau_residual > 0.01
+
+            # Pattern 3: Positive elbow, negative plateau → transition too early, increase k & D0
+            early_transition = mean_elbow_residual > 0.01 and mean_plateau_residual < -0.01
+
+            # Pattern 4: Positive plateau only → plateau saturation, decrease k
             final_residual = plateau_residuals[-1]
             final_2_mean = np.mean(plateau_residuals[-2:])
-
-            # Detection criteria:
-            # 1. Final residual > 0.02 (model undershoots final point significantly)
-            # 2. Mean of last 2 residuals > 0.01 (sustained undershoot at end)
-            # 3. Model plateau < data plateau (sanity check)
-            model_undershoots_final = (
+            plateau_saturation = (
                 final_residual > 0.02 and
                 final_2_mean > 0.01 and
-                plateau_pred[-1] < plateau_data[-1]
+                plateau_pred[-1] < plateau_data[-1] and
+                not baseline_too_low  # Exclude if baseline is the primary issue
             )
 
             if verbose:
-                print(f"\n  🔍 Checking plateau saturation:")
-                print(f"    - Model plateau: {plateau_pred[-1]:.4f}")
-                print(f"    - Data plateau: {plateau_data[-1]:.4f}")
-                print(f"    - Final residual: {final_residual:.4f} (threshold: >0.02)")
-                print(f"    - Mean last 2 residuals: {final_2_mean:.4f} (threshold: >0.01)")
-                print(f"    - Last 3 residuals: {plateau_residuals[-3:]}")
-                print(f"    - Undershoots final points: {model_undershoots_final}")
+                print(f"\n  🔍 Residual Pattern Analysis:")
+                print(f"    - Mean baseline residual: {mean_baseline_residual:+.4f}")
+                print(f"    - Mean elbow residual: {mean_elbow_residual:+.4f}")
+                print(f"    - Mean plateau residual: {mean_plateau_residual:+.4f}")
+                print(f"    - Final residual: {final_residual:+.4f}")
+                print(f"  Detected patterns:")
+                print(f"    - Baseline too low: {baseline_too_low}")
+                print(f"    - Late transition: {late_transition}")
+                print(f"    - Early transition: {early_transition}")
+                print(f"    - Plateau saturation: {plateau_saturation}")
 
-            if model_undershoots_final:
+            # Apply retry strategy based on dominant pattern
+            if baseline_too_low and late_transition:
+                # X6.R5.4 pattern: positive baseline + negative elbow + positive plateau
+                # Fix: increase background, decrease D0, increase k
+                if verbose:
+                    print(f"\n  🔍 BASELINE + LATE TRANSITION DETECTED:")
+                    print(f"    → Increasing background bounds")
+                    print(f"    → Decreasing D0 bounds (shift lower)")
+                    print(f"    → Increasing k bounds (shift higher)")
                 if verbose:
                     print(f"\n  🔍 PLATEAU SATURATION DETECTED:")
                     print(f"    - Model plateau: {plateau_pred[-1]:.4f}")
@@ -657,18 +687,26 @@ class MAK2Optimizer:
                     print(f"    - Model saturates BELOW final data points")
                     print(f"    → P0 is too low, increasing P0 bounds for retry")
 
-                # Retry with increased P0 and D0 bounds
-                # Higher P0 allows higher plateau, higher D0 provides more signal
-                P0_old_lower, P0_old_upper = bounds['P0']
-                D0_old_lower, D0_old_upper = bounds['D0']
+                # Retry with DECREASED k bounds, increased P0 and D0 bounds
+                # Lower k gives sharper transition and allows higher plateau
+                # IMPORTANT: Use ORIGINAL bounds, not the modified bounds from SSR retry
+                P0_old_lower, P0_old_upper = original_bounds['P0']
+                D0_old_lower, D0_old_upper = original_bounds['D0']
+                k_old_lower, k_old_upper = original_bounds['k']
 
-                # Increase P0 upper bound by 50% and D0 upper bound by 3×
+                # DECREASE k lower bound (allow lower k values, but not TOO low)
+                # If we allow k to go too low (0.02), optimizer gets stuck there
+                # Increase P0 and D0 upper bounds
+                k_new_lower = max(0.05, k_old_lower * 0.5)  # Reduce k lower bound to 50%, min 0.05
+                k_new_upper = k_old_upper  # Keep upper bound same
                 P0_new_lower = P0_old_lower
-                P0_new_upper = P0_old_upper * 1.5
+                P0_new_upper = P0_old_upper * 2.0  # Moderate increase
                 D0_new_lower = D0_old_lower
-                D0_new_upper = D0_old_upper * 3.0
+                D0_new_upper = D0_old_upper * 3.0  # Moderate increase
 
                 if verbose:
+                    print(f"    - Old k bounds: [{k_old_lower:.4f}, {k_old_upper:.4f}]")
+                    print(f"    - New k bounds: [{k_new_lower:.4f}, {k_new_upper:.4f}]")
                     print(f"    - Old P0 bounds: [{P0_old_lower:.4f}, {P0_old_upper:.4f}]")
                     print(f"    - New P0 bounds: [{P0_new_lower:.4f}, {P0_new_upper:.4f}]")
                     print(f"    - Old D0 bounds: [{D0_old_lower:.2e}, {D0_old_upper:.2e}]")
@@ -685,44 +723,48 @@ class MAK2Optimizer:
                         # This forces optimizer to explore high-P0 region
                         P0_sample = P0_new_lower + (0.7 + 0.3 * (retry_i - 1) / 2) * (P0_new_upper - P0_new_lower)
 
-                        # Sample D0 from UPPER portion of new bounds (60%-100%)
-                        # Higher D0 provides more signal to support higher plateau
+                        # Sample D0 from LOWER-MIDDLE-UPPER portion of new bounds (30%-80%)
+                        # Slightly higher D0 helps reach target plateau
                         log_D0_lower = np.log10(D0_new_lower)
                         log_D0_upper = np.log10(D0_new_upper)
-                        D0_sample = 10**(log_D0_lower + (0.6 + 0.4 * (retry_i - 1) / 2) * (log_D0_upper - log_D0_lower))
+                        D0_sample = 10**(log_D0_lower + (0.3 + 0.5 * (retry_i - 1) / 2) * (log_D0_upper - log_D0_lower))
 
-                        # For plateau saturation, we need HIGH P0 with LOW k
-                        # Lower k gives higher plateau: P0/(1+k*P0)
-                        # Sample k from LOWER portion of bounds (0%-30%)
-                        k_bounds = bounds['k']
-                        k_sample = k_bounds[0] + (0.0 + 0.3 * (retry_i - 1) / 2) * (k_bounds[1] - k_bounds[0])
+                        # For plateau saturation, we need HIGH P0 with VERY-LOW k
+                        # Lower k gives sharper transition and higher plateau: P0/(1+k*P0)
+                        # Sample k from VERY-LOW to LOW-MEDIUM portion (2%-45%)
+                        # Start very low to allow optimizer to find optimal k
+                        k_sample = k_new_lower + (0.02 + 0.43 * (retry_i - 1) / 2) * (k_new_upper - k_new_lower)
 
                         if verbose:
                             print(f"    Plateau retry {retry_i}: D0_init = {D0_sample:.2e}, k_init = {k_sample:.4f}, P0_init = {P0_sample:.4f}")
 
+                        # Use uniform weighting for first retry (most aggressive low-k exploration)
+                        # Use STRONG adaptive weighting for retries 2-3 (20×, 30×) to force plateau matching
+                        use_uniform = (retry_i == 1)
+                        weight_multiplier = 10.0 + (retry_i - 1) * 10.0  # 10×, 20×, 30×
+
                         retry_params, retry_r2 = self._fit_attempt(
                             cycles_fit,
                             fluorescence_fit,
-                            {**bounds, 'D0': (D0_new_lower, D0_new_upper), 'P0': (P0_new_lower, P0_new_upper)},
+                            {**bounds, 'k': (k_new_lower, k_new_upper), 'D0': (D0_new_lower, D0_new_upper), 'P0': (P0_new_lower, P0_new_upper)},
                             seed=1000 + retry_i,
                             lhs_D0=D0_sample,
                             lhs_k=k_sample,
-                            lhs_P0=P0_sample
+                            lhs_P0=P0_sample,
+                            use_uniform_weighting=use_uniform,
+                            plateau_weight_multiplier=weight_multiplier
                         )
 
                         if verbose:
-                            print(f"      → R² = {retry_r2:.6f}, SSR = {retry_params['ssr']:.6f}, P0_final = {retry_params['P0']:.4f}")
+                            print(f"      → R² = {retry_r2:.6f}, SSR = {retry_params['ssr']:.6f}, k_final = {retry_params['k']:.6f}, P0_final = {retry_params['P0']:.4f}")
 
                         if retry_r2 > plateau_retry_best_r2:
                             plateau_retry_best_r2 = retry_r2
                             plateau_retry_best_params = retry_params
                             plateau_retry_best_ssr = retry_params['ssr']
 
-                        # If we found a good fit, stop
-                        if retry_r2 >= 0.99:
-                            if verbose:
-                                print(f"    ✓ Plateau saturation retry succeeded: R² = {retry_r2:.6f}")
-                            break
+                        # Don't stop early - try all retries to find best k
+                        # (even if R² ≥ 0.99, a different k might be better)
 
                     except Exception as e:
                         if verbose:
@@ -734,7 +776,8 @@ class MAK2Optimizer:
                     if verbose:
                         print(f"\n  ✅ Plateau saturation retry improved fit:")
                         print(f"    Original: R² = {best_r2:.6f}, SSR = {best_params['ssr']:.6f}")
-                        print(f"    Retry:    R² = {plateau_retry_best_r2:.6f}, SSR = {plateau_retry_best_ssr:.6f}")
+                        print(f"    Best retry: R² = {plateau_retry_best_r2:.6f}, SSR = {plateau_retry_best_ssr:.6f}")
+                        print(f"    Best k = {plateau_retry_best_params['k']:.6f}, P0 = {plateau_retry_best_params['P0']:.4f}")
                     best_params = plateau_retry_best_params
                     best_r2 = plateau_retry_best_r2
                 elif verbose:
@@ -891,7 +934,9 @@ class MAK2Optimizer:
         seed: int,
         lhs_D0: Optional[float] = None,
         lhs_k: Optional[float] = None,
-        lhs_P0: Optional[float] = None
+        lhs_P0: Optional[float] = None,
+        use_uniform_weighting: bool = False,
+        plateau_weight_multiplier: float = 10.0
     ) -> Tuple[Dict[str, float], float]:
         """
         Single fitting attempt with random initial guess or LHS samples.
@@ -1059,13 +1104,17 @@ class MAK2Optimizer:
         weights = np.ones(n_points)
 
         # Use moderate fixed weighting that works well for most samples
-        # Increase from 1.0 to 10.0 over the exponential + plateau region
-        max_weight = 10.0
+        # Increase from 1.0 to max_weight over the exponential + plateau region
+        # Use plateau_weight_multiplier parameter to control emphasis
+        if use_uniform_weighting:
+            max_weight = 1.0  # No weighting, uniform across all points
+        else:
+            max_weight = plateau_weight_multiplier
 
         # Weight exponential + plateau region (from signal start to end)
         for i in range(signal_start_idx, n_points):
             progress = (i - signal_start_idx) / max(1, n_points - signal_start_idx)
-            weights[i] = 1.0 + (max_weight - 1.0) * progress  # Linear increase from 1 to 10
+            weights[i] = 1.0 + (max_weight - 1.0) * progress  # Linear increase from 1 to max_weight
 
         # Apply weights through sigma parameter (smaller sigma = higher weight)
         # sigma = 1/sqrt(weight)
