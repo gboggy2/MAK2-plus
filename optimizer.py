@@ -324,31 +324,38 @@ class MAK2Optimizer:
         # Bounds may get adjusted during attempts, but LHS should sample from original space
         original_bounds = {k: v for k, v in bounds.items()}
 
-        # Generate LHS samples for k and P0 (for attempts 2+)
+        # Generate LHS samples for D0, k, and P0 (for attempts 2+)
         # Attempt 1 uses analytical estimates, attempts 2+ use LHS
         print("🎲 GENERATING LATIN HYPERCUBE SAMPLES")
         n_lhs_samples = max_attempts - 1
         if n_lhs_samples > 0:
-            sampler = qmc.LatinHypercube(d=2, seed=42)
+            sampler = qmc.LatinHypercube(d=3, seed=42)  # 3D: D0, k, P0
             lhs_samples = sampler.random(n=n_lhs_samples)
             print(f"✅ Generated {n_lhs_samples} LHS samples")
 
-            # Scale to ORIGINAL bounds: column 0 = k, column 1 = P0
-            k_lhs = lhs_samples[:, 0] * (original_bounds['k'][1] - original_bounds['k'][0]) + original_bounds['k'][0]
-            P0_lhs = lhs_samples[:, 1] * (original_bounds['P0'][1] - original_bounds['P0'][0]) + original_bounds['P0'][0]
+            # Scale to ORIGINAL bounds in log space for D0, linear for k and P0
+            # Column 0 = D0 (log space), Column 1 = k, Column 2 = P0
+            log_D0_min = np.log10(original_bounds['D0'][0])
+            log_D0_max = np.log10(original_bounds['D0'][1])
+            D0_lhs = 10**(lhs_samples[:, 0] * (log_D0_max - log_D0_min) + log_D0_min)
+            k_lhs = lhs_samples[:, 1] * (original_bounds['k'][1] - original_bounds['k'][0]) + original_bounds['k'][0]
+            P0_lhs = lhs_samples[:, 2] * (original_bounds['P0'][1] - original_bounds['P0'][0]) + original_bounds['P0'][0]
 
-            # Override attempt 2 to explore HIGH P0 + LOW k corner
+            # Override attempt 2 to explore HIGH P0 + LOW k + UPPER D0 corner
             # This region gives maximum plateau: P0/(1+k*P0) is highest when P0 high, k low
+            # D0 should be in upper range for better signal
             if n_lhs_samples >= 1:
+                D0_lhs[0] = 10**(log_D0_min + 0.7 * (log_D0_max - log_D0_min))  # 70% into D0 range (log space)
                 k_lhs[0] = original_bounds['k'][0] + 0.1 * (original_bounds['k'][1] - original_bounds['k'][0])  # 10% into k range (low k)
                 P0_lhs[0] = original_bounds['P0'][0] + 0.85 * (original_bounds['P0'][1] - original_bounds['P0'][0])  # 85% into P0 range (high P0)
-                print(f"📍 Biased attempt 2 toward high-P0 low-k corner for maximum plateau")
+                print(f"📍 Biased attempt 2 toward high-P0 low-k upper-D0 corner for maximum plateau")
 
             if verbose:
                 print(f"\nLatin Hypercube Sampling for attempts 2-{max_attempts}:")
-                for i, (k, p0) in enumerate(zip(k_lhs, P0_lhs), start=2):
-                    print(f"  Attempt {i}: k={k:.4f}, P0={p0:.4f}")
+                for i, (d0, k, p0) in enumerate(zip(D0_lhs, k_lhs, P0_lhs), start=2):
+                    print(f"  Attempt {i}: D0={d0:.2e}, k={k:.4f}, P0={p0:.4f}")
         else:
+            D0_lhs = None
             k_lhs = None
             P0_lhs = None
 
@@ -360,19 +367,21 @@ class MAK2Optimizer:
 
         for attempt in range(1, max_attempts + 1):
             try:
-                # For attempts 2+, pass LHS samples for k and P0
+                # For attempts 2+, pass LHS samples for D0, k, and P0
+                lhs_D0 = D0_lhs[attempt - 2] if attempt > 1 and D0_lhs is not None else None
                 lhs_k = k_lhs[attempt - 2] if attempt > 1 and k_lhs is not None else None
                 lhs_P0 = P0_lhs[attempt - 2] if attempt > 1 and P0_lhs is not None else None
 
                 # Use original bounds for LHS attempts to avoid clipping LHS samples
                 # Use adjusted bounds only for attempt 1 (analytical estimates)
-                bounds_to_use = original_bounds if (lhs_k is not None or lhs_P0 is not None) else bounds
+                bounds_to_use = original_bounds if (lhs_D0 is not None or lhs_k is not None or lhs_P0 is not None) else bounds
 
                 params, r2 = self._fit_attempt(
                     cycles_fit,
                     fluorescence_fit,
                     bounds_to_use,
                     seed=attempt,
+                    lhs_D0=lhs_D0,
                     lhs_k=lhs_k,
                     lhs_P0=lhs_P0
                 )
@@ -479,16 +488,15 @@ class MAK2Optimizer:
                         continue
                 
                 # If R² is already very good (≥0.99), accept it even with minor issues
-                # Don't waste time searching for marginal improvements
+                # Continue trying remaining attempts to find the best fit
                 if r2 >= 0.99:
                     if verbose:
                         print(f"    ✓ R² = {r2:.6f} is excellent, accepting fit despite minor warnings")
-                    # Track as best and stop immediately
+                    # Track as best but continue to try remaining attempts
                     if r2 > best_r2:
                         best_r2 = r2
                         best_params = params
-                    self.n_attempts = attempt
-                    break  # Accept this fit immediately
+                    # Continue to next attempt instead of breaking
                 else:
                     # If SSR is high and k is small, likely stuck in local minimum
                     # BUT: For low-template wells (wide D0 bounds), k SHOULD be small!
@@ -504,7 +512,19 @@ class MAK2Optimizer:
                         old_k_max = bounds['k'][1]
                         # Shift k bounds upward significantly, but cap at 1.5 (unrealistic beyond this)
                         new_k_max = min(old_k_max * 2, 1.5)
-                        bounds['k'] = (old_k_min * 10, new_k_max)
+                        new_k_min = old_k_min * 10
+
+                        # Prevent inverted bounds
+                        if new_k_min >= new_k_max:
+                            # If multiplication would invert, just use moderate increase
+                            new_k_min = min(old_k_min * 2, 0.8)
+                            if new_k_min >= new_k_max:
+                                # Still inverted, give up on this adjustment
+                                if verbose:
+                                    print(f"    → Cannot increase k bounds further without inversion, skipping")
+                                continue
+
+                        bounds['k'] = (new_k_min, new_k_max)
                         if verbose:
                             print(f"    → New k bounds: [{bounds['k'][0]:.6f}, {bounds['k'][1]:.6f}]")
                         n_bounds_adjustments += 1
@@ -637,15 +657,22 @@ class MAK2Optimizer:
                     print(f"    - Model saturates BELOW final data points")
                     print(f"    → P0 is too low, increasing P0 bounds for retry")
 
-                # Retry with increased P0 bounds only
+                # Retry with increased P0 and D0 bounds
+                # Higher P0 allows higher plateau, higher D0 provides more signal
                 P0_old_lower, P0_old_upper = bounds['P0']
-                # Increase both bounds by 50% to allow higher plateau
+                D0_old_lower, D0_old_upper = bounds['D0']
+
+                # Increase P0 upper bound by 50% and D0 upper bound by 3×
                 P0_new_lower = P0_old_lower
                 P0_new_upper = P0_old_upper * 1.5
+                D0_new_lower = D0_old_lower
+                D0_new_upper = D0_old_upper * 3.0
 
                 if verbose:
                     print(f"    - Old P0 bounds: [{P0_old_lower:.4f}, {P0_old_upper:.4f}]")
                     print(f"    - New P0 bounds: [{P0_new_lower:.4f}, {P0_new_upper:.4f}]")
+                    print(f"    - Old D0 bounds: [{D0_old_lower:.2e}, {D0_old_upper:.2e}]")
+                    print(f"    - New D0 bounds: [{D0_new_lower:.2e}, {D0_new_upper:.2e}]")
 
                 # Try up to 3 attempts with higher P0
                 plateau_retry_best_ssr = np.inf
@@ -658,6 +685,12 @@ class MAK2Optimizer:
                         # This forces optimizer to explore high-P0 region
                         P0_sample = P0_new_lower + (0.7 + 0.3 * (retry_i - 1) / 2) * (P0_new_upper - P0_new_lower)
 
+                        # Sample D0 from UPPER portion of new bounds (60%-100%)
+                        # Higher D0 provides more signal to support higher plateau
+                        log_D0_lower = np.log10(D0_new_lower)
+                        log_D0_upper = np.log10(D0_new_upper)
+                        D0_sample = 10**(log_D0_lower + (0.6 + 0.4 * (retry_i - 1) / 2) * (log_D0_upper - log_D0_lower))
+
                         # For plateau saturation, we need HIGH P0 with LOW k
                         # Lower k gives higher plateau: P0/(1+k*P0)
                         # Sample k from LOWER portion of bounds (0%-30%)
@@ -665,13 +698,14 @@ class MAK2Optimizer:
                         k_sample = k_bounds[0] + (0.0 + 0.3 * (retry_i - 1) / 2) * (k_bounds[1] - k_bounds[0])
 
                         if verbose:
-                            print(f"    Plateau retry {retry_i}: P0_init = {P0_sample:.4f}, k_init = {k_sample:.4f}")
+                            print(f"    Plateau retry {retry_i}: D0_init = {D0_sample:.2e}, k_init = {k_sample:.4f}, P0_init = {P0_sample:.4f}")
 
                         retry_params, retry_r2 = self._fit_attempt(
                             cycles_fit,
                             fluorescence_fit,
-                            {**bounds, 'P0': (P0_new_lower, P0_new_upper)},
+                            {**bounds, 'D0': (D0_new_lower, D0_new_upper), 'P0': (P0_new_lower, P0_new_upper)},
                             seed=1000 + retry_i,
+                            lhs_D0=D0_sample,
                             lhs_k=k_sample,
                             lhs_P0=P0_sample
                         )
@@ -855,6 +889,7 @@ class MAK2Optimizer:
         fluorescence: np.ndarray,
         bounds: Dict[str, Tuple[float, float]],
         seed: int,
+        lhs_D0: Optional[float] = None,
         lhs_k: Optional[float] = None,
         lhs_P0: Optional[float] = None
     ) -> Tuple[Dict[str, float], float]:
@@ -944,7 +979,8 @@ class MAK2Optimizer:
                     np.log10(bounds['D0'][1])
                 ))
             
-            # Use LHS samples if provided, otherwise random
+            # Use LHS samples if provided, otherwise use the D0_init from above
+            D0_init = lhs_D0 if lhs_D0 is not None else D0_init
             k_init = lhs_k if lhs_k is not None else np.random.uniform(bounds['k'][0], bounds['k'][1])
             P0_init = lhs_P0 if lhs_P0 is not None else np.random.uniform(bounds['P0'][0], bounds['P0'][1])
             F_bg_int_init = np.random.uniform(
