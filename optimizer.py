@@ -642,20 +642,27 @@ class MAK2Optimizer:
             # Pattern 1: Positive baseline residuals → increase background
             baseline_too_low = mean_baseline_residual > 0.01
 
-            # Pattern 2: Negative elbow, positive plateau → transition too late, decrease k & D0
+            # Pattern 2: All positive residuals → systematic undershoot, likely background issue
+            # Combined with baseline being low, this suggests global shift needed
+            all_positive = (mean_baseline_residual > 0.005 and
+                           mean_elbow_residual > 0.005 and
+                           mean_plateau_residual > 0.005)
+
+            # Pattern 3: Negative elbow, positive plateau → transition too late, decrease k & D0
             late_transition = mean_elbow_residual < -0.01 and mean_plateau_residual > 0.01
 
-            # Pattern 3: Positive elbow, negative plateau → transition too early, increase k & D0
+            # Pattern 4: Positive elbow, negative plateau → transition too early, increase k & D0
             early_transition = mean_elbow_residual > 0.01 and mean_plateau_residual < -0.01
 
-            # Pattern 4: Positive plateau only → plateau saturation, decrease k
+            # Pattern 5: Positive plateau only → plateau saturation, decrease k
             final_residual = plateau_residuals[-1]
             final_2_mean = np.mean(plateau_residuals[-2:])
             plateau_saturation = (
                 final_residual > 0.02 and
                 final_2_mean > 0.01 and
                 plateau_pred[-1] < plateau_data[-1] and
-                not baseline_too_low  # Exclude if baseline is the primary issue
+                not baseline_too_low and
+                not all_positive  # Exclude if global background is the issue
             )
 
             if verbose:
@@ -666,43 +673,120 @@ class MAK2Optimizer:
                 print(f"    - Final residual: {final_residual:+.4f}")
                 print(f"  Detected patterns:")
                 print(f"    - Baseline too low: {baseline_too_low}")
+                print(f"    - All positive (global undershoot): {all_positive}")
                 print(f"    - Late transition: {late_transition}")
                 print(f"    - Early transition: {early_transition}")
                 print(f"    - Plateau saturation: {plateau_saturation}")
 
             # Apply retry strategy based on dominant pattern
-            if baseline_too_low and late_transition:
-                # X6.R5.4 pattern: positive baseline + negative elbow + positive plateau
-                # Fix: increase background, decrease D0, increase k
-                if verbose:
-                    print(f"\n  🔍 BASELINE + LATE TRANSITION DETECTED:")
-                    print(f"    → Increasing background bounds")
-                    print(f"    → Decreasing D0 bounds (shift lower)")
-                    print(f"    → Increasing k bounds (shift higher)")
-                if verbose:
-                    print(f"\n  🔍 PLATEAU SATURATION DETECTED:")
-                    print(f"    - Model plateau: {plateau_pred[-1]:.4f}")
-                    print(f"    - Data plateau: {plateau_data[-1]:.4f}")
-                    print(f"    - Mean residual: {mean_plateau_residual:.4f}")
-                    print(f"    - Model saturates BELOW final data points")
-                    print(f"    → P0 is too low, increasing P0 bounds for retry")
+            retry_needed = baseline_too_low or all_positive or late_transition or early_transition or plateau_saturation
 
-                # Retry with DECREASED k bounds, increased P0 and D0 bounds
-                # Lower k gives sharper transition and allows higher plateau
-                # IMPORTANT: Use ORIGINAL bounds, not the modified bounds from SSR retry
+            if retry_needed:
+                # Use ORIGINAL bounds, not modified bounds from SSR retry
                 P0_old_lower, P0_old_upper = original_bounds['P0']
                 D0_old_lower, D0_old_upper = original_bounds['D0']
                 k_old_lower, k_old_upper = original_bounds['k']
+                bg_int_old_lower, bg_int_old_upper = original_bounds['F_bg_intercept']
 
-                # DECREASE k lower bound (allow lower k values, but not TOO low)
-                # If we allow k to go too low (0.02), optimizer gets stuck there
-                # Increase P0 and D0 upper bounds
-                k_new_lower = max(0.05, k_old_lower * 0.5)  # Reduce k lower bound to 50%, min 0.05
-                k_new_upper = k_old_upper  # Keep upper bound same
-                P0_new_lower = P0_old_lower
-                P0_new_upper = P0_old_upper * 2.0  # Moderate increase
-                D0_new_lower = D0_old_lower
-                D0_new_upper = D0_old_upper * 3.0  # Moderate increase
+                # Determine bounds adjustments based on residual pattern
+                if all_positive:
+                    # X6.R5.4 pattern: all residuals positive → global background too low
+                    # Fix: significantly increase background, moderate adjustments to other params
+                    if verbose:
+                        print(f"\n  🔍 GLOBAL UNDERSHOOT DETECTED:")
+                        print(f"    → Significantly increasing background bounds")
+                        print(f"    → Moderate D0 sampling (20%-60%)")
+                        print(f"    → Moderate k sampling (15%-55%)")
+
+                    # Shift background up by mean of all residuals
+                    global_shift = (mean_baseline_residual + mean_elbow_residual + mean_plateau_residual) / 3
+                    bg_int_new_lower = bg_int_old_lower + global_shift
+                    bg_int_new_upper = bg_int_old_upper + global_shift
+
+                    # Keep D0/k bounds same, sample from moderate ranges
+                    D0_new_lower = D0_old_lower
+                    D0_new_upper = D0_old_upper * 2.0
+                    D0_sample_range = (0.2, 0.6)  # Moderate range
+
+                    k_new_lower = k_old_lower
+                    k_new_upper = k_old_upper
+                    k_sample_range = (0.15, 0.55)  # Moderate range
+
+                    # Moderate P0 increase
+                    P0_new_lower = P0_old_lower
+                    P0_new_upper = P0_old_upper * 1.5
+
+                elif baseline_too_low and late_transition:
+                    # X6.R5.4 pattern: positive baseline + negative elbow + positive plateau
+                    # Fix: increase background, decrease D0 (shift lower), increase k (shift higher)
+                    if verbose:
+                        print(f"\n  🔍 BASELINE + LATE TRANSITION DETECTED:")
+                        print(f"    → Increasing background bounds")
+                        print(f"    → Decreasing D0 (sample from lower range)")
+                        print(f"    → Increasing k (sample from higher range)")
+
+                    # Increase background intercept bounds
+                    bg_int_shift = mean_baseline_residual  # Shift up by average baseline error
+                    bg_int_new_lower = bg_int_old_lower + bg_int_shift
+                    bg_int_new_upper = bg_int_old_upper + bg_int_shift
+
+                    # Keep D0 bounds same but will sample from LOWER portion (10%-40%)
+                    D0_new_lower = D0_old_lower
+                    D0_new_upper = D0_old_upper
+                    D0_sample_range = (0.1, 0.4)  # Sample from lower 10%-40%
+
+                    # Keep k bounds same but will sample from HIGHER portion (30%-70%)
+                    k_new_lower = k_old_lower
+                    k_new_upper = k_old_upper
+                    k_sample_range = (0.3, 0.7)  # Sample from higher 30%-70%
+
+                    # Moderate P0 increase
+                    P0_new_lower = P0_old_lower
+                    P0_new_upper = P0_old_upper * 1.5
+
+                elif plateau_saturation:
+                    # F6.2 pattern: positive plateau only (no baseline/elbow issues)
+                    # Fix: decrease k (sharper transition), moderate D0, increase P0
+                    if verbose:
+                        print(f"\n  🔍 PLATEAU SATURATION DETECTED:")
+                        print(f"    - Model plateau: {plateau_pred[-1]:.4f}")
+                        print(f"    - Data plateau: {plateau_data[-1]:.4f}")
+                        print(f"    → Decreasing k (sample from lower range)")
+                        print(f"    → Moderate D0 (sample from medium range)")
+                        print(f"    → Increasing P0 bounds")
+
+                    # Keep background bounds unchanged
+                    bg_int_new_lower = bg_int_old_lower
+                    bg_int_new_upper = bg_int_old_upper
+
+                    # Sample D0 from medium range (30%-80%)
+                    D0_new_lower = D0_old_lower
+                    D0_new_upper = D0_old_upper * 3.0
+                    D0_sample_range = (0.3, 0.8)
+
+                    # Sample k from very low range (2%-45%)
+                    k_new_lower = max(0.05, k_old_lower * 0.5)
+                    k_new_upper = k_old_upper
+                    k_sample_range = (0.02, 0.45)
+
+                    # Increase P0 upper bound
+                    P0_new_lower = P0_old_lower
+                    P0_new_upper = P0_old_upper * 2.0
+
+                else:
+                    # Default: use plateau saturation strategy
+                    if verbose:
+                        print(f"\n  🔍 POOR FIT DETECTED, using default retry strategy")
+                    bg_int_new_lower = bg_int_old_lower
+                    bg_int_new_upper = bg_int_old_upper
+                    D0_new_lower = D0_old_lower
+                    D0_new_upper = D0_old_upper * 3.0
+                    D0_sample_range = (0.3, 0.8)
+                    k_new_lower = max(0.05, k_old_lower * 0.5)
+                    k_new_upper = k_old_upper
+                    k_sample_range = (0.02, 0.45)
+                    P0_new_lower = P0_old_lower
+                    P0_new_upper = P0_old_upper * 2.0
 
                 if verbose:
                     print(f"    - Old k bounds: [{k_old_lower:.4f}, {k_old_upper:.4f}]")
@@ -711,42 +795,47 @@ class MAK2Optimizer:
                     print(f"    - New P0 bounds: [{P0_new_lower:.4f}, {P0_new_upper:.4f}]")
                     print(f"    - Old D0 bounds: [{D0_old_lower:.2e}, {D0_old_upper:.2e}]")
                     print(f"    - New D0 bounds: [{D0_new_lower:.2e}, {D0_new_upper:.2e}]")
+                    print(f"    - Old BG bounds: [{bg_int_old_lower:.4f}, {bg_int_old_upper:.4f}]")
+                    print(f"    - New BG bounds: [{bg_int_new_lower:.4f}, {bg_int_new_upper:.4f}]")
 
-                # Try up to 3 attempts with higher P0
-                plateau_retry_best_ssr = np.inf
-                plateau_retry_best_params = None
-                plateau_retry_best_r2 = -np.inf
+                # Try up to 3 attempts with pattern-specific sampling
+                pattern_retry_best_ssr = np.inf
+                pattern_retry_best_params = None
+                pattern_retry_best_r2 = -np.inf
 
                 for retry_i in range(1, 4):
                     try:
                         # Sample P0 from UPPER portion of new bounds (70%-100%)
-                        # This forces optimizer to explore high-P0 region
                         P0_sample = P0_new_lower + (0.7 + 0.3 * (retry_i - 1) / 2) * (P0_new_upper - P0_new_lower)
 
-                        # Sample D0 from LOWER-MIDDLE-UPPER portion of new bounds (30%-80%)
-                        # Slightly higher D0 helps reach target plateau
+                        # Sample D0 using pattern-specific range
                         log_D0_lower = np.log10(D0_new_lower)
                         log_D0_upper = np.log10(D0_new_upper)
-                        D0_sample = 10**(log_D0_lower + (0.3 + 0.5 * (retry_i - 1) / 2) * (log_D0_upper - log_D0_lower))
+                        d0_min_pct, d0_max_pct = D0_sample_range
+                        d0_pct = d0_min_pct + (d0_max_pct - d0_min_pct) * (retry_i - 1) / 2
+                        D0_sample = 10**(log_D0_lower + d0_pct * (log_D0_upper - log_D0_lower))
 
-                        # For plateau saturation, we need HIGH P0 with VERY-LOW k
-                        # Lower k gives sharper transition and higher plateau: P0/(1+k*P0)
-                        # Sample k from VERY-LOW to LOW-MEDIUM portion (2%-45%)
-                        # Start very low to allow optimizer to find optimal k
-                        k_sample = k_new_lower + (0.02 + 0.43 * (retry_i - 1) / 2) * (k_new_upper - k_new_lower)
+                        # Sample k using pattern-specific range
+                        k_min_pct, k_max_pct = k_sample_range
+                        k_pct = k_min_pct + (k_max_pct - k_min_pct) * (retry_i - 1) / 2
+                        k_sample = k_new_lower + k_pct * (k_new_upper - k_new_lower)
 
                         if verbose:
-                            print(f"    Plateau retry {retry_i}: D0_init = {D0_sample:.2e}, k_init = {k_sample:.4f}, P0_init = {P0_sample:.4f}")
+                            print(f"    Pattern retry {retry_i}: D0_init = {D0_sample:.2e}, k_init = {k_sample:.4f}, P0_init = {P0_sample:.4f}")
 
-                        # Use uniform weighting for first retry (most aggressive low-k exploration)
-                        # Use STRONG adaptive weighting for retries 2-3 (20×, 30×) to force plateau matching
+                        # Use uniform weighting for first retry
+                        # Use STRONG adaptive weighting for retries 2-3 (20×, 30×) for plateau emphasis
                         use_uniform = (retry_i == 1)
                         weight_multiplier = 10.0 + (retry_i - 1) * 10.0  # 10×, 20×, 30×
 
                         retry_params, retry_r2 = self._fit_attempt(
                             cycles_fit,
                             fluorescence_fit,
-                            {**bounds, 'k': (k_new_lower, k_new_upper), 'D0': (D0_new_lower, D0_new_upper), 'P0': (P0_new_lower, P0_new_upper)},
+                            {**bounds,
+                             'k': (k_new_lower, k_new_upper),
+                             'D0': (D0_new_lower, D0_new_upper),
+                             'P0': (P0_new_lower, P0_new_upper),
+                             'F_bg_intercept': (bg_int_new_lower, bg_int_new_upper)},
                             seed=1000 + retry_i,
                             lhs_D0=D0_sample,
                             lhs_k=k_sample,
@@ -758,35 +847,34 @@ class MAK2Optimizer:
                         if verbose:
                             print(f"      → R² = {retry_r2:.6f}, SSR = {retry_params['ssr']:.6f}, k_final = {retry_params['k']:.6f}, P0_final = {retry_params['P0']:.4f}")
 
-                        if retry_r2 > plateau_retry_best_r2:
-                            plateau_retry_best_r2 = retry_r2
-                            plateau_retry_best_params = retry_params
-                            plateau_retry_best_ssr = retry_params['ssr']
+                        if retry_r2 > pattern_retry_best_r2:
+                            pattern_retry_best_r2 = retry_r2
+                            pattern_retry_best_params = retry_params
+                            pattern_retry_best_ssr = retry_params['ssr']
 
-                        # Don't stop early - try all retries to find best k
-                        # (even if R² ≥ 0.99, a different k might be better)
+                        # Don't stop early - try all retries to find best parameters
 
                     except Exception as e:
                         if verbose:
-                            print(f"    Plateau retry {retry_i}: Failed - {type(e).__name__}: {str(e)}")
+                            print(f"    Pattern retry {retry_i}: Failed - {type(e).__name__}: {str(e)}")
                         continue
 
                 # Use retry result if better
-                if plateau_retry_best_params and plateau_retry_best_ssr < best_params['ssr']:
+                if pattern_retry_best_params and pattern_retry_best_ssr < best_params['ssr']:
                     if verbose:
-                        print(f"\n  ✅ Plateau saturation retry improved fit:")
+                        print(f"\n  ✅ Pattern-based retry improved fit:")
                         print(f"    Original: R² = {best_r2:.6f}, SSR = {best_params['ssr']:.6f}")
-                        print(f"    Best retry: R² = {plateau_retry_best_r2:.6f}, SSR = {plateau_retry_best_ssr:.6f}")
-                        print(f"    Best k = {plateau_retry_best_params['k']:.6f}, P0 = {plateau_retry_best_params['P0']:.4f}")
-                    best_params = plateau_retry_best_params
-                    best_r2 = plateau_retry_best_r2
+                        print(f"    Best retry: R² = {pattern_retry_best_r2:.6f}, SSR = {pattern_retry_best_ssr:.6f}")
+                        print(f"    Best k = {pattern_retry_best_params['k']:.6f}, P0 = {pattern_retry_best_params['P0']:.4f}")
+                    best_params = pattern_retry_best_params
+                    best_r2 = pattern_retry_best_r2
                 elif verbose:
-                    if plateau_retry_best_params:
-                        print(f"\n  ↩️  Plateau saturation retry did not improve fit:")
+                    if pattern_retry_best_params:
+                        print(f"\n  ↩️  Pattern-based retry did not improve fit:")
                         print(f"    Original: SSR = {best_params['ssr']:.6f}")
-                        print(f"    Best retry: SSR = {plateau_retry_best_ssr:.6f}")
+                        print(f"    Best retry: SSR = {pattern_retry_best_ssr:.6f}")
                     else:
-                        print(f"\n  ❌ All plateau saturation retries failed")
+                        print(f"\n  ❌ All pattern-based retries failed")
 
         # Automatic retry if SSR too high (likely local minimum)
         F_max = np.max(fluorescence_fit)
