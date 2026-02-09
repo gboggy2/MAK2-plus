@@ -320,6 +320,10 @@ class MAK2Optimizer:
             print(f"  F_min: {np.min(fluorescence_fit):.4f}")
             print(f"  F_range: {np.max(fluorescence_fit) - np.min(fluorescence_fit):.4f}")
 
+        # Preserve original bounds for LHS sampling
+        # Bounds may get adjusted during attempts, but LHS should sample from original space
+        original_bounds = {k: v for k, v in bounds.items()}
+
         # Generate LHS samples for k and P0 (for attempts 2+)
         # Attempt 1 uses analytical estimates, attempts 2+ use LHS
         print("🎲 GENERATING LATIN HYPERCUBE SAMPLES")
@@ -329,9 +333,16 @@ class MAK2Optimizer:
             lhs_samples = sampler.random(n=n_lhs_samples)
             print(f"✅ Generated {n_lhs_samples} LHS samples")
 
-            # Scale to bounds: column 0 = k, column 1 = P0
-            k_lhs = lhs_samples[:, 0] * (bounds['k'][1] - bounds['k'][0]) + bounds['k'][0]
-            P0_lhs = lhs_samples[:, 1] * (bounds['P0'][1] - bounds['P0'][0]) + bounds['P0'][0]
+            # Scale to ORIGINAL bounds: column 0 = k, column 1 = P0
+            k_lhs = lhs_samples[:, 0] * (original_bounds['k'][1] - original_bounds['k'][0]) + original_bounds['k'][0]
+            P0_lhs = lhs_samples[:, 1] * (original_bounds['P0'][1] - original_bounds['P0'][0]) + original_bounds['P0'][0]
+
+            # Override attempt 2 to explore HIGH P0 + LOW k corner
+            # This region gives maximum plateau: P0/(1+k*P0) is highest when P0 high, k low
+            if n_lhs_samples >= 1:
+                k_lhs[0] = original_bounds['k'][0] + 0.1 * (original_bounds['k'][1] - original_bounds['k'][0])  # 10% into k range (low k)
+                P0_lhs[0] = original_bounds['P0'][0] + 0.85 * (original_bounds['P0'][1] - original_bounds['P0'][0])  # 85% into P0 range (high P0)
+                print(f"📍 Biased attempt 2 toward high-P0 low-k corner for maximum plateau")
 
             if verbose:
                 print(f"\nLatin Hypercube Sampling for attempts 2-{max_attempts}:")
@@ -353,10 +364,14 @@ class MAK2Optimizer:
                 lhs_k = k_lhs[attempt - 2] if attempt > 1 and k_lhs is not None else None
                 lhs_P0 = P0_lhs[attempt - 2] if attempt > 1 and P0_lhs is not None else None
 
+                # Use original bounds for LHS attempts to avoid clipping LHS samples
+                # Use adjusted bounds only for attempt 1 (analytical estimates)
+                bounds_to_use = original_bounds if (lhs_k is not None or lhs_P0 is not None) else bounds
+
                 params, r2 = self._fit_attempt(
                     cycles_fit,
                     fluorescence_fit,
-                    bounds,
+                    bounds_to_use,
                     seed=attempt,
                     lhs_k=lhs_k,
                     lhs_P0=lhs_P0
@@ -570,7 +585,132 @@ class MAK2Optimizer:
                 print(f"    - Signal range = {F_range:.4f}")
                 print(f"    - SSR/(F_range²) = {ssr_ratio:.4f} (threshold: 0.01)")
                 print(f"    - Likely local minimum with poor parameters")
-        
+
+        # Check for plateau saturation: model predicts lower plateau than actual data
+        # This indicates P0 is too low
+        if best_params is not None and best_r2 < r2_threshold:
+            # Predict fluorescence for all fitted cycles
+            predicted_F = self.model.simulate_to_cycle(
+                best_params['D0'], best_params['k'], best_params['P0'],
+                cycles_fit, best_params['F_bg_intercept'], best_params['F_bg_slope']
+            )
+
+            # Find last 20% of data points (plateau region)
+            n_plateau = max(3, int(len(cycles_fit) * 0.2))
+            plateau_data = fluorescence_fit[-n_plateau:]
+            plateau_pred = predicted_F[-n_plateau:]
+
+            # Check if model systematically undershoots plateau
+            # Focus on final data points - model saturates below them
+            plateau_residuals = plateau_data - plateau_pred
+            mean_plateau_residual = np.mean(plateau_residuals)
+
+            # Check final point specifically
+            final_residual = plateau_residuals[-1]
+            final_2_mean = np.mean(plateau_residuals[-2:])
+
+            # Detection criteria:
+            # 1. Final residual > 0.02 (model undershoots final point significantly)
+            # 2. Mean of last 2 residuals > 0.01 (sustained undershoot at end)
+            # 3. Model plateau < data plateau (sanity check)
+            model_undershoots_final = (
+                final_residual > 0.02 and
+                final_2_mean > 0.01 and
+                plateau_pred[-1] < plateau_data[-1]
+            )
+
+            if verbose:
+                print(f"\n  🔍 Checking plateau saturation:")
+                print(f"    - Model plateau: {plateau_pred[-1]:.4f}")
+                print(f"    - Data plateau: {plateau_data[-1]:.4f}")
+                print(f"    - Final residual: {final_residual:.4f} (threshold: >0.02)")
+                print(f"    - Mean last 2 residuals: {final_2_mean:.4f} (threshold: >0.01)")
+                print(f"    - Last 3 residuals: {plateau_residuals[-3:]}")
+                print(f"    - Undershoots final points: {model_undershoots_final}")
+
+            if model_undershoots_final:
+                if verbose:
+                    print(f"\n  🔍 PLATEAU SATURATION DETECTED:")
+                    print(f"    - Model plateau: {plateau_pred[-1]:.4f}")
+                    print(f"    - Data plateau: {plateau_data[-1]:.4f}")
+                    print(f"    - Mean residual: {mean_plateau_residual:.4f}")
+                    print(f"    - Model saturates BELOW final data points")
+                    print(f"    → P0 is too low, increasing P0 bounds for retry")
+
+                # Retry with increased P0 bounds only
+                P0_old_lower, P0_old_upper = bounds['P0']
+                # Increase both bounds by 50% to allow higher plateau
+                P0_new_lower = P0_old_lower
+                P0_new_upper = P0_old_upper * 1.5
+
+                if verbose:
+                    print(f"    - Old P0 bounds: [{P0_old_lower:.4f}, {P0_old_upper:.4f}]")
+                    print(f"    - New P0 bounds: [{P0_new_lower:.4f}, {P0_new_upper:.4f}]")
+
+                # Try up to 3 attempts with higher P0
+                plateau_retry_best_ssr = np.inf
+                plateau_retry_best_params = None
+                plateau_retry_best_r2 = -np.inf
+
+                for retry_i in range(1, 4):
+                    try:
+                        # Sample P0 from UPPER portion of new bounds (70%-100%)
+                        # This forces optimizer to explore high-P0 region
+                        P0_sample = P0_new_lower + (0.7 + 0.3 * (retry_i - 1) / 2) * (P0_new_upper - P0_new_lower)
+
+                        # For plateau saturation, we need HIGH P0 with LOW k
+                        # Lower k gives higher plateau: P0/(1+k*P0)
+                        # Sample k from LOWER portion of bounds (0%-30%)
+                        k_bounds = bounds['k']
+                        k_sample = k_bounds[0] + (0.0 + 0.3 * (retry_i - 1) / 2) * (k_bounds[1] - k_bounds[0])
+
+                        if verbose:
+                            print(f"    Plateau retry {retry_i}: P0_init = {P0_sample:.4f}, k_init = {k_sample:.4f}")
+
+                        retry_params, retry_r2 = self._fit_attempt(
+                            cycles_fit,
+                            fluorescence_fit,
+                            {**bounds, 'P0': (P0_new_lower, P0_new_upper)},
+                            seed=1000 + retry_i,
+                            lhs_k=k_sample,
+                            lhs_P0=P0_sample
+                        )
+
+                        if verbose:
+                            print(f"      → R² = {retry_r2:.6f}, SSR = {retry_params['ssr']:.6f}, P0_final = {retry_params['P0']:.4f}")
+
+                        if retry_r2 > plateau_retry_best_r2:
+                            plateau_retry_best_r2 = retry_r2
+                            plateau_retry_best_params = retry_params
+                            plateau_retry_best_ssr = retry_params['ssr']
+
+                        # If we found a good fit, stop
+                        if retry_r2 >= 0.99:
+                            if verbose:
+                                print(f"    ✓ Plateau saturation retry succeeded: R² = {retry_r2:.6f}")
+                            break
+
+                    except Exception as e:
+                        if verbose:
+                            print(f"    Plateau retry {retry_i}: Failed - {type(e).__name__}: {str(e)}")
+                        continue
+
+                # Use retry result if better
+                if plateau_retry_best_params and plateau_retry_best_ssr < best_params['ssr']:
+                    if verbose:
+                        print(f"\n  ✅ Plateau saturation retry improved fit:")
+                        print(f"    Original: R² = {best_r2:.6f}, SSR = {best_params['ssr']:.6f}")
+                        print(f"    Retry:    R² = {plateau_retry_best_r2:.6f}, SSR = {plateau_retry_best_ssr:.6f}")
+                    best_params = plateau_retry_best_params
+                    best_r2 = plateau_retry_best_r2
+                elif verbose:
+                    if plateau_retry_best_params:
+                        print(f"\n  ↩️  Plateau saturation retry did not improve fit:")
+                        print(f"    Original: SSR = {best_params['ssr']:.6f}")
+                        print(f"    Best retry: SSR = {plateau_retry_best_ssr:.6f}")
+                    else:
+                        print(f"\n  ❌ All plateau saturation retries failed")
+
         # Automatic retry if SSR too high (likely local minimum)
         F_max = np.max(fluorescence_fit)
         F_min = np.min(fluorescence_fit)
