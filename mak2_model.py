@@ -648,7 +648,10 @@ def estimate_D0_bounds(
     print(f"  Background from baseline fit (cycles {cycles[0]:.0f}-{baseline_cycles_final[-1]:.0f}):")
     print(f"    Intercept: {bg_intercept_est:.4f} ± {intercept_uncertainty:.4f} → bounds [{bg_intercept_min:.4f}, {bg_intercept_max:.4f}]")
     print(f"    Slope: {bg_slope_est:.6f} ± {slope_uncertainty:.6f} → bounds [{bg_slope_min:.6f}, {bg_slope_max:.6f}]")
-    
+
+    # Store baseline_end_cycle for late-baseline detection (used for k bounds constraint)
+    baseline_end_cycle = baseline_cycles_final[-1]
+
     # Find first cycle with real signal (for information only)
     min_signal_threshold = max(0.001, F_min + 0.01 * F_range)
     real_signal_idx = np.where(fluorescence > min_signal_threshold)[0]
@@ -894,7 +897,17 @@ def estimate_D0_bounds(
         print(f"  After adding margin (10x):")
         print(f"    Lower bound: {D0_lower_bounded:.2e}")
         print(f"    Upper bound: {D0_upper_bounded:.2e}")
-        
+
+        # Estimate k from efficiency fit
+        try:
+            k_estimate = estimate_k_from_exponential(
+                D0_upper, efficiency, cycles_upper, P0_assumed=1.0
+            )
+        except Exception as e:
+            k_estimate = None
+            if verbose:
+                print(f"  Warning: k estimation failed ({str(e)})")
+
         # Store fit info for visualization
         fit_info = {
             'exp_cycles_lower': cycles_lower,
@@ -919,7 +932,9 @@ def estimate_D0_bounds(
             'bg_slope': F_bg_slope,
             # Additional info for analytical MAK2 parameter estimation
             'D0_efficiency': D0_upper,
-            'fitted_cycles_efficiency': cycles_upper
+            'fitted_cycles_efficiency': cycles_upper,
+            'baseline_end_cycle': baseline_end_cycle,  # For late-baseline detection
+            'k_estimate': k_estimate  # For data-driven k bounds
         }
         
         print(f"\nEstimated D0 bounds from sliding window baseline detection:")
@@ -1024,11 +1039,13 @@ def estimate_k_from_exponential(
             result = fsolve(equation, k_init, full_output=True)
             if result[2] == 1:  # Solution converged
                 k_est = result[0][0]
-                if 1e-6 < k_est < 100:  # Sanity check
+                error = equation(k_est)
+                # Only accept if error is very small (true minimum) and k is reasonable
+                if error < 1e-10 and 1e-6 < k_est < 100:
                     k_estimates.append(k_est)
         except:
             continue
-    
+
     if not k_estimates:
         # Fallback: use empirical relationship
         # E close to 2 → minimal depletion → small k
@@ -1037,7 +1054,7 @@ def estimate_k_from_exponential(
         print(f"    Warning: Numerical solution failed, using empirical estimate")
     else:
         k_estimate = np.median(k_estimates)
-    
+
     return k_estimate
 
 
@@ -1156,28 +1173,72 @@ def estimate_MAK2_params_from_exponential(
         0.001  # Absolute minimum
     )
 
-    # Use data-driven bounds for D0 and P0, but fixed realistic range for k
-    # k estimate from exponential fit can be unreliable, so use wide but reasonable bounds
-    # D0 estimate can also be unreliable - use very wide bounds (10,000× range)
+    # Use data-driven bounds for D0 and P0, hybrid approach for k
+    # D0 bounds come from estimate_D0_bounds: perfect doubling fit (lower) and efficiency fit (upper)
+    #
+    # k bounds: HYBRID DATA-DRIVEN (adaptive lower, fixed upper)
+    # - Lower bound: k_estimate/2 (data-driven, adapts to each sample)
+    #   - Accounts for k_estimate underestimating true k
+    #   - Provides instrument-independent adaptation
+    # - Upper bound: 1.2 (fixed empirically-validated maximum)
+    #   - Represents realistic qPCR upper limit (~55% primer depletion per cycle)
+    #   - Prevents optimizer from exploring unrealistic parameter space
+    #   - Tested: fully data-driven upper (k_est*100) degraded performance to 80.8%
+    #
+    # For F_bg_slope, use the constrained bounds from estimate_D0_bounds (which includes
+    # late-baseline detection and slope constraint) instead of margin-based bounds
+
+    # Calculate data-driven k bounds (both adaptive based on D0)
+    if k_estimate is not None:
+        k_lower = max(0.01, k_estimate / 2)
+
+        # k_upper based on D0: strong negative correlation (r=-0.79, R²=0.63)
+        # High D0 → low k (short exp phase, minimal observable depletion)
+        # Low D0 → high k (long exp phase, cumulative depletion visible)
+        # Formula: k_upper = 0.2 - 0.03 * log10(D0), clipped to [0.3, 2.0]
+        log_D0 = np.log10(D0_upper)  # Use D0 from efficiency fit
+        k_upper_D0 = 0.2 - 0.03 * log_D0
+        k_upper = np.clip(k_upper_D0, 0.3, 2.0)  # Reasonable bounds
+    else:
+        k_lower = 0.05
+        k_upper = 1.2  # Fallback if k_estimate unavailable
+
     bounds = {
-        'D0': (D0_estimate / 1000, D0_estimate * 10),  # 10,000× range, biased toward lower values
-        'k': (0.05, 1.2),  # Fixed realistic qPCR range, don't trust exponential k estimate
+        'D0': (D0_lower, D0_upper),  # Use bounds from both exponential fits (already have 10× margins)
+        'k': (k_lower, k_upper),  # Fully data-driven k bounds
         'P0': (P0_estimate * 0.5, P0_estimate * 2),  # Tight: 0.5x to 2x of F_max
         'F_bg_intercept': (
-            F_bg_est['intercept'] - F_bg_int_margin,  # Allow negative
-            F_bg_est['intercept'] + F_bg_int_margin
+            fit_info['bg_intercept_min'],  # Use fit_info bounds directly
+            fit_info['bg_intercept_max']
         ),
         'F_bg_slope': (
-            F_bg_est['slope'] - F_bg_slope_margin,
-            F_bg_est['slope'] + F_bg_slope_margin
+            fit_info['bg_slope_min'],  # Use constrained bounds from estimate_D0_bounds
+            fit_info['bg_slope_max']   # (includes late-baseline positive slope constraint)
         )
     }
-    
+
+    # For late-baseline samples, narrow k range to prevent oscillation
+    # When baseline extends to cycle 21+, optimizer tends to oscillate between
+    # k too low (0.05) and k too high (1.2+). Empirically, k~0.2-0.8 works better.
+    baseline_end_cycle = fit_info.get('baseline_end_cycle', 0)
+    if baseline_end_cycle >= 21:
+        old_k_bounds = bounds['k']
+        bounds['k'] = (0.15, 0.85)  # Narrower, more moderate range
+        if verbose:
+            print(f"    → Narrowing k bounds for late baseline: {old_k_bounds} → {bounds['k']}")
+
+    # Note: We don't constrain P0 based on plateau here because:
+    # 1. Plateau = P0/(1+k*P0) + F_bg_intercept depends on both P0 and k
+    # 2. We don't know k before fitting, so using k_min is too conservative
+    # 3. Hard constraints degrade performance significantly
+    # Instead, the optimizer should prefer fits where model doesn't exceed data
+
     if verbose:
         print(f"\nData-Driven Bounds:")
-        print(f"  D0: [{bounds['D0'][0]:.2e}, {bounds['D0'][1]:.2e}]  (100× range)")
-        print(f"  k:  [{bounds['k'][0]:.6f}, {bounds['k'][1]:.6f}]  (100× range)")
+        print(f"  D0: [{bounds['D0'][0]:.2e}, {bounds['D0'][1]:.2e}]  (from perfect doubling and efficiency fits)")
+        print(f"  k:  [{bounds['k'][0]:.6f}, {bounds['k'][1]:.6f}]  (fixed realistic range)")
         print(f"  P0: [{bounds['P0'][0]:.2f}, {bounds['P0'][1]:.2f}]  (0.5× to 2× F_max)")
+        print(f"  F_bg_slope: [{bounds['F_bg_slope'][0]:.6f}, {bounds['F_bg_slope'][1]:.6f}]")
     
     return estimates, bounds
 

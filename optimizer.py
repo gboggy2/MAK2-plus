@@ -67,7 +67,7 @@ class MAK2Optimizer:
         auto_truncate: bool = True,
         truncate_cycle: Optional[int] = None,
         bounds: Optional[Dict[str, Tuple[float, float]]] = None,
-        max_attempts: int = 5,
+        max_attempts: int = 10,
         r2_threshold: float = 0.999,
         verbose: bool = False,
         method: str = None  # Ignored - kept for compatibility
@@ -183,7 +183,7 @@ class MAK2Optimizer:
                     print("Falling back to exponential fit bounds...")
                 
                 try:
-                    D0_lower, D0_upper, F_bg_estimate_scalar, _ = estimate_D0_bounds(
+                    D0_lower, D0_upper, F_bg_estimate_scalar, fit_info = estimate_D0_bounds(
                         cycles_fit, fluorescence_fit
                     )
                     
@@ -376,6 +376,9 @@ class MAK2Optimizer:
                 # Use adjusted bounds only for attempt 1 (analytical estimates)
                 bounds_to_use = original_bounds if (lhs_D0 is not None or lhs_k is not None or lhs_P0 is not None) else bounds
 
+                # Positive slope exploration disabled - trust exponential fit bounds
+                force_positive = False
+
                 params, r2 = self._fit_attempt(
                     cycles_fit,
                     fluorescence_fit,
@@ -383,7 +386,8 @@ class MAK2Optimizer:
                     seed=attempt,
                     lhs_D0=lhs_D0,
                     lhs_k=lhs_k,
-                    lhs_P0=lhs_P0
+                    lhs_P0=lhs_P0,
+                    force_positive_slope=force_positive
                 )
                 
                 if verbose:
@@ -674,6 +678,27 @@ class MAK2Optimizer:
                 not plateau_saturation  # Mutually exclusive
             )
 
+            # Pattern 7: Increasing residuals (plateau >> elbow >> baseline)
+            # Suggests background slope is too low (flat when should be rising)
+            # Check if plateau residuals significantly higher than baseline
+            increasing_residuals = (
+                mean_plateau_residual > mean_baseline_residual + 0.01 and
+                mean_plateau_residual > 0.01 and
+                not all_positive  # If all positive, use global undershoot instead
+            )
+
+            # Pattern 8: k stuck at lower bound (critical!)
+            # When k hits lower bound, model is trying to achieve higher plateau by minimizing depletion
+            # Real fix: increase k bounds AND increase background slope (make more positive)
+            # Check if k is within 10% of lower bound
+            k_at_lower_bound = abs(best_params['k'] - bounds['k'][0]) / bounds['k'][0] < 0.10
+
+            # If k is stuck at lower bound, likely need both higher k and higher slope
+            k_stuck_at_bound = (
+                k_at_lower_bound and
+                best_r2 < 0.995  # Only trigger if fit is poor
+            )
+
             if verbose:
                 print(f"\n  🔍 Residual Pattern Analysis:")
                 print(f"    - Mean baseline residual: {mean_baseline_residual:+.4f}")
@@ -687,9 +712,11 @@ class MAK2Optimizer:
                 print(f"    - Early transition: {early_transition}")
                 print(f"    - Plateau saturation: {plateau_saturation}")
                 print(f"    - Plateau overshoot: {plateau_overshoot}")
+                print(f"    - Increasing residuals (slope issue): {increasing_residuals}")
+                print(f"    - k stuck at lower bound: {k_stuck_at_bound}")
 
             # Apply retry strategy based on dominant pattern
-            retry_needed = baseline_too_low or all_positive or late_transition or early_transition or plateau_saturation or plateau_overshoot
+            retry_needed = baseline_too_low or all_positive or late_transition or early_transition or plateau_saturation or plateau_overshoot or increasing_residuals
 
             if retry_needed:
                 # Use ORIGINAL bounds, not modified bounds from SSR retry
@@ -697,9 +724,89 @@ class MAK2Optimizer:
                 D0_old_lower, D0_old_upper = original_bounds['D0']
                 k_old_lower, k_old_upper = original_bounds['k']
                 bg_int_old_lower, bg_int_old_upper = original_bounds['F_bg_intercept']
+                bg_slope_old_lower, bg_slope_old_upper = original_bounds['F_bg_slope']
+
+                # Initialize default slope bounds (will be overridden by specific patterns if needed)
+                bg_slope_new_lower = bg_slope_old_lower
+                bg_slope_new_upper = bg_slope_old_upper
 
                 # Determine bounds adjustments based on residual pattern
-                if all_positive:
+                if k_stuck_at_bound:
+                    # X6.R4.2 pattern: k at lower bound (0.05) → model trying to minimize depletion
+                    # Real fix: INCREASE k bounds significantly + INCREASE background slope
+                    # When k=0.05, model wants higher plateau but can't get it with low k
+                    # User feedback: "increased slope and increased k"
+                    if verbose:
+                        print(f"\n  🔍 K STUCK AT LOWER BOUND DETECTED:")
+                        print(f"    - k = {best_params['k']:.6f} (bound: {bounds['k'][0]:.6f})")
+                        print(f"    - R² = {best_r2:.4f}")
+                        print(f"    → INCREASING k bounds significantly (force k higher)")
+                        print(f"    → INCREASING background slope (shift upward)")
+                        print(f"    → Adjusting P0 bounds")
+
+                    # Force k to explore MUCH HIGHER values
+                    # If k is at 0.05, we want to push it to 0.2-0.8 range
+                    k_new_lower = max(0.15, k_old_lower * 3.0)  # At least 3× higher
+                    k_new_upper = max(k_old_upper, 1.0)  # Ensure upper bound is high enough
+                    k_sample_range = (0.4, 0.8)  # Sample from higher range
+
+                    # Increase background slope significantly (make more positive/upward)
+                    # Estimate needed slope increase from signal range
+                    signal_range = fluorescence_fit[-1] - fluorescence_fit[0]
+                    slope_increase = signal_range / len(cycles_fit) * 0.02  # 2% of average rise per cycle
+
+                    bg_slope_new_lower = bg_slope_old_lower + slope_increase * 0.5
+                    bg_slope_new_upper = bg_slope_old_upper + slope_increase * 2.0
+
+                    # Keep background intercept moderate
+                    bg_int_new_lower = bg_int_old_lower
+                    bg_int_new_upper = bg_int_old_upper
+
+                    # Moderate D0/P0 adjustments
+                    D0_new_lower = D0_old_lower
+                    D0_new_upper = D0_old_upper * 2.0
+                    D0_sample_range = (0.3, 0.7)
+
+                    # P0 adjustments depend on whether we need higher or lower plateau
+                    # Start with moderate range
+                    P0_new_lower = P0_old_lower * 0.8
+                    P0_new_upper = P0_old_upper * 1.5
+                    P0_sample_range = (0.3, 0.7)
+
+                elif increasing_residuals:
+                    # X6.R2.1 pattern: residuals increase from baseline → elbow → plateau
+                    # Suggests background slope is too low (should be rising more)
+                    # Fix: increase background slope bounds significantly
+                    if verbose:
+                        print(f"\n  🔍 INCREASING RESIDUALS DETECTED (SLOPE TOO LOW):")
+                        print(f"    - Baseline residual: {mean_baseline_residual:+.4f}")
+                        print(f"    - Plateau residual: {mean_plateau_residual:+.4f}")
+                        print(f"    - Difference: {mean_plateau_residual - mean_baseline_residual:+.4f}")
+                        print(f"    → Increasing background slope bounds")
+                        print(f"    → Moderate parameter adjustments")
+
+                    # Shift background slope UPWARD - this is the key fix
+                    slope_shift = (mean_plateau_residual - mean_baseline_residual) / len(cycles_fit)
+                    bg_slope_new_lower = max(bg_slope_old_lower, bg_slope_old_lower + slope_shift * 0.5)
+                    bg_slope_new_upper = bg_slope_old_upper + slope_shift * 1.5
+
+                    # Keep intercept bounds moderate
+                    bg_int_new_lower = bg_int_old_lower
+                    bg_int_new_upper = bg_int_old_upper
+
+                    # Moderate D0/k/P0 adjustments
+                    D0_new_lower = D0_old_lower
+                    D0_new_upper = D0_old_upper * 2.0
+                    D0_sample_range = (0.3, 0.7)
+
+                    k_new_lower = max(0.05, k_old_lower * 0.7)
+                    k_new_upper = k_old_upper
+                    k_sample_range = (0.1, 0.5)
+
+                    P0_new_lower = P0_old_lower
+                    P0_new_upper = P0_old_upper * 1.5
+
+                elif all_positive:
                     # X6.R5.4 pattern: all residuals positive → global background too low
                     # Fix: significantly increase background, moderate adjustments to other params
                     if verbose:
@@ -883,7 +990,8 @@ class MAK2Optimizer:
                              'k': (k_new_lower, k_new_upper),
                              'D0': (D0_new_lower, D0_new_upper),
                              'P0': (P0_new_lower, P0_new_upper),
-                             'F_bg_intercept': (bg_int_new_lower, bg_int_new_upper)},
+                             'F_bg_intercept': (bg_int_new_lower, bg_int_new_upper),
+                             'F_bg_slope': (bg_slope_new_lower, bg_slope_new_upper)},
                             seed=1000 + retry_i,
                             lhs_D0=D0_sample,
                             lhs_k=k_sample,
@@ -1072,7 +1180,8 @@ class MAK2Optimizer:
         lhs_k: Optional[float] = None,
         lhs_P0: Optional[float] = None,
         use_uniform_weighting: bool = False,
-        plateau_weight_multiplier: float = 10.0
+        plateau_weight_multiplier: float = 10.0,
+        force_positive_slope: bool = False
     ) -> Tuple[Dict[str, float], float]:
         """
         Single fitting attempt with random initial guess or LHS samples.
@@ -1175,23 +1284,39 @@ class MAK2Optimizer:
 
         p0 = [D0_init, k_init, P0_init, F_bg_int_init, F_bg_slope_init]
 
+        # Apply positive slope constraint as an exploration strategy if requested
+        # This is one attempt among many, not a universal constraint
+        bounds_to_use = bounds.copy()
+        if force_positive_slope and bounds_to_use['F_bg_slope'][0] < 0:
+            # Constrain slope to be non-negative for this attempt
+            bounds_to_use['F_bg_slope'] = (
+                max(0.0, bounds_to_use['F_bg_slope'][0]),
+                bounds_to_use['F_bg_slope'][1]
+            )
+            # If initial slope is negative, move it to lower bound
+            if F_bg_slope_init < 0:
+                F_bg_slope_init = bounds_to_use['F_bg_slope'][0]
+                p0 = [D0_init, k_init, P0_init, F_bg_int_init, F_bg_slope_init]
+
         # Debug: print initial guesses
         print(f"    Initial guesses: D0={D0_init:.2e}, k={k_init:.4f}, P0={P0_init:.4f}")
+        if force_positive_slope:
+            print(f"    🔬 Exploring with positive slope constraint: [{bounds_to_use['F_bg_slope'][0]:.6f}, {bounds_to_use['F_bg_slope'][1]:.6f}]")
 
-        # Prepare bounds for curve_fit
+        # Prepare bounds for curve_fit (use bounds_to_use which may have positive slope constraint)
         lower_bounds = [
-            bounds['D0'][0],
-            bounds['k'][0],
-            bounds['P0'][0],
-            bounds['F_bg_intercept'][0],
-            bounds['F_bg_slope'][0]
+            bounds_to_use['D0'][0],
+            bounds_to_use['k'][0],
+            bounds_to_use['P0'][0],
+            bounds_to_use['F_bg_intercept'][0],
+            bounds_to_use['F_bg_slope'][0]
         ]
         upper_bounds = [
-            bounds['D0'][1],
-            bounds['k'][1],
-            bounds['P0'][1],
-            bounds['F_bg_intercept'][1],
-            bounds['F_bg_slope'][1]
+            bounds_to_use['D0'][1],
+            bounds_to_use['k'][1],
+            bounds_to_use['P0'][1],
+            bounds_to_use['F_bg_intercept'][1],
+            bounds_to_use['F_bg_slope'][1]
         ]
 
         # Validate and fix bounds before fitting
