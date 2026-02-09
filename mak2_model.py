@@ -886,8 +886,8 @@ def estimate_D0_bounds(
         print(f"  D0 from exponential fits:")
         print(f"    Perfect doubling (lower): {D0_lower:.2e}")
         print(f"    Efficiency (upper): {D0_upper:.2e}")
-        
-        # Add some margin (10x on each side) - NO minimum floor
+
+        # Add some margin (10x on each side) - allow D0 to go very low if needed
         D0_lower_bounded = D0_lower / 10
         D0_upper_bounded = min(100.0, D0_upper * 10)  # Cap at reasonable max
         
@@ -916,7 +916,10 @@ def estimate_D0_bounds(
             'bg_slope_max': bg_slope_max,
             # Averaged background for plotting
             'bg_intercept': F_bg_intercept,
-            'bg_slope': F_bg_slope
+            'bg_slope': F_bg_slope,
+            # Additional info for analytical MAK2 parameter estimation
+            'D0_efficiency': D0_upper,
+            'fitted_cycles_efficiency': cycles_upper
         }
         
         print(f"\nEstimated D0 bounds from sliding window baseline detection:")
@@ -1079,13 +1082,25 @@ def estimate_MAK2_params_from_exponential(
         print("\n=== Analytical MAK2 Parameter Estimation ===")
     
     # Step 1: Get exponential fits (this already exists and works well!)
-    D0_lower, D0_upper, F_bg_est, fit_info = estimate_D0_bounds(cycles, fluorescence)
-    
+    D0_lower, D0_upper, F_bg_est_scalar, fit_info = estimate_D0_bounds(cycles, fluorescence)
+
+    # Check if exponential fitting succeeded (fit_info will be empty dict if it failed)
+    if not fit_info or 'D0_efficiency' not in fit_info:
+        raise ValueError("Exponential fitting failed - cannot estimate MAK2 parameters analytically")
+
+    # Reconstruct F_bg dictionary from fit_info (estimate_D0_bounds returns scalar for compatibility)
+    F_bg_est = {
+        'intercept': fit_info['bg_intercept'],
+        'slope': fit_info['bg_slope'],
+        'SE_intercept': 0.0,  # Not used in this function
+        'SE_slope': 0.0  # Not used in this function
+    }
+
     # Extract efficiency exponential results
     D0_eff = fit_info['D0_efficiency']
     E = fit_info['efficiency']
     fitted_cycles = fit_info['fitted_cycles_efficiency']
-    
+
     if verbose:
         print(f"\nExponential Fit Results:")
         print(f"  D0 = {D0_eff:.2e}")
@@ -1130,17 +1145,31 @@ def estimate_MAK2_params_from_exponential(
         'F_bg_slope': F_bg_est['slope']
     }
     
+    # Ensure minimum margins for F_bg parameters to avoid collapsed bounds
+    F_bg_int_margin = max(
+        3 * F_bg_est['SE_intercept'],  # SE-based margin
+        0.1 * abs(F_bg_est['intercept']),  # 10% of value
+        0.05  # Absolute minimum
+    )
+    F_bg_slope_margin = max(
+        5 * F_bg_est['SE_slope'],  # SE-based margin
+        0.001  # Absolute minimum
+    )
+
+    # Use data-driven bounds for D0 and P0, but fixed realistic range for k
+    # k estimate from exponential fit can be unreliable, so use wide but reasonable bounds
+    # D0 estimate can also be unreliable - use very wide bounds (10,000× range)
     bounds = {
-        'D0': (D0_estimate / 10, D0_estimate * 10),
-        'k': (k_estimate / 10, k_estimate * 10),
+        'D0': (D0_estimate / 1000, D0_estimate * 10),  # 10,000× range, biased toward lower values
+        'k': (0.05, 1.2),  # Fixed realistic qPCR range, don't trust exponential k estimate
         'P0': (P0_estimate * 0.5, P0_estimate * 2),  # Tight: 0.5x to 2x of F_max
         'F_bg_intercept': (
-            max(0, F_bg_est['intercept'] - 3 * F_bg_est['SE_intercept']),
-            F_bg_est['intercept'] + 3 * F_bg_est['SE_intercept']
+            F_bg_est['intercept'] - F_bg_int_margin,  # Allow negative
+            F_bg_est['intercept'] + F_bg_int_margin
         ),
         'F_bg_slope': (
-            F_bg_est['slope'] - 5 * F_bg_est['SE_slope'],
-            F_bg_est['slope'] + 5 * F_bg_est['SE_slope']
+            F_bg_est['slope'] - F_bg_slope_margin,
+            F_bg_est['slope'] + F_bg_slope_margin
         )
     }
     

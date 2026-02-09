@@ -14,6 +14,14 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import importlib
+import sys
+
+# Force reload of optimizer module to pick up latest changes
+if 'optimizer' in sys.modules:
+    import optimizer
+    importlib.reload(optimizer)
+    print("🔄 RELOADED OPTIMIZER MODULE")
 
 from mak2_model import MAK2Model, find_truncation_cycle, calculate_amplification_efficiency
 from optimizer import MAK2Optimizer
@@ -489,19 +497,35 @@ if cycles is not None and fluorescence is not None:
     
     # Show D0 estimation details
     with st.expander("📊 D₀ Bounds Estimation (from Exponential Fits)", expanded=False):
-        from mak2_model import estimate_D0_bounds
-        
+        from mak2_model import estimate_D0_bounds, estimate_MAK2_params_from_exponential
+
         # Get bounds and estimates with fit info (D0 is now in fluorescence units)
         D0_lower, D0_upper, F_bg_estimate, fit_info = estimate_D0_bounds(
             cycles, fluorescence
         )
-        
-        # Display results
+
+        # Display results - top row for D0
         col1, col2, col3 = st.columns(3)
         col1.metric("D₀ Lower Bound", f"{D0_lower:.2e}", help="From perfect doubling fit (2^n) - in fluorescence units")
-        col2.metric("D₀ Upper Bound", f"{D0_upper:.2e}", 
+        col2.metric("D₀ Upper Bound", f"{D0_upper:.2e}",
                    help=f"From efficiency fit (E^n, E={fit_info.get('efficiency', 1.8):.2f}) - in fluorescence units")
         col3.metric("Background Est.", f"{F_bg_estimate:.4f}", help="Estimated from exponential fits")
+
+        # Also get analytical estimates for k and P0
+        try:
+            analytical_estimates, analytical_bounds = estimate_MAK2_params_from_exponential(
+                cycles, fluorescence, P0_assumed=1.0, verbose=False
+            )
+            k_estimate = analytical_estimates['k']
+            P0_estimate = analytical_estimates['P0']
+
+            # Display k and P0 initial guesses in a second row
+            st.markdown("**Initial Parameter Guesses:**")
+            col4, col5 = st.columns(2)
+            col4.metric("k Initial Guess", f"{k_estimate:.4f}", help="Analytical estimate of primer depletion rate from exponential growth")
+            col5.metric("P₀ Initial Guess", f"{P0_estimate:.4f}", help="Estimated initial primer concentration (= F_max)")
+        except Exception as e:
+            st.warning(f"Could not calculate analytical k and P0 estimates: {str(e)}")
         
         # Show exponential phase region and fits
         if fit_info:
@@ -922,7 +946,7 @@ if cycles is not None and fluorescence is not None:
                             informed_bounds = {
                                 'k': (mean_k * 0.5, mean_k * 2),  # 4× range around mean
                                 'P0': (mean_P0 * 0.5, mean_P0 * 2),  # 4× range around mean
-                                'D0': (1e-10, F_max * 10),  # Wide D0 range
+                                'D0': (1e-15, F_max * 10),  # Wide D0 range - allow very low values
                                 'F_bg_intercept': (0, F_max),
                                 'F_bg_slope': (-0.1, 0.1)
                             }
@@ -1145,7 +1169,14 @@ if cycles is not None and fluorescence is not None:
             with st.spinner("Fitting MAK2 model..."):
                 model = MAK2Model()
                 optimizer = MAK2Optimizer(model)
-                
+
+                # Capture stdout to display debug output
+                import io
+                import sys
+                captured_output = io.StringIO()
+                old_stdout = sys.stdout
+                sys.stdout = captured_output
+
                 try:
                     fitted_params = optimizer.fit(
                         cycles,
@@ -1159,16 +1190,26 @@ if cycles is not None and fluorescence is not None:
                         bounds=custom_bounds_dict,  # None for automatic, or custom dict
                         verbose=True  # Enable progress output
                     )
-                    
+
                     st.session_state['fitted_params'] = fitted_params
                     st.session_state['optimizer'] = optimizer
+
+                    # Restore stdout and save captured output
+                    sys.stdout = old_stdout
+                    debug_output = captured_output.getvalue()
+                    st.session_state['fit_debug_output'] = debug_output
                     # Store hash of data to validate fit matches current data
                     import hashlib
                     data_hash = hashlib.md5(f"{cycles.tobytes()}{fluorescence.tobytes()}".encode()).hexdigest()
                     st.session_state['fitted_data_hash'] = data_hash
                     st.success("✅ Fitting complete!")
-                    
+
                 except Exception as e:
+                    # Restore stdout even if there was an error
+                    sys.stdout = old_stdout
+                    debug_output = captured_output.getvalue()
+                    if debug_output:
+                        st.session_state['fit_debug_output'] = debug_output
                     st.error(f"Fitting failed: {str(e)}")
                     st.stop()
     
@@ -1176,7 +1217,12 @@ if cycles is not None and fluorescence is not None:
     if 'fitted_params' in st.session_state:
         fitted_params = st.session_state['fitted_params']
         optimizer = st.session_state['optimizer']
-        
+
+        # Show debug output if available
+        if 'fit_debug_output' in st.session_state and st.session_state['fit_debug_output']:
+            with st.expander("🐛 Debug Output (Optimization Details)", expanded=True):
+                st.code(st.session_state['fit_debug_output'], language='text')
+
         # Results tabs
         tab1, tab2, tab3, tab4 = st.tabs(["📊 Fit Visualization", "📈 Parameters & Metrics", "🔬 Bootstrap CI", "💾 Export"])
         
