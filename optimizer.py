@@ -665,6 +665,15 @@ class MAK2Optimizer:
                 not all_positive  # Exclude if global background is the issue
             )
 
+            # Pattern 6: Negative plateau residuals → model overshoots plateau
+            # Model predicts too high at plateau → P0 too high or k too low
+            # Fix: decrease P0, increase k, adjust background slope if needed
+            plateau_overshoot = (
+                mean_plateau_residual < -0.01 and
+                plateau_pred[-1] > plateau_data[-1] and
+                not plateau_saturation  # Mutually exclusive
+            )
+
             if verbose:
                 print(f"\n  🔍 Residual Pattern Analysis:")
                 print(f"    - Mean baseline residual: {mean_baseline_residual:+.4f}")
@@ -677,9 +686,10 @@ class MAK2Optimizer:
                 print(f"    - Late transition: {late_transition}")
                 print(f"    - Early transition: {early_transition}")
                 print(f"    - Plateau saturation: {plateau_saturation}")
+                print(f"    - Plateau overshoot: {plateau_overshoot}")
 
             # Apply retry strategy based on dominant pattern
-            retry_needed = baseline_too_low or all_positive or late_transition or early_transition or plateau_saturation
+            retry_needed = baseline_too_low or all_positive or late_transition or early_transition or plateau_saturation or plateau_overshoot
 
             if retry_needed:
                 # Use ORIGINAL bounds, not modified bounds from SSR retry
@@ -773,6 +783,38 @@ class MAK2Optimizer:
                     P0_new_lower = P0_old_lower
                     P0_new_upper = P0_old_upper * 2.0
 
+                elif plateau_overshoot:
+                    # X5.R1.4 pattern: negative plateau residuals → model overshoots
+                    # Model predicts too high at plateau
+                    # Fix: DECREASE P0, INCREASE k (more depletion, lower plateau)
+                    # Also consider increasing background slope if baseline trends up
+                    if verbose:
+                        print(f"\n  🔍 PLATEAU OVERSHOOT DETECTED:")
+                        print(f"    - Model plateau: {plateau_pred[-1]:.4f}")
+                        print(f"    - Data plateau: {plateau_data[-1]:.4f}")
+                        print(f"    - Model OVERSHOOTS (predicts too high)")
+                        print(f"    → Decreasing P0 (sample from lower range)")
+                        print(f"    → Increasing k (sample from higher range)")
+
+                    # Keep background bounds, but could shift slope upward if needed
+                    bg_int_new_lower = bg_int_old_lower
+                    bg_int_new_upper = bg_int_old_upper
+
+                    # Sample D0 from moderate range
+                    D0_new_lower = D0_old_lower
+                    D0_new_upper = D0_old_upper * 2.0
+                    D0_sample_range = (0.3, 0.7)
+
+                    # Sample k from HIGHER range (40%-80%) for more depletion
+                    k_new_lower = k_old_lower
+                    k_new_upper = k_old_upper * 1.2  # Allow slightly higher k
+                    k_sample_range = (0.4, 0.8)
+
+                    # Sample P0 from LOWER range (10%-50%) to reduce plateau
+                    P0_new_lower = P0_old_lower * 0.5
+                    P0_new_upper = P0_old_upper * 0.8
+                    P0_sample_range = (0.1, 0.5)  # Will override default later
+
                 else:
                     # Default: use plateau saturation strategy
                     if verbose:
@@ -805,8 +847,14 @@ class MAK2Optimizer:
 
                 for retry_i in range(1, 4):
                     try:
-                        # Sample P0 from UPPER portion of new bounds (70%-100%)
-                        P0_sample = P0_new_lower + (0.7 + 0.3 * (retry_i - 1) / 2) * (P0_new_upper - P0_new_lower)
+                        # Sample P0 - check if custom range is defined (for plateau_overshoot)
+                        if 'P0_sample_range' in locals():
+                            p0_min_pct, p0_max_pct = P0_sample_range
+                            p0_pct = p0_min_pct + (p0_max_pct - p0_min_pct) * (retry_i - 1) / 2
+                            P0_sample = P0_new_lower + p0_pct * (P0_new_upper - P0_new_lower)
+                        else:
+                            # Default: sample from UPPER portion (70%-100%) for most patterns
+                            P0_sample = P0_new_lower + (0.7 + 0.3 * (retry_i - 1) / 2) * (P0_new_upper - P0_new_lower)
 
                         # Sample D0 using pattern-specific range
                         log_D0_lower = np.log10(D0_new_lower)
