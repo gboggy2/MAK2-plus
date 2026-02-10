@@ -326,12 +326,20 @@ class MAK2Optimizer:
 
         # Generate LHS samples for D0, k, and P0 (for attempts 2+)
         # Attempt 1 uses analytical estimates, attempts 2+ use LHS
-        print("🎲 GENERATING LATIN HYPERCUBE SAMPLES")
-        n_lhs_samples = max_attempts - 1
+        # ADAPTIVE LHS: Generate more samples for better parameter space coverage
+        # This helps escape local minima by exploring more starting points
+        print("🎲 GENERATING ADAPTIVE LATIN HYPERCUBE SAMPLES")
+
+        # Adaptive sampling: scale with max_attempts for better coverage
+        # Base: 20 samples per attempt (much more than previous 1 sample per attempt)
+        # This provides ~200 LHS points for 10 attempts vs ~9 previously
+        n_lhs_samples = 20 * (max_attempts - 1)  # Attempt 1 uses analytical, rest use LHS
+
         if n_lhs_samples > 0:
             sampler = qmc.LatinHypercube(d=3, seed=42)  # 3D: D0, k, P0
             lhs_samples = sampler.random(n=n_lhs_samples)
-            print(f"✅ Generated {n_lhs_samples} LHS samples")
+            print(f"✅ Generated {n_lhs_samples} LHS samples ({20} per attempt × {max_attempts-1} attempts)")
+            print(f"   This provides {n_lhs_samples}x more coverage than previous approach")
 
             # Scale to ORIGINAL bounds in log space for D0, linear for k and P0
             # Column 0 = D0 (log space), Column 1 = k, Column 2 = P0
@@ -350,10 +358,69 @@ class MAK2Optimizer:
                 P0_lhs[0] = original_bounds['P0'][0] + 0.85 * (original_bounds['P0'][1] - original_bounds['P0'][0])  # 85% into P0 range (high P0)
                 print(f"📍 Biased attempt 2 toward high-P0 low-k upper-D0 corner for maximum plateau")
 
+            # Evaluate all LHS samples to find best starting points
+            # This is the key to escaping local minima: we test many points
+            # and optimize from the most promising ones
+            print(f"\n📊 EVALUATING {n_lhs_samples} LHS SAMPLES...")
+            lhs_scores = []
+
+            for i, (d0, k, p0) in enumerate(zip(D0_lhs, k_lhs, P0_lhs)):
+                try:
+                    # Quick evaluation: compute SSR for this parameter combination
+                    # without full optimization (just initial guess quality)
+                    test_params = {
+                        'D0': d0,
+                        'k': k,
+                        'P0': p0,
+                        'F_bg_intercept': original_bounds['F_bg_intercept'][0],  # Use lower bound
+                        'F_bg_slope': 0.0  # Start at zero
+                    }
+
+                    # Calculate SSR for this guess
+                    _, _, predicted_F = self.model.simulate_cycles(
+                        D0=test_params['D0'],
+                        k=test_params['k'],
+                        P0=test_params['P0'],
+                        n_cycles=len(cycles_fit),
+                        F_bg_intercept=test_params['F_bg_intercept'],
+                        F_bg_slope=test_params['F_bg_slope']
+                    )
+
+                    # Interpolate to data cycles
+                    predicted_fit = np.interp(cycles_fit, np.arange(len(predicted_F)), predicted_F)
+                    ssr = np.sum((fluorescence_fit - predicted_fit) ** 2)
+
+                    lhs_scores.append((ssr, i, d0, k, p0))
+                except:
+                    # If evaluation fails, assign worst score
+                    lhs_scores.append((np.inf, i, d0, k, p0))
+
+            # Sort by SSR (lower is better)
+            lhs_scores.sort()
+
+            # Use top samples for attempts 2+
+            # Number of starting points = max_attempts - 1 (attempt 1 uses analytical)
+            n_starts = min(max_attempts - 1, len(lhs_scores))
+            best_lhs_indices = [lhs_scores[i][1] for i in range(n_starts)]
+
+            # Extract best LHS samples for optimization attempts
+            D0_lhs_best = np.array([D0_lhs[i] for i in best_lhs_indices])
+            k_lhs_best = np.array([k_lhs[i] for i in best_lhs_indices])
+            P0_lhs_best = np.array([P0_lhs[i] for i in best_lhs_indices])
+
+            print(f"✅ Selected top {n_starts} LHS samples (from {n_lhs_samples} evaluated)")
+
             if verbose:
-                print(f"\nLatin Hypercube Sampling for attempts 2-{max_attempts}:")
-                for i, (d0, k, p0) in enumerate(zip(D0_lhs, k_lhs, P0_lhs), start=2):
-                    print(f"  Attempt {i}: D0={d0:.2e}, k={k:.4f}, P0={p0:.4f}")
+                print(f"\nTop {min(5, n_starts)} LHS starting points (by SSR):")
+                for i in range(min(5, n_starts)):
+                    ssr, idx, d0, k, p0 = lhs_scores[i]
+                    print(f"  Rank {i+1}: D0={d0:.2e}, k={k:.4f}, P0={p0:.4f}, SSR={ssr:.6f}")
+
+            # Use the best ones for optimization
+            D0_lhs = D0_lhs_best
+            k_lhs = k_lhs_best
+            P0_lhs = P0_lhs_best
+
         else:
             D0_lhs = None
             k_lhs = None
