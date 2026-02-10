@@ -847,16 +847,55 @@ if cycles is not None and fluorescence is not None:
                 del st.session_state['fitted_params']
             if 'optimizer' in st.session_state:
                 del st.session_state['optimizer']
-            
+
             st.subheader("🔄 Batch Fitting Results")
-            
+
+            # === SIGNAL DETECTION: Pre-filter samples before fitting ===
+            from data_processing import detect_no_signal_samples
+
+            with st.status("🔍 Detecting samples with no signal...", expanded=True) as status:
+                st.write(f"Analyzing {len(all_samples)} samples...")
+
+                valid_samples, no_signal_samples, plate_stats = detect_no_signal_samples(
+                    cycles,
+                    all_samples,
+                    min_range_pct=2.0,  # 2% of max plate signal
+                    min_r2=0.80,        # 80% R² for borderline samples
+                    verbose=False       # Don't print to console in app
+                )
+
+                st.write(f"✅ Found {len(valid_samples)} samples with valid signal")
+                if no_signal_samples:
+                    st.write(f"⚠️ Flagged {len(no_signal_samples)} samples with no detectable signal")
+
+                status.update(label="✅ Signal detection complete", state="complete")
+
+            # Show flagged samples if any
+            if no_signal_samples:
+                with st.expander(f"⚠️ {len(no_signal_samples)} samples flagged (will be skipped)", expanded=True):
+                    st.info("These samples have insufficient signal for MAK2+ fitting (likely NTC, failed reactions, or no template).")
+
+                    no_signal_df = pd.DataFrame([
+                        {
+                            'Sample': name,
+                            'Reason': info['reason'],
+                            'Range': f"{info['F_range']:.4f}",
+                            '% of Max': f"{info['F_range_pct']:.1f}%"
+                        }
+                        for name, info in no_signal_samples.items()
+                    ])
+                    st.dataframe(no_signal_df, use_container_width=True)
+
+            # Update all_samples to only include valid samples
+            all_samples_to_fit = valid_samples
+
             results_list = []
             progress_bar = st.progress(0)
             status_text = st.empty()
-            
+
             # Pass 1: Fit all samples normally
-            for i, (sample_name, fluor_data) in enumerate(all_samples.items()):
-                status_text.text(f"Pass 1: Fitting {sample_name}... ({i+1}/{len(all_samples)})")
+            for i, (sample_name, fluor_data) in enumerate(all_samples_to_fit.items()):
+                status_text.text(f"Pass 1: Fitting {sample_name}... ({i+1}/{len(all_samples_to_fit)})")
                 
                 try:
                     model_batch = MAK2Model()
@@ -907,7 +946,7 @@ if cycles is not None and fluorescence is not None:
                         'fluor_data': fluor_data
                     })
                 
-                progress_bar.progress((i + 1) / len(all_samples))
+                progress_bar.progress((i + 1) / len(all_samples_to_fit))
             
             # Pass 2: Identify high SSR samples and retry with informed bounds
             # Calculate SSR threshold for each sample based on its fluorescence range
@@ -1009,6 +1048,7 @@ if cycles is not None and fluorescence is not None:
             st.session_state['batch_results'] = results_df
             st.session_state['batch_results_list'] = results_list
             st.session_state['batch_all_samples'] = all_samples
+            st.session_state['batch_no_signal_samples'] = no_signal_samples  # Store flagged samples
             st.session_state['batch_cycles'] = cycles
             st.session_state['batch_settings'] = {
                 'truncation_method': truncation_method,
@@ -1048,6 +1088,21 @@ if cycles is not None and fluorescence is not None:
                 col2.metric("Mean R²", f"{results_df['R2'].mean():.4f}")
                 col3.metric("Median R²", f"{results_df['R2'].median():.4f}")
             
+            # Show no-signal samples if any
+            if 'batch_no_signal_samples' in st.session_state and st.session_state['batch_no_signal_samples']:
+                no_signal_samples = st.session_state['batch_no_signal_samples']
+                with st.expander(f"⚠️ {len(no_signal_samples)} samples skipped (no signal detected)"):
+                    no_signal_df = pd.DataFrame([
+                        {
+                            'Sample': name,
+                            'Reason': info['reason'],
+                            'Fluorescence Range': f"{info['F_range']:.4f}",
+                            '% of Max on Plate': f"{info['F_range_pct']:.1f}%"
+                        }
+                        for name, info in no_signal_samples.items()
+                    ])
+                    st.dataframe(no_signal_df, use_container_width=True)
+
             # Export button
             csv = results_df.to_csv(index=False)
             st.download_button(
