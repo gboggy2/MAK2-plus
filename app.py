@@ -915,7 +915,17 @@ if cycles is not None and fluorescence is not None:
                     )
                     
                     metrics_batch = optimizer_batch.calculate_fit_metrics()
-                    
+
+                    # Determine which tier was used
+                    if params_batch.get('de_used', False):
+                        tier = 'T3-DE'
+                    elif params_batch.get('fallback_succeeded', False):
+                        tier = 'T2-LHS'
+                    elif params_batch.get('used_fixed_background', False):
+                        tier = 'T1-Fixed'
+                    else:
+                        tier = 'T1-Full'
+
                     results_list.append({
                         'Sample': sample_name,
                         'D0': params_batch['D0'],
@@ -927,7 +937,11 @@ if cycles is not None and fluorescence is not None:
                         'RMSE': metrics_batch['rmse'],
                         'NRMSE': metrics_batch['nrmse'] * 100,
                         'SSR': metrics_batch['ssr'],
+                        'Tier': tier,
                         'Success': '✓',
+                        'FixedBG': '✓' if params_batch.get('used_fixed_background', False) else '',
+                        'Fallback': '✓' if params_batch.get('fallback_attempted', False) else '',
+                        'FallbackOK': '✓' if params_batch.get('fallback_succeeded', False) else '',
                         'fluor_data': fluor_data  # Store for potential retry
                     })
                 except Exception as e:

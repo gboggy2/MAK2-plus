@@ -9,7 +9,7 @@ print("🔄 OPTIMIZER MODULE LOADING - VERSION 2.0.0 (LHS + NOISE + STUCK DETECT
 print("="*80)
 
 import numpy as np
-from scipy.optimize import curve_fit
+from scipy.optimize import curve_fit, differential_evolution
 from scipy.stats import qmc
 from typing import Tuple, Dict, Optional
 from mak2_model import (
@@ -70,7 +70,8 @@ class MAK2Optimizer:
         max_attempts: int = 10,
         r2_threshold: float = 0.999,
         verbose: bool = False,
-        method: str = None  # Ignored - kept for compatibility
+        method: str = None,  # Ignored - kept for compatibility
+        fix_background: bool = True  # Fix background with adaptive fallback
     ) -> Dict[str, float]:
         """
         Fit MAK2 model to qPCR data using adaptive multi-start optimization.
@@ -108,7 +109,11 @@ class MAK2Optimizer:
             Print fitting progress (default: False)
         method : str, optional
             Ignored (kept for backward compatibility)
-            
+        fix_background : bool
+            Fix background with adaptive fallback (default: True)
+            - True: Try fixed background first, fallback to 5-param if R² < 0.995
+            - False: Always fit all 5 parameters including background
+
         Returns
         -------
         params : dict
@@ -294,10 +299,35 @@ class MAK2Optimizer:
             if 'F_bg_slope' not in bounds:
                 bounds['F_bg_slope'] = (-0.001, 0.001)
         
+        # Handle fixed background parameters
+        if fix_background:
+            # Extract background values from exponential fits
+            if self.analytical_estimates is not None:
+                # Use values from analytical estimation
+                fixed_F_bg_intercept = self.analytical_estimates['F_bg_intercept']
+                fixed_F_bg_slope = self.analytical_estimates['F_bg_slope']
+            else:
+                # Use midpoint of bounds as best estimate
+                fixed_F_bg_intercept = (bounds['F_bg_intercept'][0] + bounds['F_bg_intercept'][1]) / 2
+                fixed_F_bg_slope = (bounds['F_bg_slope'][0] + bounds['F_bg_slope'][1]) / 2
+
+            self.fixed_background = {
+                'F_bg_intercept': fixed_F_bg_intercept,
+                'F_bg_slope': fixed_F_bg_slope
+            }
+
+            if verbose:
+                print(f"\n🔒 FIXED BACKGROUND (from exponential fits):")
+                print(f"   F_bg_intercept = {fixed_F_bg_intercept:.6f}")
+                print(f"   F_bg_slope = {fixed_F_bg_slope:.6f}")
+                print(f"   Fitting only D0, k, P0 (3 parameters)")
+        else:
+            self.fixed_background = None
+
         if verbose:
             print(f"\n=== MAK2 Model Fitting ===")
             print(f"Target R²: ≥ {r2_threshold}")
-        
+
         # Increase attempts for low-template wells (wide D0 bounds)
         # These are harder to fit due to poor exponential estimates
         D0_range_log = np.log10(bounds['D0'][1]) - np.log10(bounds['D0'][0])
@@ -1231,12 +1261,274 @@ class MAK2Optimizer:
         self.optimal_params = best_params
         self.cycles_fit = cycles_fit
         self.fluorescence_fit = fluorescence_fit
-        
+
         # Calculate metrics
         self.metrics = self.calculate_fit_metrics()
-        
-        return best_params
-    
+
+        # Track whether we used fixed background
+        used_fixed_bg = fix_background and hasattr(self, 'fixed_background') and self.fixed_background is not None
+        best_params['used_fixed_background'] = used_fixed_bg
+        best_params['fallback_attempted'] = False
+        best_params['fallback_succeeded'] = False
+
+        # ADAPTIVE BACKGROUND STRATEGY
+        # If we used fixed background but R² < 0.999, retry with full 5-parameter fit
+        if used_fixed_bg and self.metrics['r_squared'] < 0.999:
+            best_params['fallback_attempted'] = True
+            # Always print fallback messages (even with verbose=False)
+            print(f"\n🔄 ADAPTIVE FALLBACK: Fixed background R²={self.metrics['r_squared']:.4f} < 0.999")
+            print(f"   Retrying with full 5-parameter fit...")
+
+            try:
+                # Save fixed background results
+                fixed_bg_params = dict(best_params)  # Use dict() instead of .copy()
+                fixed_bg_r2 = self.metrics['r_squared']
+
+                # Clear fixed background and re-run optimization on SAME truncated data
+                self.fixed_background = None
+
+                # WIDEN BOUNDS for fallback to escape local minima
+                # Increase D0 upper bound by 10x
+                # Decrease k lower bound by 10x
+                # Increase P0 upper bound by 2x
+                print(f"   Widening bounds for better exploration...")
+                fallback_bounds = dict(bounds)
+                fallback_bounds['D0'] = (bounds['D0'][0], bounds['D0'][1] * 10)
+                fallback_bounds['k'] = (bounds['k'][0] / 10, bounds['k'][1])
+                fallback_bounds['P0'] = (bounds['P0'][0], bounds['P0'][1] * 2)
+                print(f"   D0: [{fallback_bounds['D0'][0]:.2e}, {fallback_bounds['D0'][1]:.2e}]")
+                print(f"   k: [{fallback_bounds['k'][0]:.4f}, {fallback_bounds['k'][1]:.4f}]")
+                print(f"   P0: [{fallback_bounds['P0'][0]:.4f}, {fallback_bounds['P0'][1]:.4f}]")
+
+                # Generate LHS samples for FULL 5D parameter space with WIDENED bounds
+                # Use more samples for fallback since we need thorough exploration
+                n_lhs_fallback = 100  # More samples for challenging cases
+                print(f"   Generating {n_lhs_fallback} LHS samples for 5D parameter space...")
+
+                # qmc is already imported at the top
+                sampler = qmc.LatinHypercube(d=5, seed=42)  # 5D: D0, k, P0, F_bg_int, F_bg_slope
+                lhs_samples_5d = sampler.random(n=n_lhs_fallback)
+
+                # Scale to WIDENED bounds in log space for D0, linear for others
+                log_D0_min = np.log10(fallback_bounds['D0'][0])
+                log_D0_max = np.log10(fallback_bounds['D0'][1])
+                D0_lhs_5d = 10**(lhs_samples_5d[:, 0] * (log_D0_max - log_D0_min) + log_D0_min)
+                k_lhs_5d = lhs_samples_5d[:, 1] * (fallback_bounds['k'][1] - fallback_bounds['k'][0]) + fallback_bounds['k'][0]
+                P0_lhs_5d = lhs_samples_5d[:, 2] * (fallback_bounds['P0'][1] - fallback_bounds['P0'][0]) + fallback_bounds['P0'][0]
+                F_bg_int_lhs_5d = lhs_samples_5d[:, 3] * (fallback_bounds['F_bg_intercept'][1] - fallback_bounds['F_bg_intercept'][0]) + fallback_bounds['F_bg_intercept'][0]
+                F_bg_slope_lhs_5d = lhs_samples_5d[:, 4] * (fallback_bounds['F_bg_slope'][1] - fallback_bounds['F_bg_slope'][0]) + fallback_bounds['F_bg_slope'][0]
+
+                # Evaluate all LHS samples
+                print(f"   Evaluating {n_lhs_fallback} LHS samples...")
+                lhs_scores_5d = []
+                for i in range(n_lhs_fallback):
+                    try:
+                        _, _, predicted_F = self.model.simulate_cycles(
+                            D0=D0_lhs_5d[i],
+                            k=k_lhs_5d[i],
+                            P0=P0_lhs_5d[i],
+                            n_cycles=len(cycles_fit),
+                            F_bg_intercept=F_bg_int_lhs_5d[i],
+                            F_bg_slope=F_bg_slope_lhs_5d[i]
+                        )
+                        predicted = np.interp(cycles_fit, np.arange(len(predicted_F)), predicted_F)
+                        ssr = np.sum((fluorescence_fit - predicted)**2)
+                        lhs_scores_5d.append((ssr, i))
+                    except:
+                        lhs_scores_5d.append((np.inf, i))
+
+                # Sort by SSR and take top candidates
+                lhs_scores_5d.sort()
+                n_starts_fallback = min(max_attempts, len(lhs_scores_5d))
+                print(f"   Optimizing from top {n_starts_fallback} starting points...")
+
+                # Re-run the optimization loop with best LHS starting points
+                best_params_full = None
+                best_r2_full = -np.inf
+
+                for attempt in range(n_starts_fallback):
+                    try:
+                        idx = lhs_scores_5d[attempt][1]
+
+                        # Use LHS sample as initial guess with WIDENED bounds
+                        params_full, r2_full = self._fit_attempt(
+                            cycles_fit,
+                            fluorescence_fit,
+                            fallback_bounds,  # Use widened bounds!
+                            seed=attempt + 1000,  # Different seed range
+                            lhs_D0=D0_lhs_5d[idx],
+                            lhs_k=k_lhs_5d[idx],
+                            lhs_P0=P0_lhs_5d[idx]
+                        )
+
+                        if r2_full > best_r2_full:
+                            best_params_full = params_full
+                            best_r2_full = r2_full
+                            print(f"   Attempt {attempt+1}: R² = {r2_full:.4f}")
+
+                        if r2_full >= r2_threshold:
+                            print(f"   ✅ Threshold met!")
+                            break
+
+                    except Exception as e:
+                        print(f"   Attempt {attempt+1} failed: {str(e)[:80]}")
+                        continue
+
+                # Compare fixed vs full fit
+                if best_params_full is not None and best_r2_full > fixed_bg_r2:
+                    print(f"   ✅ Full fit improved: R² {fixed_bg_r2:.4f} → {best_r2_full:.4f}")
+                    best_params = best_params_full
+                    best_params['fallback_succeeded'] = True
+                    # Update stored results
+                    self.optimal_params = best_params
+                    self.metrics = self.calculate_fit_metrics()
+                else:
+                    print(f"   ↩️  Fixed background was better: keeping R² = {fixed_bg_r2:.4f}")
+                    # Restore fixed background results (already stored)
+
+            except Exception as e:
+                print(f"   ⚠️  Fallback failed with error: {str(e)[:80]}")
+                print(f"   Keeping fixed background result (R² = {self.metrics['r_squared']:.4f})")
+
+        # TIER 3: DIFFERENTIAL EVOLUTION for extremely challenging samples
+        # If R² < 0.999, try global optimization to reach excellence threshold
+        if self.metrics['r_squared'] < 0.999:
+            print(f"\n🌍 TIER 3: DIFFERENTIAL EVOLUTION")
+            print(f"   Current R²={self.metrics['r_squared']:.4f} < 0.999")
+            print(f"   Attempting global optimization with Differential Evolution...")
+
+            try:
+                # Use widened bounds for DE (or even wider)
+                de_bounds_widened = dict(bounds)
+                de_bounds_widened['D0'] = (bounds['D0'][0], bounds['D0'][1] * 20)  # 20x for DE
+                de_bounds_widened['k'] = (bounds['k'][0] / 20, bounds['k'][1])     # 20x wider
+                de_bounds_widened['P0'] = (bounds['P0'][0], bounds['P0'][1] * 3)   # 3x wider
+
+                de_params, de_r2 = self._fit_with_differential_evolution(
+                    cycles_fit,
+                    fluorescence_fit,
+                    de_bounds_widened,
+                    verbose=False
+                )
+
+                if de_r2 > self.metrics['r_squared']:
+                    print(f"   ✅ DE improved: R² {self.metrics['r_squared']:.4f} → {de_r2:.4f}")
+                    self.optimal_params = de_params
+                    self.optimal_params['de_used'] = True
+                    self.metrics = self.calculate_fit_metrics()
+                else:
+                    print(f"   ↩️  DE did not improve: R² = {de_r2:.4f}")
+
+            except Exception as e:
+                print(f"   ⚠️  DE failed: {str(e)[:80]}")
+
+        return self.optimal_params
+
+    def _fit_with_differential_evolution(
+        self,
+        cycles: np.ndarray,
+        fluorescence: np.ndarray,
+        bounds: Dict[str, Tuple[float, float]],
+        verbose: bool = False
+    ) -> Tuple[Dict[str, float], float]:
+        """
+        Fit MAK2 model using Differential Evolution global optimizer.
+
+        DE is a robust global optimization algorithm that explores the parameter
+        space more thoroughly than local methods. It's slower but can escape
+        local minima that trap gradient-based optimizers.
+
+        Parameters
+        ----------
+        cycles : np.ndarray
+            Cycle numbers
+        fluorescence : np.ndarray
+            Fluorescence measurements
+        bounds : Dict[str, Tuple[float, float]]
+            Parameter bounds dictionary
+        verbose : bool
+            Print progress messages
+
+        Returns
+        -------
+        params : Dict[str, float]
+            Best parameters found
+        r2 : float
+            R² value for best fit
+        """
+        if verbose:
+            print("   Running Differential Evolution...")
+
+        # Convert bounds to DE format: [(min, max), ...]
+        # Use log space for D0 for better exploration
+        de_bounds = [
+            (np.log10(bounds['D0'][0]), np.log10(bounds['D0'][1])),  # log10(D0)
+            (bounds['k'][0], bounds['k'][1]),                         # k
+            (bounds['P0'][0], bounds['P0'][1]),                       # P0
+            (bounds['F_bg_intercept'][0], bounds['F_bg_intercept'][1]),  # F_bg_intercept
+            (bounds['F_bg_slope'][0], bounds['F_bg_slope'][1])        # F_bg_slope
+        ]
+
+        # Objective function: minimize sum of squared residuals
+        def objective(x):
+            log_D0, k, P0, F_bg_intercept, F_bg_slope = x
+            D0 = 10 ** log_D0  # Convert back from log space
+
+            try:
+                y_pred = self.model.simulate_to_cycle(
+                    D0, k, P0, cycles,
+                    F_bg_intercept, F_bg_slope
+                )
+
+                ssr = np.sum((fluorescence - y_pred) ** 2)
+                return ssr
+
+            except Exception:
+                return 1e10  # Return large penalty for invalid parameters
+
+        # Run Differential Evolution
+        result = differential_evolution(
+            objective,
+            de_bounds,
+            strategy='best2bin',  # Robust strategy
+            maxiter=200,          # Max iterations
+            popsize=30,           # Population size (30 * 5 params = 150 candidates)
+            tol=1e-7,             # Convergence tolerance
+            mutation=(0.5, 1.5),  # Mutation factor range
+            recombination=0.7,    # Crossover probability
+            seed=42,              # Reproducible results
+            polish=True,          # Use L-BFGS-B to polish the best solution
+            workers=1,            # Single-threaded (avoid pickling issues)
+            updating='deferred'   # Evaluate full generation before updating
+        )
+
+        # Extract best parameters
+        log_D0_best, k_best, P0_best, F_bg_int_best, F_bg_slope_best = result.x
+        D0_best = 10 ** log_D0_best
+
+        # Calculate R² for best solution
+        y_pred = self.model.simulate_to_cycle(
+            D0_best, k_best, P0_best, cycles,
+            F_bg_int_best, F_bg_slope_best
+        )
+
+        r2 = calculate_r2(fluorescence, y_pred)
+
+        # Package results
+        params = {
+            'D0': D0_best,
+            'k': k_best,
+            'P0': P0_best,
+            'F_bg_intercept': F_bg_int_best,
+            'F_bg_slope': F_bg_slope_best
+        }
+
+        if verbose:
+            print(f"   DE converged: R² = {r2:.6f}")
+            print(f"   Best params: D0={D0_best:.2e}, k={k_best:.4f}, P0={P0_best:.2e}")
+
+        return params, r2
+
     def _fit_attempt(
         self,
         cycles: np.ndarray,
@@ -1370,24 +1662,46 @@ class MAK2Optimizer:
         if force_positive_slope:
             print(f"    🔬 Exploring with positive slope constraint: [{bounds_to_use['F_bg_slope'][0]:.6f}, {bounds_to_use['F_bg_slope'][1]:.6f}]")
 
+        # Check if we're using fixed background
+        use_fixed_bg = hasattr(self, 'fixed_background') and self.fixed_background is not None
+
         # Prepare bounds for curve_fit (use bounds_to_use which may have positive slope constraint)
-        lower_bounds = [
-            bounds_to_use['D0'][0],
-            bounds_to_use['k'][0],
-            bounds_to_use['P0'][0],
-            bounds_to_use['F_bg_intercept'][0],
-            bounds_to_use['F_bg_slope'][0]
-        ]
-        upper_bounds = [
-            bounds_to_use['D0'][1],
-            bounds_to_use['k'][1],
-            bounds_to_use['P0'][1],
-            bounds_to_use['F_bg_intercept'][1],
-            bounds_to_use['F_bg_slope'][1]
-        ]
+        if use_fixed_bg:
+            # Fit only D0, k, P0 (background is fixed)
+            lower_bounds = [
+                bounds_to_use['D0'][0],
+                bounds_to_use['k'][0],
+                bounds_to_use['P0'][0]
+            ]
+            upper_bounds = [
+                bounds_to_use['D0'][1],
+                bounds_to_use['k'][1],
+                bounds_to_use['P0'][1]
+            ]
+            # Initial guess for 3 parameters
+            p0_reduced = [p0[0], p0[1], p0[2]]  # D0, k, P0
+            fixed_bg_int = self.fixed_background['F_bg_intercept']
+            fixed_bg_slope = self.fixed_background['F_bg_slope']
+        else:
+            # Fit all 5 parameters
+            lower_bounds = [
+                bounds_to_use['D0'][0],
+                bounds_to_use['k'][0],
+                bounds_to_use['P0'][0],
+                bounds_to_use['F_bg_intercept'][0],
+                bounds_to_use['F_bg_slope'][0]
+            ]
+            upper_bounds = [
+                bounds_to_use['D0'][1],
+                bounds_to_use['k'][1],
+                bounds_to_use['P0'][1],
+                bounds_to_use['F_bg_intercept'][1],
+                bounds_to_use['F_bg_slope'][1]
+            ]
+            p0_reduced = p0
 
         # Validate and fix bounds before fitting
-        param_names = ['D0', 'k', 'P0', 'F_bg_intercept', 'F_bg_slope']
+        param_names = ['D0', 'k', 'P0', 'F_bg_intercept', 'F_bg_slope'] if not use_fixed_bg else ['D0', 'k', 'P0']
         for i, name in enumerate(param_names):
             if lower_bounds[i] >= upper_bounds[i]:
                 # Fix collapsed bounds by adding minimum margin
@@ -1408,10 +1722,10 @@ class MAK2Optimizer:
 
         # Validate initial guesses are within bounds
         for i, name in enumerate(param_names):
-            if p0[i] < lower_bounds[i] or p0[i] > upper_bounds[i]:
-                print(f"  Warning: {name} initial guess {p0[i]:.2e} outside bounds [{lower_bounds[i]:.2e}, {upper_bounds[i]:.2e}]")
-                p0[i] = np.clip(p0[i], lower_bounds[i], upper_bounds[i])
-                print(f"           Clipped to {p0[i]:.2e}")
+            if p0_reduced[i] < lower_bounds[i] or p0_reduced[i] > upper_bounds[i]:
+                print(f"  Warning: {name} initial guess {p0_reduced[i]:.2e} outside bounds [{lower_bounds[i]:.2e}, {upper_bounds[i]:.2e}]")
+                p0_reduced[i] = np.clip(p0_reduced[i], lower_bounds[i], upper_bounds[i])
+                print(f"           Clipped to {p0_reduced[i]:.2e}")
 
         # Create adaptive weights to emphasize exponential growth and plateau regions
         # Identify where signal rises above baseline (>10% of max fluorescence)
@@ -1449,19 +1763,37 @@ class MAK2Optimizer:
         sigma = 1.0 / np.sqrt(weights)
 
         # Fit using Trust Region Reflective (supports bounds, similar performance to LM)
-        popt, _ = curve_fit(
-            lambda n, D0, k, P0, bg_int, bg_slope: self.model.simulate_to_cycle(
-                D0, k, P0, n, bg_int, bg_slope
-            ),
-            cycles,
-            fluorescence,
-            p0=p0,
-            sigma=sigma,  # Weights via inverse uncertainty
-            bounds=(lower_bounds, upper_bounds),
-            method='trf',  # Trust Region Reflective (supports bounds)
-            maxfev=10000
-        )
-        
+        if use_fixed_bg:
+            # Fit only D0, k, P0 with fixed background
+            popt_3param, _ = curve_fit(
+                lambda n, D0, k, P0: self.model.simulate_to_cycle(
+                    D0, k, P0, n, fixed_bg_int, fixed_bg_slope
+                ),
+                cycles,
+                fluorescence,
+                p0=p0_reduced,
+                sigma=sigma,  # Weights via inverse uncertainty
+                bounds=(lower_bounds, upper_bounds),
+                method='trf',  # Trust Region Reflective (supports bounds)
+                maxfev=10000
+            )
+            # Expand to 5 parameters for consistency
+            popt = [popt_3param[0], popt_3param[1], popt_3param[2], fixed_bg_int, fixed_bg_slope]
+        else:
+            # Fit all 5 parameters
+            popt, _ = curve_fit(
+                lambda n, D0, k, P0, bg_int, bg_slope: self.model.simulate_to_cycle(
+                    D0, k, P0, n, bg_int, bg_slope
+                ),
+                cycles,
+                fluorescence,
+                p0=p0_reduced,
+                sigma=sigma,  # Weights via inverse uncertainty
+                bounds=(lower_bounds, upper_bounds),
+                method='trf',  # Trust Region Reflective (supports bounds)
+                maxfev=10000
+            )
+
         # Calculate R² and SSR
         y_pred = self.model.simulate_to_cycle(
             popt[0], popt[1], popt[2], cycles, popt[3], popt[4]
