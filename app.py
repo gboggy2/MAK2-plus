@@ -888,6 +888,9 @@ if cycles is not None and fluorescence is not None:
                     st.warning("⚠️ No replicate groups found with this pattern")
 
                 # Dilution series options
+                analyze_as_dilution = False
+                dilution_info = None
+
                 if len(preview_groups) >= 3:
                     analyze_as_dilution = st.checkbox(
                         "Analyze as dilution series",
@@ -905,9 +908,6 @@ if cycles is not None and fluorescence is not None:
 
                         if "Custom" in dilution_info:
                             st.info("💡 After fitting, you can specify custom dilution factors")
-                else:
-                    analyze_as_dilution = False
-                    dilution_info = None
 
                 # Store settings in session state
                 st.session_state['replicate_analysis_enabled'] = True
