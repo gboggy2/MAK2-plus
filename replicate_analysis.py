@@ -253,12 +253,13 @@ def plot_dilution_series_comparison(analysis_results: Dict) -> go.Figure:
                 type='data',
                 array=data['Ct_SD'],
                 visible=True,
-                thickness=2,
-                width=6
+                thickness=2.5,
+                width=8,
+                color='rgba(0,0,255,0.3)'
             ),
             mode='markers',
             name='Ct',
-            marker=dict(size=10, color='blue')
+            marker=dict(size=8, color='blue', line=dict(width=1, color='darkblue'))
         ),
         row=1, col=1
     )
@@ -289,12 +290,13 @@ def plot_dilution_series_comparison(analysis_results: Dict) -> go.Figure:
                 type='data',
                 array=log_d0_sd,
                 visible=True,
-                thickness=2,
-                width=6
+                thickness=2.5,
+                width=8,
+                color='rgba(255,0,0,0.3)'
             ),
             mode='markers',
             name='D0',
-            marker=dict(size=10, color='red')
+            marker=dict(size=8, color='red', line=dict(width=1, color='darkred'))
         ),
         row=1, col=2
     )
