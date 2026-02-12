@@ -30,6 +30,13 @@ from bootstrap import bootstrap_parameter_uncertainty, BootstrapAnalyzer
 from example_data_loader import ExampleDataLoader
 from qpcr_data_converter import load_qpcr_file, QPCRDataConverter
 from sample_selector_ui import create_sample_selector_widget
+from replicate_analysis import (
+    parse_sample_groups,
+    calculate_replicate_stats,
+    analyze_dilution_series,
+    compare_precision,
+    plot_dilution_series_comparison
+)
 
 # Page config
 st.set_page_config(
@@ -837,7 +844,79 @@ if cycles is not None and fluorescence is not None:
             
             # Show what bounds will be used
             st.info(f"**Custom bounds:** D₀: [{D0_min:.2e}, {D0_max:.2e}], k: [{k_min:.2e}, {k_max:.2e}], P₀: [{P0_min:.2e}, {P0_max:.2e}]")
-    
+
+    # Replicate Analysis Options (only show for batch mode)
+    if batch_mode and all_samples:
+        with st.sidebar.expander("📊 Replicate Analysis", expanded=False):
+            st.markdown("**Group samples into replicates**")
+
+            enable_replicate_analysis = st.checkbox(
+                "Enable replicate analysis",
+                value=False,
+                help="Automatically group samples and calculate statistics"
+            )
+
+            if enable_replicate_analysis:
+                grouping_pattern = st.radio(
+                    "Group samples by:",
+                    ["Dot (F1.1, F1.2 → F1)",
+                     "Underscore (Sample_A_1, Sample_A_2 → Sample_A)",
+                     "No grouping (show all samples)"],
+                    index=0,
+                    help="How to parse sample names into replicate groups"
+                )
+
+                # Preview groups with current samples
+                if grouping_pattern == "Dot (F1.1, F1.2 → F1)":
+                    pattern_key = 'dot'
+                elif grouping_pattern == "Underscore (Sample_A_1, Sample_A_2 → Sample_A)":
+                    pattern_key = 'underscore'
+                else:
+                    pattern_key = None
+
+                # Show preview of groups that will be created
+                preview_groups = parse_sample_groups(list(all_samples.keys()), pattern=pattern_key)
+
+                if len(preview_groups) > 0:
+                    st.success(f"✅ Found {len(preview_groups)} replicate groups")
+                    with st.expander("Preview groups", expanded=False):
+                        for group, samples in list(preview_groups.items())[:5]:  # Show first 5
+                            st.write(f"**{group}:** {', '.join(samples)}")
+                        if len(preview_groups) > 5:
+                            st.write(f"... and {len(preview_groups) - 5} more groups")
+                else:
+                    st.warning("⚠️ No replicate groups found with this pattern")
+
+                # Dilution series options
+                if len(preview_groups) >= 3:
+                    analyze_as_dilution = st.checkbox(
+                        "Analyze as dilution series",
+                        value=False,
+                        help="Check linearity and efficiency for dilution series"
+                    )
+
+                    if analyze_as_dilution:
+                        dilution_info = st.selectbox(
+                            "Dilution type:",
+                            ["2-fold serial dilutions (auto-detect order)",
+                             "Custom dilution factors (enter below)"],
+                            help="How are your samples diluted?"
+                        )
+
+                        if "Custom" in dilution_info:
+                            st.info("💡 After fitting, you can specify custom dilution factors")
+                else:
+                    analyze_as_dilution = False
+                    dilution_info = None
+
+                # Store settings in session state
+                st.session_state['replicate_analysis_enabled'] = True
+                st.session_state['grouping_pattern'] = pattern_key
+                st.session_state['analyze_as_dilution'] = analyze_as_dilution
+                st.session_state['dilution_info'] = dilution_info
+            else:
+                st.session_state['replicate_analysis_enabled'] = False
+
     # Fit button(s)
     if batch_mode and all_samples:
         # Batch mode - fit all samples
@@ -916,6 +995,13 @@ if cycles is not None and fluorescence is not None:
                     
                     metrics_batch = optimizer_batch.calculate_fit_metrics()
 
+                    # Calculate Ct (threshold cycle) for comparison with traditional methods
+                    try:
+                        ct_results = optimizer_batch.calculate_ct(method='threshold')
+                        ct_value = ct_results['ct']
+                    except:
+                        ct_value = np.nan
+
                     # Determine which tier was used
                     if params_batch.get('de_used', False):
                         tier = 'T3-DE'
@@ -928,6 +1014,7 @@ if cycles is not None and fluorescence is not None:
 
                     results_list.append({
                         'Sample': sample_name,
+                        'Ct': ct_value,
                         'D0': params_batch['D0'],
                         'k': params_batch['k'],
                         'P0': params_batch['P0'],
@@ -1126,7 +1213,209 @@ if cycles is not None and fluorescence is not None:
                 "text/csv",
                 key="batch_download"
             )
-        
+
+            # ============================================================================
+            # REPLICATE ANALYSIS SECTION
+            # ============================================================================
+            if st.session_state.get('replicate_analysis_enabled', False):
+                st.markdown("---")
+                st.subheader("📊 Replicate Analysis")
+
+                # Get grouping pattern from session state
+                pattern = st.session_state.get('grouping_pattern', 'dot')
+
+                # Parse sample groups
+                sample_groups = parse_sample_groups(
+                    results_df['Sample'].tolist(),
+                    pattern=pattern
+                )
+
+                if len(sample_groups) == 0:
+                    st.warning("⚠️ No replicate groups found with the selected pattern")
+                else:
+                    # Add Group column to results
+                    results_with_groups = results_df.copy()
+                    group_mapping = {}
+                    for group, samples in sample_groups.items():
+                        for sample in samples:
+                            group_mapping[sample] = group
+
+                    results_with_groups['Group'] = results_with_groups['Sample'].map(
+                        lambda x: group_mapping.get(x, x)
+                    )
+
+                    # Filter to only samples that are in groups
+                    results_with_groups = results_with_groups[
+                        results_with_groups['Group'] != results_with_groups['Sample']
+                    ]
+
+                    if len(results_with_groups) == 0:
+                        st.warning("⚠️ No samples matched the grouping pattern")
+                    else:
+                        st.success(f"✅ Analyzed {len(sample_groups)} replicate groups ({len(results_with_groups)} samples total)")
+
+                        # Calculate replicate statistics
+                        replicate_stats = calculate_replicate_stats(
+                            results_with_groups,
+                            group_column='Group',
+                            metrics=['Ct', 'D0']
+                        )
+
+                        # Precision comparison
+                        precision_comparison = compare_precision(replicate_stats)
+
+                        # Display tabs for different analyses
+                        tab1, tab2, tab3 = st.tabs([
+                            "📈 Replicate Statistics",
+                            "🎯 Precision Comparison",
+                            "📉 Dilution Series"
+                        ])
+
+                        with tab1:
+                            st.markdown("**Replicate Statistics (Mean ± SD)**")
+                            st.markdown("*Coefficient of Variation (CV%) = (SD / Mean) × 100*")
+
+                            # Format for display
+                            display_stats = replicate_stats.copy()
+                            format_stats_dict = {
+                                'Ct_Mean': '{:.2f}',
+                                'Ct_SD': '{:.3f}',
+                                'Ct_CV': '{:.2f}%',
+                                'D0_Mean': '{:.2e}',
+                                'D0_SD': '{:.2e}',
+                                'D0_CV': '{:.2f}%'
+                            }
+
+                            st.dataframe(
+                                display_stats.style.format(format_stats_dict, na_rep='-'),
+                                use_container_width=True
+                            )
+
+                            # Download button for stats
+                            stats_csv = replicate_stats.to_csv(index=False)
+                            st.download_button(
+                                "📥 Download Replicate Statistics (CSV)",
+                                stats_csv,
+                                "replicate_statistics.csv",
+                                "text/csv",
+                                key="replicate_stats_download"
+                            )
+
+                        with tab2:
+                            st.markdown("**Precision Comparison: Ct vs D0**")
+                            st.markdown("*Lower CV% = Better precision*")
+
+                            # Add color highlighting for better method
+                            def highlight_better_precision(row):
+                                if pd.isna(row['Ct_CV']) or pd.isna(row['D0_CV']):
+                                    return [''] * len(row)
+
+                                colors = [''] * len(row)
+                                ct_cv_idx = precision_comparison.columns.get_loc('Ct_CV')
+                                d0_cv_idx = precision_comparison.columns.get_loc('D0_CV')
+
+                                if row['Better_Precision'] == 'Ct':
+                                    colors[ct_cv_idx] = 'background-color: lightgreen'
+                                else:
+                                    colors[d0_cv_idx] = 'background-color: lightgreen'
+
+                                return colors
+
+                            format_precision_dict = {
+                                'Ct_Mean': '{:.2f}',
+                                'Ct_CV': '{:.2f}%',
+                                'D0_Mean': '{:.2e}',
+                                'D0_CV': '{:.2f}%',
+                                'CV_Difference': '{:.2f}%'
+                            }
+
+                            st.dataframe(
+                                precision_comparison.style.format(format_precision_dict, na_rep='-').apply(
+                                    highlight_better_precision, axis=1
+                                ),
+                                use_container_width=True
+                            )
+
+                            # Summary statistics
+                            ct_wins = (precision_comparison['Better_Precision'] == 'Ct').sum()
+                            d0_wins = (precision_comparison['Better_Precision'] == 'D0').sum()
+
+                            col1, col2, col3 = st.columns(3)
+                            col1.metric("Ct Better", f"{ct_wins}/{len(precision_comparison)}")
+                            col2.metric("D0 Better", f"{d0_wins}/{len(precision_comparison)}")
+                            avg_ct_cv = precision_comparison['Ct_CV'].mean()
+                            avg_d0_cv = precision_comparison['D0_CV'].mean()
+                            col3.metric("Avg CV Diff", f"{abs(avg_ct_cv - avg_d0_cv):.2f}%")
+
+                            st.markdown("---")
+                            st.markdown("**Interpretation:**")
+                            if d0_wins > ct_wins:
+                                st.success(f"✅ **D0 quantification** shows better precision in {d0_wins}/{len(precision_comparison)} groups")
+                            elif ct_wins > d0_wins:
+                                st.info(f"ℹ️ **Ct method** shows better precision in {ct_wins}/{len(precision_comparison)} groups")
+                            else:
+                                st.info("ℹ️ Both methods show similar precision across groups")
+
+                            # Download button
+                            precision_csv = precision_comparison.to_csv(index=False)
+                            st.download_button(
+                                "📥 Download Precision Comparison (CSV)",
+                                precision_csv,
+                                "precision_comparison.csv",
+                                "text/csv",
+                                key="precision_comparison_download"
+                            )
+
+                        with tab3:
+                            # Check if dilution series analysis is enabled
+                            if st.session_state.get('analyze_as_dilution', False):
+                                st.markdown("**Dilution Series Analysis**")
+
+                                if len(sample_groups) < 3:
+                                    st.warning("⚠️ Need at least 3 dilution levels for analysis")
+                                else:
+                                    # Run dilution series analysis
+                                    dilution_analysis = analyze_dilution_series(
+                                        results_with_groups,
+                                        dilution_factors=None,  # Auto-detect 2-fold
+                                        group_column='Group'
+                                    )
+
+                                    if 'error' in dilution_analysis:
+                                        st.error(dilution_analysis['error'])
+                                    else:
+                                        # Display results
+                                        col1, col2 = st.columns(2)
+
+                                        with col1:
+                                            st.markdown("**Ct Analysis**")
+                                            ct_analysis = dilution_analysis['ct_analysis']
+                                            st.metric("R²", f"{ct_analysis['r2']:.4f}")
+                                            st.metric("Efficiency", f"{ct_analysis['efficiency']:.1f}%")
+                                            st.metric("Slope", f"{ct_analysis['slope']:.4f}")
+
+                                        with col2:
+                                            st.markdown("**D0 Analysis**")
+                                            d0_analysis = dilution_analysis['d0_analysis']
+                                            st.metric("R²", f"{d0_analysis['r2']:.4f}")
+                                            st.metric("Slope", f"{d0_analysis['slope']:.4f}")
+                                            st.caption(f"Expected: {d0_analysis['expected_slope']:.4f}")
+
+                                        # Plot comparison
+                                        st.markdown("---")
+                                        st.markdown("**Linearity Comparison**")
+                                        dilution_plot = plot_dilution_series_comparison(dilution_analysis)
+                                        st.plotly_chart(dilution_plot, use_container_width=True)
+
+                                        # Summary
+                                        comparison = dilution_analysis['comparison']
+                                        if comparison['better_linearity'] == 'D0':
+                                            st.success(f"✅ **D0 shows better linearity** (R² = {comparison['d0_r2']:.4f} vs {comparison['ct_r2']:.4f})")
+                                        else:
+                                            st.info(f"ℹ️ **Ct shows better linearity** (R² = {comparison['ct_r2']:.4f} vs {comparison['d0_r2']:.4f})")
+                            else:
+                                st.info("💡 Enable 'Analyze as dilution series' in the sidebar to see linearity analysis")
+
         # Batch visualization section (outside button block, always visible if results exist)
         if 'batch_results_list' in st.session_state and 'batch_all_samples' in st.session_state:
             st.markdown("---")

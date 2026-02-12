@@ -1922,7 +1922,153 @@ class MAK2Optimizer:
         )
         
         return F_pred
-    
+
+    def calculate_ct(
+        self,
+        method: str = 'threshold',
+        threshold: Optional[float] = None,
+        baseline_cycles: Optional[Tuple[int, int]] = None
+    ) -> Dict[str, float]:
+        """
+        Calculate Ct (threshold cycle) using standard methods.
+
+        This provides instrument-equivalent Ct values for comparison
+        with traditional qPCR analysis software.
+
+        Parameters
+        ----------
+        method : str
+            Ct calculation method:
+            - 'threshold': Fixed fluorescence threshold (default, most common)
+            - 'second_derivative': Maximum second derivative (inflection point)
+            - 'regression': Linear regression on log-phase
+        threshold : float, optional
+            Fluorescence threshold for 'threshold' method.
+            If None, auto-calculated as baseline_mean + 10*baseline_SD
+        baseline_cycles : tuple, optional
+            (start, end) cycles for baseline calculation.
+            If None, uses first 25% of data
+
+        Returns
+        -------
+        results : dict
+            Dictionary containing:
+            - 'ct': Ct value
+            - 'method': Method used
+            - 'threshold': Threshold used (for threshold method)
+            - 'baseline_mean': Baseline mean fluorescence
+            - 'baseline_sd': Baseline standard deviation
+        """
+        if self.cycles_fit is None or self.fluorescence_fit is None:
+            raise ValueError("No fitted data available. Run fit() first.")
+
+        cycles = self.cycles_fit
+        fluorescence = self.fluorescence_fit
+
+        # Determine baseline region
+        if baseline_cycles is None:
+            baseline_end = max(3, int(len(cycles) * 0.25))
+            baseline_cycles = (0, baseline_end)
+
+        baseline_fluor = fluorescence[baseline_cycles[0]:baseline_cycles[1]]
+        baseline_mean = np.mean(baseline_fluor)
+        baseline_sd = np.std(baseline_fluor)
+
+        # Baseline-correct fluorescence (Delta Rn)
+        delta_rn = fluorescence - baseline_mean
+
+        results = {
+            'baseline_mean': baseline_mean,
+            'baseline_sd': baseline_sd,
+            'method': method
+        }
+
+        if method == 'threshold':
+            # Auto-calculate threshold if not provided
+            if threshold is None:
+                # Standard: 10× baseline SD above baseline
+                threshold = 10 * baseline_sd
+
+            results['threshold'] = threshold
+
+            # Find where delta_rn crosses threshold
+            above_threshold = delta_rn >= threshold
+
+            if not np.any(above_threshold):
+                results['ct'] = np.nan
+                return results
+
+            crossing_idx = np.where(above_threshold)[0][0]
+
+            if crossing_idx == 0:
+                results['ct'] = cycles[0]
+                return results
+
+            # Linear interpolation
+            c1, c2 = cycles[crossing_idx - 1], cycles[crossing_idx]
+            f1, f2 = delta_rn[crossing_idx - 1], delta_rn[crossing_idx]
+
+            if f2 == f1:
+                ct = c1
+            else:
+                ct = c1 + (threshold - f1) * (c2 - c1) / (f2 - f1)
+
+            results['ct'] = ct
+
+        elif method == 'second_derivative':
+            # Maximum second derivative (inflection point)
+            first_deriv = np.gradient(delta_rn)
+            second_deriv = np.gradient(first_deriv)
+            max_idx = np.argmax(second_deriv)
+            results['ct'] = cycles[max_idx]
+
+        elif method == 'regression':
+            # Linear regression on exponential phase
+            # Use log-transformed delta_rn (remove non-positive values)
+            valid_mask = delta_rn > 0
+            if np.sum(valid_mask) < 5:
+                results['ct'] = np.nan
+                return results
+
+            cycles_valid = cycles[valid_mask]
+            log_fluor = np.log(delta_rn[valid_mask])
+
+            # Find most linear window (sliding window of 5 points)
+            window_size = 5
+            best_r2 = -np.inf
+            best_coeffs = None
+
+            for i in range(len(cycles_valid) - window_size):
+                x = cycles_valid[i:i+window_size]
+                y = log_fluor[i:i+window_size]
+
+                coeffs = np.polyfit(x, y, deg=1)
+                y_pred = np.polyval(coeffs, x)
+                r2 = 1 - np.sum((y - y_pred)**2) / np.sum((y - np.mean(y))**2)
+
+                if r2 > best_r2:
+                    best_r2 = r2
+                    best_coeffs = coeffs
+
+            if best_coeffs is None:
+                results['ct'] = np.nan
+                return results
+
+            slope, intercept = best_coeffs
+
+            # Ct where regression line crosses baseline threshold (10× SD)
+            threshold_log = np.log(10 * baseline_sd)
+            ct = (threshold_log - intercept) / slope
+
+            results['ct'] = ct
+            results['efficiency'] = np.exp(slope) - 1
+            results['r2'] = best_r2
+
+        else:
+            raise ValueError(f"Unknown method: {method}")
+
+        return results
+
     def plot_fit(self):
         """
         Create a plot of the fitted model vs data.
