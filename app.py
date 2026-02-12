@@ -23,6 +23,12 @@ if 'optimizer' in sys.modules:
     importlib.reload(optimizer)
     print("🔄 RELOADED OPTIMIZER MODULE")
 
+# Force reload of replicate_analysis module to pick up latest changes
+if 'replicate_analysis' in sys.modules:
+    import replicate_analysis
+    importlib.reload(replicate_analysis)
+    print("🔄 RELOADED REPLICATE_ANALYSIS MODULE")
+
 from mak2_model import MAK2Model, find_truncation_cycle, calculate_amplification_efficiency
 from optimizer import MAK2Optimizer
 from data_processing import export_results
@@ -901,13 +907,25 @@ if cycles is not None and fluorescence is not None:
                     if analyze_as_dilution:
                         dilution_info = st.selectbox(
                             "Dilution type:",
-                            ["2-fold serial dilutions (auto-detect order)",
-                             "Custom dilution factors (enter below)"],
+                            ["2-fold serial dilutions",
+                             "10-fold serial dilutions",
+                             "5-fold serial dilutions",
+                             "Custom dilution factors"],
                             help="How are your samples diluted?"
                         )
 
-                        if "Custom" in dilution_info:
-                            st.info("💡 After fitting, you can specify custom dilution factors")
+                        # Determine dilution factor
+                        if "2-fold" in dilution_info:
+                            dilution_factor = 2
+                        elif "10-fold" in dilution_info:
+                            dilution_factor = 10
+                        elif "5-fold" in dilution_info:
+                            dilution_factor = 5
+                        else:
+                            dilution_factor = None
+                            st.info("💡 Custom dilution factors not yet implemented - defaulting to 2-fold")
+
+                        st.session_state['dilution_factor'] = dilution_factor
 
                 # Store settings in session state
                 st.session_state['replicate_analysis_enabled'] = True
@@ -1261,8 +1279,9 @@ if cycles is not None and fluorescence is not None:
                             metrics=['Ct', 'D0']
                         )
 
-                        # Precision comparison
-                        precision_comparison = compare_precision(replicate_stats)
+                        # Precision comparison (use default efficiency unless dilution series provides better estimate)
+                        # This will be updated if dilution series is analyzed
+                        precision_comparison = compare_precision(replicate_stats, efficiency=0.95)
 
                         # Display tabs for different analyses
                         tab1, tab2, tab3 = st.tabs([
@@ -1305,17 +1324,23 @@ if cycles is not None and fluorescence is not None:
                             st.markdown("**Precision Comparison: Ct vs D0**")
                             st.markdown("*Lower CV% = Better precision*")
 
+                            # Show which efficiency is being used
+                            if st.session_state.get('analyze_as_dilution', False) and len(sample_groups) >= 3:
+                                st.info("ℹ️ **Note:** Ct values are logarithmic, so Ct CV% is converted to concentration CV% using efficiency from dilution series.")
+                            else:
+                                st.info("ℹ️ **Note:** Ct values are logarithmic, so Ct CV% is converted to concentration CV% assuming 95% efficiency. Enable dilution series analysis for actual efficiency.")
+
                             # Add color highlighting for better method
                             def highlight_better_precision(row):
-                                if pd.isna(row['Ct_CV']) or pd.isna(row['D0_CV']):
+                                if pd.isna(row['Ct_Conc_CV']) or pd.isna(row['D0_CV']):
                                     return [''] * len(row)
 
                                 colors = [''] * len(row)
-                                ct_cv_idx = precision_comparison.columns.get_loc('Ct_CV')
+                                ct_conc_cv_idx = precision_comparison.columns.get_loc('Ct_Conc_CV')
                                 d0_cv_idx = precision_comparison.columns.get_loc('D0_CV')
 
                                 if row['Better_Precision'] == 'Ct':
-                                    colors[ct_cv_idx] = 'background-color: lightgreen'
+                                    colors[ct_conc_cv_idx] = 'background-color: lightgreen'
                                 else:
                                     colors[d0_cv_idx] = 'background-color: lightgreen'
 
@@ -1323,7 +1348,9 @@ if cycles is not None and fluorescence is not None:
 
                             format_precision_dict = {
                                 'Ct_Mean': '{:.2f}',
+                                'Ct_SD': '{:.3f}',
                                 'Ct_CV': '{:.2f}%',
+                                'Ct_Conc_CV': '{:.2f}%',
                                 'D0_Mean': '{:.2e}',
                                 'D0_CV': '{:.2f}%',
                                 'CV_Difference': '{:.2f}%'
@@ -1343,9 +1370,9 @@ if cycles is not None and fluorescence is not None:
                             col1, col2, col3 = st.columns(3)
                             col1.metric("Ct Better", f"{ct_wins}/{len(precision_comparison)}")
                             col2.metric("D0 Better", f"{d0_wins}/{len(precision_comparison)}")
-                            avg_ct_cv = precision_comparison['Ct_CV'].mean()
+                            avg_ct_conc_cv = precision_comparison['Ct_Conc_CV'].mean()
                             avg_d0_cv = precision_comparison['D0_CV'].mean()
-                            col3.metric("Avg CV Diff", f"{abs(avg_ct_cv - avg_d0_cv):.2f}%")
+                            col3.metric("Avg CV Diff", f"{abs(avg_ct_conc_cv - avg_d0_cv):.2f}%")
 
                             st.markdown("---")
                             st.markdown("**Interpretation:**")
@@ -1374,16 +1401,24 @@ if cycles is not None and fluorescence is not None:
                                 if len(sample_groups) < 3:
                                     st.warning("⚠️ Need at least 3 dilution levels for analysis")
                                 else:
+                                    # Get dilution factor from session state
+                                    dilution_factor = st.session_state.get('dilution_factor', 2)
+
                                     # Run dilution series analysis
                                     dilution_analysis = analyze_dilution_series(
                                         results_with_groups,
-                                        dilution_factors=None,  # Auto-detect 2-fold
+                                        dilution_factors=None,  # Will auto-generate based on dilution_factor
+                                        dilution_factor=dilution_factor,
                                         group_column='Group'
                                     )
 
                                     if 'error' in dilution_analysis:
                                         st.error(dilution_analysis['error'])
                                     else:
+                                        # Use efficiency from dilution series to recalculate precision comparison
+                                        ct_efficiency = dilution_analysis['ct_analysis']['efficiency'] / 100  # Convert % to fraction
+                                        precision_comparison = compare_precision(replicate_stats, efficiency=ct_efficiency)
+
                                         # Display results
                                         col1, col2 = st.columns(2)
 

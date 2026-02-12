@@ -111,6 +111,7 @@ def calculate_replicate_stats(
 def analyze_dilution_series(
     results_df: pd.DataFrame,
     dilution_factors: Optional[Dict[str, float]] = None,
+    dilution_factor: float = 2,
     group_column: str = 'Group'
 ) -> Dict:
     """
@@ -122,7 +123,10 @@ def analyze_dilution_series(
         Results with D0 and Ct values
     dilution_factors : dict, optional
         {group_name: dilution_factor} e.g., {'F1': 1, 'F2': 2, 'F3': 4}
-        If None, assumes groups are ordered (1, 2, 4, 8, ...)
+        If None, assumes groups are ordered with given dilution_factor
+    dilution_factor : float
+        Fold-dilution between consecutive groups (e.g., 2, 10, 5)
+        Only used if dilution_factors is None
     group_column : str
         Column name for grouping
 
@@ -144,8 +148,8 @@ def analyze_dilution_series(
 
     # Assign dilution factors
     if dilution_factors is None:
-        # Assume 2-fold dilutions
-        dilution_factors = {row['Group']: 2**i for i, row in grouped.iterrows()}
+        # Auto-generate dilution factors (e.g., 1, 2, 4, 8 for 2-fold or 1, 10, 100, 1000 for 10-fold)
+        dilution_factors = {row['Group']: dilution_factor**i for i, row in grouped.iterrows()}
 
     # Add dilution info
     grouped['Dilution'] = grouped['Group'].map(dilution_factors)
@@ -158,37 +162,43 @@ def analyze_dilution_series(
             'd0_analysis': None
         }
 
-    # CT ANALYSIS: ΔCt vs log2(dilution)
-    # Expected: ΔCt = -log2(dilution) * (1/efficiency)
-    # Slope = -1 for 100% efficiency
-    log_dilution = np.log2(grouped['Dilution'].values)
+    # CT ANALYSIS: Standard curve approach
+    # Plot Ct vs log10(1/dilution) = -log10(dilution)
+    # For standard curve: Ct = -m * log10(quantity) + b
+    # Efficiency = 10^(-1/m) - 1
+    # Expected slope m ≈ -3.32 for 100% efficiency
+
+    log_dilution = np.log2(grouped['Dilution'].values)  # For plotting
+    log10_dilution = np.log10(grouped['Dilution'].values)
     ct_values = grouped['Ct_Mean'].values
 
-    # Regress Ct vs log2(dilution)
-    ct_slope, ct_intercept, ct_r2, _, _ = linregress(log_dilution, ct_values)
+    # Regress Ct vs log10(dilution) - note: dilution increases means template decreases
+    # So we use -log10(dilution) to get standard curve format (higher template = lower Ct)
+    ct_slope, ct_intercept, ct_r2, _, _ = linregress(-log10_dilution, ct_values)
 
-    # Efficiency from slope: E = 2^(-1/slope) - 1
-    ct_efficiency = (2 ** (-1 / ct_slope) - 1) * 100 if ct_slope != 0 else np.nan
+    # Efficiency from slope: E = 10^(-1/slope) - 1
+    # For 100% efficiency, slope = -3.32 (doubling per cycle)
+    ct_efficiency = (10 ** (-1 / ct_slope) - 1) * 100 if ct_slope != 0 else np.nan
 
     ct_analysis = {
         'slope': ct_slope,
         'intercept': ct_intercept,
         'r2': ct_r2 ** 2,
         'efficiency': ct_efficiency,
-        'expected_slope': -1.0,
-        'slope_error': abs(ct_slope - (-1.0))
+        'expected_slope': -3.32,  # For 100% efficiency
+        'slope_error': abs(ct_slope - (-3.32))
     }
 
-    # D0 ANALYSIS: log10(D0) vs log2(dilution)
-    # Expected: perfect inverse relationship
-    # Slope = -1 (doubling dilution halves D0)
+    # D0 ANALYSIS: log10(D0) vs log10(dilution)
+    # For dilution series: log10(D0) should decrease linearly with log10(dilution)
+    # Expected slope = -1 (10-fold dilution → 10-fold decrease in D0)
     log_d0 = np.log10(grouped['D0_Mean'].values)
 
-    d0_slope, d0_intercept, d0_r2, _, _ = linregress(log_dilution, log_d0)
+    d0_slope, d0_intercept, d0_r2, _, _ = linregress(log10_dilution, log_d0)
 
-    # Convert slope to efficiency-like metric
-    # D0 should halve with each dilution → slope ≈ -0.301 (log10(0.5))
-    expected_d0_slope = np.log10(0.5)  # -0.301
+    # Expected slope is -1 for perfect dilution series
+    # (log10(D0) decreases by 1 for each log10 unit increase in dilution)
+    expected_d0_slope = -1.0
 
     d0_analysis = {
         'slope': d0_slope,
@@ -239,39 +249,75 @@ def plot_dilution_series_comparison(analysis_results: Dict) -> go.Figure:
             f"Ct Method (R² = {ct_analysis['r2']:.4f}, E = {ct_analysis['efficiency']:.1f}%)",
             f"D0 Method (R² = {d0_analysis['r2']:.4f})"
         ),
-        x_title="Log2(Dilution Factor)"
+        x_title="Log10(Dilution Factor)"
     )
 
-    log_dilution = np.log2(data['Dilution'].values)
+    # Use log10 for x-axis to match regression calculations
+    log_dilution = np.log10(data['Dilution'].values)
 
     # Debug: Print error bar values to check they exist
     print(f"DEBUG - Ct SD values: {data['Ct_SD'].values}")
     print(f"DEBUG - D0 SD values: {data['D0_SD'].values}")
 
-    # Plot Ct with error bars
-    ct_error_bars = data['Ct_SD'].values
+    # Plot Ct with EXPLICIT error bars (drawn as separate traces)
+    ct_mean = data['Ct_Mean'].values
+    ct_sd = data['Ct_SD'].values
 
+    # Draw error bars as vertical lines
+    for i in range(len(log_dilution)):
+        # Vertical line from mean-SD to mean+SD
+        fig.add_trace(
+            go.Scatter(
+                x=[log_dilution[i], log_dilution[i]],
+                y=[ct_mean[i] - ct_sd[i], ct_mean[i] + ct_sd[i]],
+                mode='lines',
+                line=dict(color='blue', width=2),
+                showlegend=False,
+                hoverinfo='skip'
+            ),
+            row=1, col=1
+        )
+        # Top cap
+        fig.add_trace(
+            go.Scatter(
+                x=[log_dilution[i] - 0.1, log_dilution[i] + 0.1],
+                y=[ct_mean[i] + ct_sd[i], ct_mean[i] + ct_sd[i]],
+                mode='lines',
+                line=dict(color='blue', width=2),
+                showlegend=False,
+                hoverinfo='skip'
+            ),
+            row=1, col=1
+        )
+        # Bottom cap
+        fig.add_trace(
+            go.Scatter(
+                x=[log_dilution[i] - 0.1, log_dilution[i] + 0.1],
+                y=[ct_mean[i] - ct_sd[i], ct_mean[i] - ct_sd[i]],
+                mode='lines',
+                line=dict(color='blue', width=2),
+                showlegend=False,
+                hoverinfo='skip'
+            ),
+            row=1, col=1
+        )
+
+    # Now plot the data points on top
     fig.add_trace(
         go.Scatter(
             x=log_dilution,
-            y=data['Ct_Mean'],
-            error_y=dict(
-                type='data',
-                array=ct_error_bars,
-                arrayminus=ct_error_bars,  # Symmetric error bars
-                visible=True,
-                thickness=3,
-                width=10
-            ),
+            y=ct_mean,
             mode='markers',
             name='Ct (±SD)',
-            marker=dict(size=8, color='blue', line=dict(width=2, color='darkblue'))
+            marker=dict(size=3, color='blue', line=dict(width=1, color='darkblue'))
         ),
         row=1, col=1
     )
 
     # Ct regression line
-    ct_fit = ct_analysis['slope'] * log_dilution + ct_analysis['intercept']
+    # ct_analysis slope is from -log10(dilution) regression (standard curve format)
+    # So to plot: Ct = slope * (-log10_dilution) + intercept
+    ct_fit = ct_analysis['slope'] * (-log_dilution) + ct_analysis['intercept']
     fig.add_trace(
         go.Scatter(
             x=log_dilution,
@@ -284,31 +330,65 @@ def plot_dilution_series_comparison(analysis_results: Dict) -> go.Figure:
         row=1, col=1
     )
 
-    # Plot D0 with error bars
+    # Plot D0 with EXPLICIT error bars (drawn as separate traces)
     log_d0 = np.log10(data['D0_Mean'].values)
     log_d0_sd = data['D0_SD'] / (data['D0_Mean'] * np.log(10))  # Error propagation
     d0_error_bars = log_d0_sd.values if hasattr(log_d0_sd, 'values') else log_d0_sd
 
+    # Draw error bars as vertical lines
+    for i in range(len(log_dilution)):
+        # Vertical line from mean-SD to mean+SD
+        fig.add_trace(
+            go.Scatter(
+                x=[log_dilution[i], log_dilution[i]],
+                y=[log_d0[i] - d0_error_bars[i], log_d0[i] + d0_error_bars[i]],
+                mode='lines',
+                line=dict(color='red', width=2),
+                showlegend=False,
+                hoverinfo='skip'
+            ),
+            row=1, col=2
+        )
+        # Top cap
+        fig.add_trace(
+            go.Scatter(
+                x=[log_dilution[i] - 0.1, log_dilution[i] + 0.1],
+                y=[log_d0[i] + d0_error_bars[i], log_d0[i] + d0_error_bars[i]],
+                mode='lines',
+                line=dict(color='red', width=2),
+                showlegend=False,
+                hoverinfo='skip'
+            ),
+            row=1, col=2
+        )
+        # Bottom cap
+        fig.add_trace(
+            go.Scatter(
+                x=[log_dilution[i] - 0.1, log_dilution[i] + 0.1],
+                y=[log_d0[i] - d0_error_bars[i], log_d0[i] - d0_error_bars[i]],
+                mode='lines',
+                line=dict(color='red', width=2),
+                showlegend=False,
+                hoverinfo='skip'
+            ),
+            row=1, col=2
+        )
+
+    # Now plot the data points on top
     fig.add_trace(
         go.Scatter(
             x=log_dilution,
             y=log_d0,
-            error_y=dict(
-                type='data',
-                array=d0_error_bars,
-                arrayminus=d0_error_bars,  # Symmetric error bars
-                visible=True,
-                thickness=3,
-                width=10
-            ),
             mode='markers',
             name='D0 (±SD)',
-            marker=dict(size=8, color='red', line=dict(width=2, color='darkred'))
+            marker=dict(size=3, color='red', line=dict(width=1, color='darkred'))
         ),
         row=1, col=2
     )
 
     # D0 regression line
+    # d0_analysis slope is from log10(dilution) vs log10(D0)
+    # So to plot: log10(D0) = slope * log10_dilution + intercept
     d0_fit = d0_analysis['slope'] * log_dilution + d0_analysis['intercept']
     fig.add_trace(
         go.Scatter(
@@ -335,29 +415,41 @@ def plot_dilution_series_comparison(analysis_results: Dict) -> go.Figure:
     return fig
 
 
-def compare_precision(stats_df: pd.DataFrame) -> pd.DataFrame:
+def compare_precision(stats_df: pd.DataFrame, efficiency: float = 0.95) -> pd.DataFrame:
     """
     Compare precision (CV%) between Ct and D0 methods.
+
+    NOTE: Ct CV% is not directly comparable to D0 CV% because Ct is logarithmic.
+    We convert Ct variation to concentration variation using: Quantity ∝ E^Ct
+    where E is PCR efficiency (default 0.95 = 95%).
 
     Parameters
     ----------
     stats_df : pd.DataFrame
         Output from calculate_replicate_stats()
+    efficiency : float
+        PCR efficiency (0-1), default 0.95. Can be estimated from dilution series.
 
     Returns
     -------
     comparison_df : pd.DataFrame
         Side-by-side comparison with winner column
     """
-    comparison = stats_df[['Group', 'N', 'Ct_Mean', 'Ct_CV', 'D0_Mean', 'D0_CV']].copy()
+    comparison = stats_df[['Group', 'N', 'Ct_Mean', 'Ct_SD', 'Ct_CV', 'D0_Mean', 'D0_CV']].copy()
 
-    # Determine which method has better (lower) CV
+    # Convert Ct variation to equivalent concentration CV%
+    # For E^Ct, the CV% ≈ |ln(1+E) × Ct_SD| × 100
+    # Simplified: CV% ≈ ln(1+E) × Ct_SD × 100
+    E = efficiency
+    comparison['Ct_Conc_CV'] = np.abs(np.log(1 + E) * comparison['Ct_SD']) * 100
+
+    # Determine which method has better (lower) CV on concentration
     comparison['Better_Precision'] = comparison.apply(
-        lambda row: 'D0' if row['D0_CV'] < row['Ct_CV'] else 'Ct',
+        lambda row: 'D0' if row['D0_CV'] < row['Ct_Conc_CV'] else 'Ct',
         axis=1
     )
 
-    comparison['CV_Difference'] = comparison['Ct_CV'] - comparison['D0_CV']
+    comparison['CV_Difference'] = comparison['Ct_Conc_CV'] - comparison['D0_CV']
 
     return comparison
 
