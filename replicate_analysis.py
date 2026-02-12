@@ -249,7 +249,13 @@ def plot_dilution_series_comparison(analysis_results: Dict) -> go.Figure:
         go.Scatter(
             x=log_dilution,
             y=data['Ct_Mean'],
-            error_y=dict(type='data', array=data['Ct_SD']),
+            error_y=dict(
+                type='data',
+                array=data['Ct_SD'],
+                visible=True,
+                thickness=2,
+                width=6
+            ),
             mode='markers',
             name='Ct',
             marker=dict(size=10, color='blue')
@@ -279,7 +285,13 @@ def plot_dilution_series_comparison(analysis_results: Dict) -> go.Figure:
         go.Scatter(
             x=log_dilution,
             y=log_d0,
-            error_y=dict(type='data', array=log_d0_sd),
+            error_y=dict(
+                type='data',
+                array=log_d0_sd,
+                visible=True,
+                thickness=2,
+                width=6
+            ),
             mode='markers',
             name='D0',
             marker=dict(size=10, color='red')
