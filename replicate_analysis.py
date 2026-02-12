@@ -244,18 +244,24 @@ def plot_dilution_series_comparison(analysis_results: Dict) -> go.Figure:
 
     log_dilution = np.log2(data['Dilution'].values)
 
-    # Plot Ct
+    # Debug: Print error bar values to check they exist
+    print(f"DEBUG - Ct SD values: {data['Ct_SD'].values}")
+    print(f"DEBUG - D0 SD values: {data['D0_SD'].values}")
+
+    # Plot Ct with error bars
+    ct_error_bars = data['Ct_SD'].values
+
     fig.add_trace(
         go.Scatter(
             x=log_dilution,
             y=data['Ct_Mean'],
             error_y=dict(
                 type='data',
-                array=data['Ct_SD'],
+                array=ct_error_bars,
                 visible=True,
-                thickness=2.5,
-                width=8,
-                color='rgba(0,0,255,0.3)'
+                thickness=3,
+                width=10,
+                color='blue'
             ),
             mode='markers',
             name='Ct',
@@ -278,9 +284,10 @@ def plot_dilution_series_comparison(analysis_results: Dict) -> go.Figure:
         row=1, col=1
     )
 
-    # Plot D0
+    # Plot D0 with error bars
     log_d0 = np.log10(data['D0_Mean'].values)
     log_d0_sd = data['D0_SD'] / (data['D0_Mean'] * np.log(10))  # Error propagation
+    d0_error_bars = log_d0_sd.values if hasattr(log_d0_sd, 'values') else log_d0_sd
 
     fig.add_trace(
         go.Scatter(
@@ -288,11 +295,11 @@ def plot_dilution_series_comparison(analysis_results: Dict) -> go.Figure:
             y=log_d0,
             error_y=dict(
                 type='data',
-                array=log_d0_sd,
+                array=d0_error_bars,
                 visible=True,
-                thickness=2.5,
-                width=8,
-                color='rgba(255,0,0,0.3)'
+                thickness=3,
+                width=10,
+                color='red'
             ),
             mode='markers',
             name='D0',
