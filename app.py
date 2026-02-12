@@ -1404,6 +1404,15 @@ if cycles is not None and fluorescence is not None:
                                         # Plot comparison
                                         st.markdown("---")
                                         st.markdown("**Linearity Comparison**")
+
+                                        # Debug: Show error bar values
+                                        with st.expander("🔍 Debug: Error Bar Values"):
+                                            data_debug = dilution_analysis['data']
+                                            st.write("**Ct Standard Deviations:**")
+                                            st.write(data_debug[['Group', 'Ct_Mean', 'Ct_SD']].to_string())
+                                            st.write("\n**D0 Standard Deviations:**")
+                                            st.write(data_debug[['Group', 'D0_Mean', 'D0_SD']].to_string())
+
                                         dilution_plot = plot_dilution_series_comparison(dilution_analysis)
                                         st.plotly_chart(dilution_plot, use_container_width=True)
 

@@ -258,14 +258,14 @@ def plot_dilution_series_comparison(analysis_results: Dict) -> go.Figure:
             error_y=dict(
                 type='data',
                 array=ct_error_bars,
+                arrayminus=ct_error_bars,  # Symmetric error bars
                 visible=True,
                 thickness=3,
-                width=10,
-                color='blue'
+                width=10
             ),
             mode='markers',
-            name='Ct',
-            marker=dict(size=8, color='blue', line=dict(width=1, color='darkblue'))
+            name='Ct (±SD)',
+            marker=dict(size=8, color='blue', line=dict(width=2, color='darkblue'))
         ),
         row=1, col=1
     )
@@ -296,14 +296,14 @@ def plot_dilution_series_comparison(analysis_results: Dict) -> go.Figure:
             error_y=dict(
                 type='data',
                 array=d0_error_bars,
+                arrayminus=d0_error_bars,  # Symmetric error bars
                 visible=True,
                 thickness=3,
-                width=10,
-                color='red'
+                width=10
             ),
             mode='markers',
-            name='D0',
-            marker=dict(size=8, color='red', line=dict(width=1, color='darkred'))
+            name='D0 (±SD)',
+            marker=dict(size=8, color='red', line=dict(width=2, color='darkred'))
         ),
         row=1, col=2
     )
