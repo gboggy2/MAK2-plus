@@ -865,23 +865,66 @@ if cycles is not None and fluorescence is not None:
             if enable_replicate_analysis:
                 grouping_pattern = st.radio(
                     "Group samples by:",
-                    ["Dot (F1.1, F1.2 → F1)",
+                    ["Dot - last (F1.1, F1.2 → F1)",
+                     "Dot - first (X1.R1.1, X1.R2.1 → X1)",
                      "Underscore (Sample_A_1, Sample_A_2 → Sample_A)",
+                     "Manual grouping (define your own)",
                      "No grouping (show all samples)"],
                     index=0,
                     help="How to parse sample names into replicate groups"
                 )
 
                 # Preview groups with current samples
-                if grouping_pattern == "Dot (F1.1, F1.2 → F1)":
+                if "Dot - last" in grouping_pattern:
                     pattern_key = 'dot'
+                elif "Dot - first" in grouping_pattern:
+                    pattern_key = 'first_part'
                 elif grouping_pattern == "Underscore (Sample_A_1, Sample_A_2 → Sample_A)":
                     pattern_key = 'underscore'
+                elif grouping_pattern == "Manual grouping (define your own)":
+                    pattern_key = 'manual'
                 else:
                     pattern_key = None
 
                 # Show preview of groups that will be created
-                preview_groups = parse_sample_groups(list(all_samples.keys()), pattern=pattern_key)
+                if pattern_key == 'manual':
+                    # Manual grouping interface
+                    st.markdown("**Define replicate groups manually:**")
+                    st.caption("Enter one group per line. Format: GroupName: Sample1, Sample2, Sample3")
+
+                    # Show available samples
+                    with st.expander("📋 Available samples", expanded=False):
+                        sample_list = list(all_samples.keys())
+                        for i, sample in enumerate(sample_list, 1):
+                            st.write(f"{i}. {sample}")
+
+                    # Text area for manual grouping
+                    manual_groups_text = st.text_area(
+                        "Define groups (one per line):",
+                        value=st.session_state.get('manual_groups_text', ''),
+                        height=200,
+                        placeholder="Example:\nGroup1: Sample_1, Sample_2, Sample_3\nGroup2: Sample_4, Sample_5, Sample_6",
+                        help="Each line defines one group. Use format 'GroupName: sample1, sample2, sample3'"
+                    )
+
+                    st.session_state['manual_groups_text'] = manual_groups_text
+
+                    # Parse manual groups
+                    preview_groups = {}
+                    if manual_groups_text.strip():
+                        for line in manual_groups_text.strip().split('\n'):
+                            if ':' in line:
+                                group_name, samples_str = line.split(':', 1)
+                                group_name = group_name.strip()
+                                samples = [s.strip() for s in samples_str.split(',')]
+                                # Validate that samples exist
+                                valid_samples = [s for s in samples if s in all_samples]
+                                if valid_samples:
+                                    preview_groups[group_name] = valid_samples
+                                else:
+                                    st.warning(f"⚠️ Group '{group_name}' has no valid samples")
+                else:
+                    preview_groups = parse_sample_groups(list(all_samples.keys()), pattern=pattern_key)
 
                 if len(preview_groups) > 0:
                     st.success(f"✅ Found {len(preview_groups)} replicate groups")
@@ -917,19 +960,66 @@ if cycles is not None and fluorescence is not None:
                         # Determine dilution factor
                         if "2-fold" in dilution_info:
                             dilution_factor = 2
+                            custom_dilution_factors = None
                         elif "10-fold" in dilution_info:
                             dilution_factor = 10
+                            custom_dilution_factors = None
                         elif "5-fold" in dilution_info:
                             dilution_factor = 5
+                            custom_dilution_factors = None
                         else:
+                            # Custom dilution factors
                             dilution_factor = None
-                            st.info("💡 Custom dilution factors not yet implemented - defaulting to 2-fold")
+                            st.markdown("**Define dilution factors for each group:**")
+                            st.caption("Enter one line per group. Format: GroupName: dilution_factor")
+                            st.caption("Example: if Group1 is undiluted (1×), Group2 is 10× diluted, Group3 is 100× diluted")
+
+                            custom_dilution_text = st.text_area(
+                                "Define dilution factors:",
+                                value=st.session_state.get('custom_dilution_text', ''),
+                                height=150,
+                                placeholder="Example:\nGroup1: 1\nGroup2: 10\nGroup3: 100\nGroup4: 1000",
+                                help="Dilution factor = how many times diluted (1 = undiluted, 10 = 10× diluted, etc.)"
+                            )
+
+                            st.session_state['custom_dilution_text'] = custom_dilution_text
+
+                            # Parse custom dilution factors
+                            custom_dilution_factors = {}
+                            if custom_dilution_text.strip():
+                                for line in custom_dilution_text.strip().split('\n'):
+                                    if ':' in line:
+                                        group_name, factor_str = line.split(':', 1)
+                                        group_name = group_name.strip()
+                                        try:
+                                            factor = float(factor_str.strip())
+                                            if group_name in preview_groups:
+                                                custom_dilution_factors[group_name] = factor
+                                            else:
+                                                st.warning(f"⚠️ Group '{group_name}' not found in replicate groups")
+                                        except ValueError:
+                                            st.warning(f"⚠️ Invalid dilution factor for '{group_name}': {factor_str}")
 
                         st.session_state['dilution_factor'] = dilution_factor
+                        st.session_state['custom_dilution_factors'] = custom_dilution_factors if dilution_factor is None else None
+
+                        # Option to exclude groups from dilution series
+                        st.markdown("**Exclude groups from dilution series (optional):**")
+                        st.caption("Select groups to exclude (e.g., most diluted samples with poor amplification)")
+
+                        groups_to_exclude = st.multiselect(
+                            "Exclude these groups:",
+                            options=list(preview_groups.keys()),
+                            default=[],
+                            help="These groups will be excluded from dilution series analysis"
+                        )
+
+                        st.session_state['exclude_from_dilution'] = groups_to_exclude
 
                 # Store settings in session state
                 st.session_state['replicate_analysis_enabled'] = True
                 st.session_state['grouping_pattern'] = pattern_key
+                st.session_state['preview_groups'] = preview_groups
                 st.session_state['analyze_as_dilution'] = analyze_as_dilution
                 st.session_state['dilution_info'] = dilution_info
             else:
@@ -990,6 +1080,41 @@ if cycles is not None and fluorescence is not None:
             progress_bar = st.progress(0)
             status_text = st.empty()
 
+            # Calculate global threshold from all samples for consistent Ct calculation
+            # This mimics how real qPCR instruments calculate threshold for a plate
+            status_text.text("Calculating global threshold for Ct analysis...")
+            global_threshold = None
+
+            # Collect fluorescence from all samples to calculate a plate-wide threshold
+            all_fluorescence = []
+            for fluor_data in all_samples_to_fit.values():
+                all_fluorescence.append(fluor_data)
+
+            if len(all_fluorescence) > 0:
+                # Calculate global baseline statistics from early cycles of all samples
+                baseline_end = max(3, int(len(cycles) * 0.25))
+                all_baseline_values = []
+
+                for fluor_data in all_fluorescence:
+                    early_fluor = fluor_data[0:baseline_end]
+                    all_baseline_values.extend(early_fluor)
+
+                # Check if data is baseline-subtracted
+                mean_early = np.mean(all_baseline_values)
+                already_baseline_subtracted = (mean_early < 0.1) or (np.any(np.array(all_baseline_values) < 0))
+
+                if already_baseline_subtracted:
+                    # For baseline-subtracted data, use SD of early cycles across all samples
+                    global_baseline_sd = np.std(all_baseline_values)
+                    global_threshold = 10 * global_baseline_sd if global_baseline_sd > 0 else 0.01
+                else:
+                    # For raw data, calculate baseline mean and SD
+                    global_baseline_mean = np.mean(all_baseline_values)
+                    global_baseline_sd = np.std(all_baseline_values)
+                    global_threshold = 10 * global_baseline_sd
+
+                st.info(f"📊 Using global threshold: {global_threshold:.6f} (calculated from all {len(all_samples_to_fit)} samples)")
+
             # Pass 1: Fit all samples normally
             for i, (sample_name, fluor_data) in enumerate(all_samples_to_fit.items()):
                 status_text.text(f"Pass 1: Fitting {sample_name}... ({i+1}/{len(all_samples_to_fit)})")
@@ -1014,8 +1139,12 @@ if cycles is not None and fluorescence is not None:
                     metrics_batch = optimizer_batch.calculate_fit_metrics()
 
                     # Calculate Ct (threshold cycle) for comparison with traditional methods
+                    # Use global threshold for consistency across all samples
                     try:
-                        ct_results = optimizer_batch.calculate_ct(method='threshold')
+                        ct_results = optimizer_batch.calculate_ct(
+                            method='threshold',
+                            threshold=global_threshold
+                        )
                         ct_value = ct_results['ct']
                     except:
                         ct_value = np.nan
@@ -1243,10 +1372,25 @@ if cycles is not None and fluorescence is not None:
                 pattern = st.session_state.get('grouping_pattern', 'dot')
 
                 # Parse sample groups
-                sample_groups = parse_sample_groups(
-                    results_df['Sample'].tolist(),
-                    pattern=pattern
-                )
+                if pattern == 'manual':
+                    # Use manually defined groups from session state
+                    sample_groups = {}
+                    manual_groups_text = st.session_state.get('manual_groups_text', '')
+                    if manual_groups_text.strip():
+                        for line in manual_groups_text.strip().split('\n'):
+                            if ':' in line:
+                                group_name, samples_str = line.split(':', 1)
+                                group_name = group_name.strip()
+                                samples = [s.strip() for s in samples_str.split(',')]
+                                # Validate that samples exist in results
+                                valid_samples = [s for s in samples if s in results_df['Sample'].tolist()]
+                                if valid_samples:
+                                    sample_groups[group_name] = valid_samples
+                else:
+                    sample_groups = parse_sample_groups(
+                        results_df['Sample'].tolist(),
+                        pattern=pattern
+                    )
 
                 if len(sample_groups) == 0:
                     st.warning("⚠️ No replicate groups found with the selected pattern")
@@ -1403,12 +1547,23 @@ if cycles is not None and fluorescence is not None:
                                 else:
                                     # Get dilution factor from session state
                                     dilution_factor = st.session_state.get('dilution_factor', 2)
+                                    custom_dilution_factors = st.session_state.get('custom_dilution_factors', None)
+                                    groups_to_exclude = st.session_state.get('exclude_from_dilution', [])
+
+                                    # Filter out excluded groups before analysis
+                                    if groups_to_exclude:
+                                        results_filtered = results_with_groups[
+                                            ~results_with_groups['Group'].isin(groups_to_exclude)
+                                        ].copy()
+                                        st.info(f"📝 Excluding {len(groups_to_exclude)} group(s) from dilution analysis: {', '.join(groups_to_exclude)}")
+                                    else:
+                                        results_filtered = results_with_groups
 
                                     # Run dilution series analysis
                                     dilution_analysis = analyze_dilution_series(
-                                        results_with_groups,
-                                        dilution_factors=None,  # Will auto-generate based on dilution_factor
-                                        dilution_factor=dilution_factor,
+                                        results_filtered,
+                                        dilution_factors=custom_dilution_factors,  # Use custom if provided, else auto-generate
+                                        dilution_factor=dilution_factor if custom_dilution_factors is None else 2,
                                         group_column='Group'
                                     )
 

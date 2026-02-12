@@ -44,6 +44,10 @@ def parse_sample_groups(sample_names: List[str], pattern: Optional[str] = None) 
             # Split on last underscore: "Sample_A_1" → "Sample_A"
             parts = name.rsplit('_', 1)
             group = parts[0] if len(parts) > 1 else name
+        elif pattern == 'first_part':
+            # Split on first dot: "X1.R1.1" → "X1"
+            parts = name.split('.', 1)
+            group = parts[0] if len(parts) > 1 else name
         else:
             # No grouping
             group = name
@@ -155,6 +159,9 @@ def analyze_dilution_series(
     grouped['Dilution'] = grouped['Group'].map(dilution_factors)
     grouped = grouped.dropna(subset=['Dilution']).sort_values('Dilution')
 
+    # Ensure dilution values are float type for numpy operations
+    grouped['Dilution'] = grouped['Dilution'].astype(float)
+
     if len(grouped) < 3:
         return {
             'error': 'Need at least 3 dilution points',
@@ -168,9 +175,11 @@ def analyze_dilution_series(
     # Efficiency = 10^(-1/m) - 1
     # Expected slope m ≈ -3.32 for 100% efficiency
 
-    log_dilution = np.log2(grouped['Dilution'].values)  # For plotting
-    log10_dilution = np.log10(grouped['Dilution'].values)
-    ct_values = grouped['Ct_Mean'].values
+    # Extract values as numpy float arrays
+    dilution_values = np.array(grouped['Dilution'].values, dtype=float)
+    log_dilution = np.log2(dilution_values)  # For plotting
+    log10_dilution = np.log10(dilution_values)
+    ct_values = np.array(grouped['Ct_Mean'].values, dtype=float)
 
     # Regress Ct vs log10(dilution) - note: dilution increases means template decreases
     # So we use -log10(dilution) to get standard curve format (higher template = lower Ct)
@@ -192,7 +201,7 @@ def analyze_dilution_series(
     # D0 ANALYSIS: log10(D0) vs log10(dilution)
     # For dilution series: log10(D0) should decrease linearly with log10(dilution)
     # Expected slope = -1 (10-fold dilution → 10-fold decrease in D0)
-    log_d0 = np.log10(grouped['D0_Mean'].values)
+    log_d0 = np.log10(np.array(grouped['D0_Mean'].values, dtype=float))
 
     d0_slope, d0_intercept, d0_r2, _, _ = linregress(log10_dilution, log_d0)
 
@@ -253,7 +262,8 @@ def plot_dilution_series_comparison(analysis_results: Dict) -> go.Figure:
     )
 
     # Use log10 for x-axis to match regression calculations
-    log_dilution = np.log10(data['Dilution'].values)
+    # Ensure dilution values are float type for numpy operations
+    log_dilution = np.log10(np.array(data['Dilution'].values, dtype=float))
 
     # Debug: Print error bar values to check they exist
     print(f"DEBUG - Ct SD values: {data['Ct_SD'].values}")

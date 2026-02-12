@@ -1965,17 +1965,32 @@ class MAK2Optimizer:
         cycles = self.cycles_fit
         fluorescence = self.fluorescence_fit
 
-        # Determine baseline region
-        if baseline_cycles is None:
-            baseline_end = max(3, int(len(cycles) * 0.25))
-            baseline_cycles = (0, baseline_end)
+        # Auto-detect if data is already baseline-subtracted
+        # Check first 25% of cycles: if many are near-zero or negative, likely pre-subtracted
+        baseline_end = max(3, int(len(cycles) * 0.25))
+        early_fluor = fluorescence[0:baseline_end]
 
-        baseline_fluor = fluorescence[baseline_cycles[0]:baseline_cycles[1]]
-        baseline_mean = np.mean(baseline_fluor)
-        baseline_sd = np.std(baseline_fluor)
+        # Data is likely pre-baseline-subtracted if:
+        # 1. Mean of early cycles is very close to zero (< 0.1)
+        # 2. OR there are negative values in early cycles
+        already_baseline_subtracted = (np.mean(early_fluor) < 0.1) or (np.any(early_fluor < 0))
 
-        # Baseline-correct fluorescence (Delta Rn)
-        delta_rn = fluorescence - baseline_mean
+        if already_baseline_subtracted:
+            # Data already baseline-corrected, use directly
+            delta_rn = fluorescence
+            baseline_mean = 0.0
+            baseline_sd = np.std(early_fluor) if np.std(early_fluor) > 0 else 0.01
+        else:
+            # Determine baseline region
+            if baseline_cycles is None:
+                baseline_cycles = (0, baseline_end)
+
+            baseline_fluor = fluorescence[baseline_cycles[0]:baseline_cycles[1]]
+            baseline_mean = np.mean(baseline_fluor)
+            baseline_sd = np.std(baseline_fluor)
+
+            # Baseline-correct fluorescence (Delta Rn)
+            delta_rn = fluorescence - baseline_mean
 
         results = {
             'baseline_mean': baseline_mean,
@@ -2000,8 +2015,10 @@ class MAK2Optimizer:
 
             crossing_idx = np.where(above_threshold)[0][0]
 
+            # If crossing at first cycle, the threshold is likely too low or baseline incorrect
+            # Return NaN rather than an unrealistic Ct value
             if crossing_idx == 0:
-                results['ct'] = cycles[0]
+                results['ct'] = np.nan
                 return results
 
             # Linear interpolation
