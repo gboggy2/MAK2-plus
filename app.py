@@ -60,7 +60,7 @@ st.title("🧬 qPCR Model Fitting with MAK2+")
 # Community signup banner
 st.info("""
 👋 **MAK2+ is in open beta!** Free to use for research and education.
-📬 Want updates and to join our community? [Sign up here](https://forms.gle/YOUR_GOOGLE_FORM_LINK) | 💬 Questions? [GitHub Discussions](https://github.com/gboggy2/MAK2-plus/discussions)
+📬 [Join our mailing list](https://docs.google.com/forms/d/e/PLACEHOLDER/viewform) for updates | 💬 [GitHub Discussions](https://github.com/gboggy2/MAK2-plus/discussions) for questions | 🌟 [Community Guide](https://github.com/gboggy2/MAK2-plus/blob/main/COMMUNITY.md)
 """, icon="🧬")
 st.markdown("""
 This tool fits the MAK2 mechanistic model to qPCR data, including primer depletion effects.
