@@ -52,54 +52,16 @@ st.set_page_config(
 )
 
 # ============================================================================
-# PASSWORD PROTECTION
-# ============================================================================
-
-def check_password():
-    """Returns `True` if the user had the correct password."""
-
-    def password_entered():
-        """Checks whether a password entered by the user is correct."""
-        if st.session_state["password"] == st.secrets["password"]:
-            st.session_state["password_correct"] = True
-            del st.session_state["password"]  # Don't store password
-        else:
-            st.session_state["password_correct"] = False
-
-    # First run or password not correct
-    if "password_correct" not in st.session_state:
-        # First run, show input for password
-        st.text_input(
-            "🔒 Password", 
-            type="password", 
-            on_change=password_entered, 
-            key="password"
-        )
-        st.info("Please enter the password to access MAK2+")
-        return False
-    elif not st.session_state["password_correct"]:
-        # Password incorrect, show input + error
-        st.text_input(
-            "🔒 Password", 
-            type="password", 
-            on_change=password_entered, 
-            key="password"
-        )
-        st.error("😕 Password incorrect")
-        return False
-    else:
-        # Password correct
-        return True
-
-# Run password check before showing app
-if not check_password():
-    st.stop()  # Don't continue if password check failed
-
-# ============================================================================
-# MAIN APP (only runs if password is correct)
+# MAIN APP
 # ============================================================================
 
 st.title("🧬 qPCR Model Fitting with MAK2+")
+
+# Community signup banner
+st.info("""
+👋 **MAK2+ is in open beta!** Free to use for research and education.
+📬 Want updates and to join our community? [Sign up here](https://forms.gle/YOUR_GOOGLE_FORM_LINK) | 💬 Questions? [GitHub Discussions](https://github.com/gboggy2/MAK2-plus/discussions)
+""", icon="🧬")
 st.markdown("""
 This tool fits the MAK2 mechanistic model to qPCR data, including primer depletion effects.
 
