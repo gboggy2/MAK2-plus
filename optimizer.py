@@ -1469,7 +1469,7 @@ class MAK2Optimizer:
                         verbose=False
                     )
 
-                    if not new_overshoots and self.metrics['r_squared'] >= 0.98:
+                    if not new_overshoots and self.metrics['r_squared'] >= 0.999:
                         if verbose:
                             print(f"   ✅ Refit successful: overshoot {overshoot_ratio:.1%} → {new_overshoot_ratio:.1%}")
                             print(f"      R² = {self.metrics['r_squared']:.4f}, P₀ = {refit_params['P0']:.4e}")
