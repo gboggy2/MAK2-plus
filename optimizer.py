@@ -55,6 +55,7 @@ class MAK2Optimizer:
         self.fluorescence_fit = None
         self.metrics = None
         self.n_attempts = None
+        self._skip_overshoot_refit = False  # Set True to prevent recursive refit
     
     def fit(
         self,
@@ -1426,64 +1427,84 @@ class MAK2Optimizer:
         # TIER 4: PLATEAU OVERSHOOT CHECK & REFIT
         # ============================================================================
         # Check if model overshoots the observed maximum (suggests P0 too high)
+        # Uses full fit() pipeline on a new optimizer with P0 upper bound constrained
+        if self._skip_overshoot_refit:
+            return self.optimal_params
         try:
             overshoots, overshoot_ratio = self.check_plateau_overshoot(
-                overshoot_threshold=0.05,
+                overshoot_threshold=0.0,
                 verbose=verbose
             )
 
             if overshoots:
                 if verbose:
                     print(f"\n⚠️  Model overshoots plateau by {overshoot_ratio:.1%}")
-                    print(f"   Refitting with reduced P₀ constraint...")
+                    print(f"   Refitting with constrained P₀ using full optimization pipeline...")
 
-                # Refit with P0 upper bound reduced by 10%
+                # Save original results
+                original_params = dict(self.optimal_params)
+                original_metrics = dict(self.metrics)
+
+                # Constrain P0: upper bound at current value, initial guess at 90%
                 current_P0 = self.optimal_params['P0']
-                reduced_P0_max = current_P0 * 0.9
-
-                # Create new bounds with constrained P0
-                refit_bounds = dict(bounds_dict)  # Copy current bounds
-                refit_bounds['P0'] = (refit_bounds['P0'][0], reduced_P0_max)
+                refit_bounds = dict(bounds)
+                refit_bounds['P0'] = (refit_bounds['P0'][0], current_P0)
 
                 if verbose:
-                    print(f"   Original P₀: {current_P0:.4e}")
-                    print(f"   New P₀ max: {reduced_P0_max:.4e}")
+                    print(f"   Current P₀: {current_P0:.4e}")
+                    print(f"   Refit P₀ bounds: [{refit_bounds['P0'][0]:.4e}, {refit_bounds['P0'][1]:.4e}]")
 
-                # Try refit with constrained P0
                 try:
-                    refit_params, refit_r2 = self._fit_with_trust_region(
-                        cycles_fit,
-                        fluorescence_fit,
-                        refit_bounds,
-                        max_attempts=5,
-                        r2_threshold=0.99,
+                    # Create a fresh optimizer and run full fit pipeline
+                    # Skip Tier 4 on refit to prevent recursion
+                    refit_model = MAK2Model()
+                    refit_optimizer = MAK2Optimizer(refit_model)
+                    refit_optimizer._skip_overshoot_refit = True
+                    refit_optimizer.fit(
+                        cycles, fluorescence,
+                        truncation_method=truncation_method,
+                        max_fluorescence_pct=max_fluorescence_pct,
+                        max_slope_pct=max_slope_pct,
+                        cycles_after_max=cycles_after_max,
+                        auto_truncate=auto_truncate,
+                        truncate_cycle=truncate_cycle,
+                        bounds=refit_bounds,
+                        max_attempts=max_attempts,
+                        r2_threshold=r2_threshold,
                         verbose=False,
                         fix_background=fix_background
                     )
 
-                    # Check if refit improved overshoot without hurting R²
-                    self.optimal_params = refit_params
-                    self.metrics = self.calculate_fit_metrics()
-                    new_overshoots, new_overshoot_ratio = self.check_plateau_overshoot(
-                        overshoot_threshold=0.05,
+                    # Check if refit reduced overshoot
+                    new_overshoots, new_overshoot_ratio = refit_optimizer.check_plateau_overshoot(
+                        overshoot_threshold=0.0,
                         verbose=False
                     )
+                    refit_r2 = refit_optimizer.metrics['r_squared']
 
-                    if not new_overshoots and self.metrics['r_squared'] >= 0.999:
+                    # Accept refit if it reduced overshoot and R² is still good
+                    if new_overshoot_ratio < overshoot_ratio and refit_r2 >= 0.995:
                         if verbose:
                             print(f"   ✅ Refit successful: overshoot {overshoot_ratio:.1%} → {new_overshoot_ratio:.1%}")
-                            print(f"      R² = {self.metrics['r_squared']:.4f}, P₀ = {refit_params['P0']:.4e}")
+                            print(f"      R² = {refit_r2:.4f}, P₀ = {refit_optimizer.optimal_params['P0']:.4e}")
+                        # Copy refit results into this optimizer
+                        self.optimal_params = refit_optimizer.optimal_params
+                        self.cycles_fit = refit_optimizer.cycles_fit
+                        self.fluorescence_fit = refit_optimizer.fluorescence_fit
+                        self.metrics = refit_optimizer.metrics
                         self.optimal_params['overshoot_refit'] = True
                     else:
-                        # Refit didn't help or hurt R² too much, keep original
                         if verbose:
-                            print(f"   ↩️  Refit did not improve overshoot sufficiently")
-                        self.optimal_params = best_params  # Restore original
-                        self.metrics = self.calculate_fit_metrics()
+                            print(f"   ↩️  Refit did not improve: overshoot {overshoot_ratio:.1%} → {new_overshoot_ratio:.1%}, R² = {refit_r2:.4f}")
+                        # Keep original
+                        self.optimal_params = original_params
+                        self.metrics = original_metrics
 
                 except Exception as e:
                     if verbose:
                         print(f"   ⚠️  Refit failed: {str(e)[:80]}")
+                    self.optimal_params = original_params
+                    self.metrics = original_metrics
 
         except Exception as e:
             if verbose:
@@ -2058,7 +2079,7 @@ class MAK2Optimizer:
         else:
             overshoot_ratio = 0.0  # Can't determine if no signal
 
-        overshoots = overshoot_ratio > overshoot_threshold
+        overshoots = overshoot_ratio >= overshoot_threshold
 
         if verbose:
             print(f"Plateau overshoot check:")
