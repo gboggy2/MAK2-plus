@@ -1422,6 +1422,73 @@ class MAK2Optimizer:
             except Exception as e:
                 print(f"   ⚠️  DE failed: {str(e)[:80]}")
 
+        # ============================================================================
+        # TIER 4: PLATEAU OVERSHOOT CHECK & REFIT
+        # ============================================================================
+        # Check if model overshoots the observed maximum (suggests P0 too high)
+        try:
+            overshoots, overshoot_ratio = self.check_plateau_overshoot(
+                overshoot_threshold=0.05,
+                verbose=verbose
+            )
+
+            if overshoots:
+                if verbose:
+                    print(f"\n⚠️  Model overshoots plateau by {overshoot_ratio:.1%}")
+                    print(f"   Refitting with reduced P₀ constraint...")
+
+                # Refit with P0 upper bound reduced by 10%
+                current_P0 = self.optimal_params['P0']
+                reduced_P0_max = current_P0 * 0.9
+
+                # Create new bounds with constrained P0
+                refit_bounds = dict(bounds_dict)  # Copy current bounds
+                refit_bounds['P0'] = (refit_bounds['P0'][0], reduced_P0_max)
+
+                if verbose:
+                    print(f"   Original P₀: {current_P0:.4e}")
+                    print(f"   New P₀ max: {reduced_P0_max:.4e}")
+
+                # Try refit with constrained P0
+                try:
+                    refit_params, refit_r2 = self._fit_with_trust_region(
+                        cycles_fit,
+                        fluorescence_fit,
+                        refit_bounds,
+                        max_attempts=5,
+                        r2_threshold=0.99,
+                        verbose=False,
+                        fix_background=fix_background
+                    )
+
+                    # Check if refit improved overshoot without hurting R²
+                    self.optimal_params = refit_params
+                    self.metrics = self.calculate_fit_metrics()
+                    new_overshoots, new_overshoot_ratio = self.check_plateau_overshoot(
+                        overshoot_threshold=0.05,
+                        verbose=False
+                    )
+
+                    if not new_overshoots and self.metrics['r_squared'] >= 0.98:
+                        if verbose:
+                            print(f"   ✅ Refit successful: overshoot {overshoot_ratio:.1%} → {new_overshoot_ratio:.1%}")
+                            print(f"      R² = {self.metrics['r_squared']:.4f}, P₀ = {refit_params['P0']:.4e}")
+                        self.optimal_params['overshoot_refit'] = True
+                    else:
+                        # Refit didn't help or hurt R² too much, keep original
+                        if verbose:
+                            print(f"   ↩️  Refit did not improve overshoot sufficiently")
+                        self.optimal_params = best_params  # Restore original
+                        self.metrics = self.calculate_fit_metrics()
+
+                except Exception as e:
+                    if verbose:
+                        print(f"   ⚠️  Refit failed: {str(e)[:80]}")
+
+        except Exception as e:
+            if verbose:
+                print(f"   ⚠️  Overshoot check failed: {str(e)[:80]}")
+
         return self.optimal_params
 
     def _fit_with_differential_evolution(
@@ -1922,6 +1989,86 @@ class MAK2Optimizer:
         )
         
         return F_pred
+
+    def check_plateau_overshoot(
+        self,
+        overshoot_threshold: float = 0.05,
+        verbose: bool = False
+    ) -> Tuple[bool, float]:
+        """
+        Check if model overshoots the observed fluorescence maximum.
+
+        Compares background-corrected signal maximums to detect when the model
+        predicts unrealistically high plateau fluorescence. This can indicate
+        P0 (initial primer concentration) is too high.
+
+        Parameters
+        ----------
+        overshoot_threshold : float
+            Maximum allowed overshoot ratio (default: 0.05 = 5%)
+            overshoot_ratio = max_predicted / max_observed - 1
+        verbose : bool
+            Print diagnostic information
+
+        Returns
+        -------
+        overshoots : bool
+            True if model overshoots beyond threshold
+        overshoot_ratio : float
+            Actual overshoot ratio (0 = perfect, >0 = overshoot)
+        """
+        if self.cycles_fit is None or self.fluorescence_fit is None:
+            raise ValueError("No fitted data available. Run fit() first.")
+
+        if self.optimal_params is None:
+            raise ValueError("No fitted parameters available. Run fit() first.")
+
+        fluorescence = self.fluorescence_fit
+        cycles = self.cycles_fit
+
+        # Get model predictions
+        F_pred = self.predict(cycles)
+
+        # Detect and subtract baseline from both observed and predicted
+        baseline_end = max(3, int(len(cycles) * 0.25))
+        early_fluor_obs = fluorescence[0:baseline_end]
+        early_fluor_pred = F_pred[0:baseline_end]
+
+        # Check if data is already baseline-corrected
+        already_corrected = (np.mean(early_fluor_obs) < 0.1) or (np.any(early_fluor_obs < 0))
+
+        if already_corrected:
+            # Data already baseline-corrected, use directly
+            signal_obs = fluorescence
+            signal_pred = F_pred
+        else:
+            # Subtract baseline to get actual amplification signal
+            baseline_obs = np.mean(early_fluor_obs)
+            baseline_pred = np.mean(early_fluor_pred)
+            signal_obs = fluorescence - baseline_obs
+            signal_pred = F_pred - baseline_pred
+
+        # Compare maximum signals
+        max_signal_obs = np.max(signal_obs)
+        max_signal_pred = np.max(signal_pred)
+
+        # Calculate overshoot ratio
+        if max_signal_obs > 0:
+            overshoot_ratio = (max_signal_pred / max_signal_obs) - 1.0
+        else:
+            overshoot_ratio = 0.0  # Can't determine if no signal
+
+        overshoots = overshoot_ratio > overshoot_threshold
+
+        if verbose:
+            print(f"Plateau overshoot check:")
+            print(f"  Max observed signal: {max_signal_obs:.6f}")
+            print(f"  Max predicted signal: {max_signal_pred:.6f}")
+            print(f"  Overshoot ratio: {overshoot_ratio:.1%}")
+            print(f"  Threshold: {overshoot_threshold:.1%}")
+            print(f"  Result: {'❌ OVERSHOOT' if overshoots else '✓ OK'}")
+
+        return overshoots, overshoot_ratio
 
     def calculate_ct(
         self,
