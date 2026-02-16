@@ -621,125 +621,18 @@ if cycles is not None and fluorescence is not None:
         "not modeled by primer depletion alone."
     )
     
-    auto_truncate = st.sidebar.checkbox(
-        "Enable auto-truncation", 
-        value=True,
-        help="Recommended: Truncates before deep plateau artifacts"
+    cycles_after_max = st.sidebar.slider(
+        "Cycles after max slope",
+        min_value=0,
+        max_value=10,
+        value=3,
+        step=1,
+        help="Cutoff = cycle at maximum slope + this many cycles. "
+             "Default: 3 cycles captures plateau onset."
     )
-    
-    if auto_truncate:
-        cycles_after_max = st.sidebar.slider(
-            "Cycles after max slope",
-            min_value=0,
-            max_value=10,
-            value=3,
-            step=1,
-            help="Cutoff = cycle at maximum slope + this many cycles. "
-                 "Default: 3 cycles captures plateau onset."
-        )
-    else:
-        cycles_after_max = 3
-        st.sidebar.warning("⚠️ Using all data may include non-primer plateau effects")
-    
-    if not auto_truncate:
-        max_cycle_idx = st.sidebar.slider(
-            "Manual truncation cycle index",
-            0, len(cycles)-1, len(cycles)-1,
-            help="Manually select where to truncate the data"
-        )
-        truncate_cycle = cycles[max_cycle_idx]
-    else:
-        truncate_cycle = None
-    
-    # Custom bounds (advanced)
-    with st.sidebar.expander("⚙️ Advanced: Override Parameter Bounds", expanded=False):
-        st.caption("ℹ️ **By default**, the optimizer uses intelligent data-driven bounds from analytical parameter estimation. Only override if you have specific constraints.")
-        
-        use_custom_bounds = st.checkbox(
-            "Override automatic bounds",
-            value=False,
-            help="Use custom bounds instead of automatic analytical estimation"
-        )
-        
-        if not use_custom_bounds:
-            st.success("✓ Using automatic analytical bounds (recommended)")
-            custom_bounds_dict = None
-        else:
-            st.warning("⚠️ Using custom bounds - optimizer will NOT use analytical estimation!")
-            auto_populate_D0 = st.checkbox(
-                "Auto-populate D₀ from exponential fits", 
-                value=True,
-                help="Use data-driven D₀ bounds from exponential fitting",
-                key="auto_populate_checkbox"
-            )
-            
-            # Clear the number input session state when toggling auto-populate
-            # to force them to update with new values
-            if 'last_auto_populate' not in st.session_state:
-                st.session_state['last_auto_populate'] = auto_populate_D0
-            elif st.session_state['last_auto_populate'] != auto_populate_D0:
-                # Toggle detected - clear the number input states
-                if 'd0_min' in st.session_state:
-                    del st.session_state['d0_min']
-                if 'd0_max' in st.session_state:
-                    del st.session_state['d0_max']
-                st.session_state['last_auto_populate'] = auto_populate_D0
-            
-            if auto_populate_D0:
-                from mak2_model import estimate_D0_bounds
-                
-                try:
-                    if cycles is not None and fluorescence is not None and len(cycles) > 0:
-                        result = estimate_D0_bounds(cycles, fluorescence)
-                        D0_lower_est, D0_upper_est = result[0], result[1]
-                        # Widen the bounds to prevent optimizer getting trapped
-                        # Exponential fits give estimates, but MAK2 needs flexibility
-                        custom_D0_min = D0_lower_est / 100  # 100x lower
-                        custom_D0_max = D0_upper_est * 100  # 100x higher
-                        st.caption(f"✓ Auto-populated (widened 100x): {custom_D0_min:.2e} to {custom_D0_max:.2e}")
-                        st.caption(f"   (Exponential estimates: {D0_lower_est:.2e} to {D0_upper_est:.2e})")
-                    else:
-                        custom_D0_min = 1e-4
-                        custom_D0_max = 1.0
-                        st.caption("⚠️ No data available for auto-populate, using defaults")
-                except Exception as e:
-                    custom_D0_min = 1e-4
-                    custom_D0_max = 1.0
-                    st.caption(f"⚠️ Auto-populate failed: {str(e)[:50]}, using defaults")
-            else:
-                custom_D0_min = 1e-4
-                custom_D0_max = 1.0
-            
-            st.write("**D₀ bounds**")
-            if auto_populate_D0:
-                st.caption("🔒 Bounds auto-set from data (uncheck to manually edit)")
-                # Use the computed values directly, don't use number_input
-                D0_min = custom_D0_min
-                D0_max = custom_D0_max
-                # Display as read-only
-                col1, col2 = st.columns(2)
-                col1.metric("D0 min", f"{D0_min:.2e}")
-                col2.metric("D0 max", f"{D0_max:.2e}")
-            else:
-                # Manual input mode
-                D0_min = st.number_input("D0 min", value=float(custom_D0_min), format="%.2e", key="d0_min")
-                D0_max = st.number_input("D0 max", value=float(custom_D0_max), format="%.2e", key="d0_max")
-            
-            st.write("**Other parameter bounds**")
-            k_min = st.number_input("k min", value=1e-4, format="%.3e")
-            k_max = st.number_input("k max", value=10.0, format="%.2e")
-            P0_min = st.number_input("P0 min", value=0.5, format="%.2e")
-            P0_max = st.number_input("P0 max", value=1e2, format="%.2e")
-            
-            # Create custom bounds dict
-            custom_bounds_dict = {
-                'D0': (D0_min, D0_max),
-                'k': (k_min, k_max),
-                'P0': (P0_min, P0_max)
-            }
-            
-            # Show what bounds will be used
-            st.info(f"**Custom bounds:** D₀: [{D0_min:.2e}, {D0_max:.2e}], k: [{k_min:.2e}, {k_max:.2e}], P₀: [{P0_min:.2e}, {P0_max:.2e}]")
+    auto_truncate = True
+    truncate_cycle = None
+    custom_bounds_dict = None
 
     # Replicate Analysis Options (only show for batch mode)
     if batch_mode and all_samples:
@@ -1137,9 +1030,6 @@ if cycles is not None and fluorescence is not None:
                             params_retry = optimizer_retry.fit(
                                 cycles,
                                 fluor_data,
-                                truncation_method=truncation_method,
-                                max_fluorescence_pct=max_fluorescence_pct,
-                                max_slope_pct=max_slope_pct,
                                 cycles_after_max=cycles_after_max,
                                 auto_truncate=auto_truncate,
                                 truncate_cycle=truncate_cycle,
@@ -1712,22 +1602,12 @@ if cycles is not None and fluorescence is not None:
                 )
                 
                 # Add threshold line (where truncation occurs)
-                if auto_truncate and threshold_cycle_num < cycles[-1]:
+                if threshold_cycle_num < cycles[-1]:
                     fig.add_vline(
                         x=threshold_cycle_num,
                         line_dash="dash",
                         line_color="green",
                         annotation_text=threshold_label,
-                        row=1, col=1
-                    )
-                
-                # Add manual truncation line if set
-                if truncate_cycle and not auto_truncate:
-                    fig.add_vline(
-                        x=truncate_cycle,
-                        line_dash="dash",
-                        line_color="red",
-                        annotation_text="Manual Truncation",
                         row=1, col=1
                     )
                 
