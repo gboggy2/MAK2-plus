@@ -14,24 +14,8 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import importlib
-import sys
-
-# Force reload of optimizer module to pick up latest changes
-if 'optimizer' in sys.modules:
-    import optimizer
-    importlib.reload(optimizer)
-    print("🔄 RELOADED OPTIMIZER MODULE")
-
-# Force reload of replicate_analysis module to pick up latest changes
-if 'replicate_analysis' in sys.modules:
-    import replicate_analysis
-    importlib.reload(replicate_analysis)
-    print("🔄 RELOADED REPLICATE_ANALYSIS MODULE")
-
-from mak2_model import MAK2Model, find_truncation_cycle, calculate_amplification_efficiency
+from mak2_model import MAK2Model, calculate_amplification_efficiency
 from optimizer import MAK2Optimizer
-from data_processing import export_results
 from bootstrap import bootstrap_parameter_uncertainty, BootstrapAnalyzer
 from example_data_loader import ExampleDataLoader
 from qpcr_data_converter import load_qpcr_file, QPCRDataConverter
@@ -238,11 +222,6 @@ elif data_source == "Upload File":
             loaded_samples = st.session_state.uploaded_samples
             metadata = st.session_state.uploaded_metadata
             
-            # DEBUG: Show what we loaded
-            st.sidebar.write("🔍 DEBUG:")
-            st.sidebar.write(f"- Cycles: {len(loaded_cycles) if loaded_cycles is not None else 'None'}")
-            st.sidebar.write(f"- Samples dict: {len(loaded_samples) if isinstance(loaded_samples, dict) else 'Not a dict'}")
-            st.sidebar.write(f"- Metadata n_samples: {metadata.get('n_samples', 'Missing')}")
             
             # Check if we need target selection first
             if metadata.get('requires_target_selection', False) and 'selected_target' not in st.session_state:

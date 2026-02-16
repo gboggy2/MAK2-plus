@@ -71,7 +71,6 @@ class MAK2Optimizer:
         max_attempts: int = 10,
         r2_threshold: float = 0.999,
         verbose: bool = False,
-        method: str = None,  # Ignored - kept for compatibility
         fix_background: bool = True  # Fix background with adaptive fallback
     ) -> Dict[str, float]:
         """
@@ -108,8 +107,6 @@ class MAK2Optimizer:
             Stop when R² exceeds this value (default: 0.999)
         verbose : bool
             Print fitting progress (default: False)
-        method : str, optional
-            Ignored (kept for backward compatibility)
         fix_background : bool
             Fix background with adaptive fallback (default: True)
             - True: Try fixed background first, fallback to 5-param if R² < 0.995
@@ -474,9 +471,6 @@ class MAK2Optimizer:
                 # Use adjusted bounds only for attempt 1 (analytical estimates)
                 bounds_to_use = original_bounds if (lhs_D0 is not None or lhs_k is not None or lhs_P0 is not None) else bounds
 
-                # Positive slope exploration disabled - trust exponential fit bounds
-                force_positive = False
-
                 params, r2 = self._fit_attempt(
                     cycles_fit,
                     fluorescence_fit,
@@ -484,8 +478,7 @@ class MAK2Optimizer:
                     seed=attempt,
                     lhs_D0=lhs_D0,
                     lhs_k=lhs_k,
-                    lhs_P0=lhs_P0,
-                    force_positive_slope=force_positive
+                    lhs_P0=lhs_P0
                 )
                 
                 if verbose:
@@ -1627,8 +1620,7 @@ class MAK2Optimizer:
         lhs_k: Optional[float] = None,
         lhs_P0: Optional[float] = None,
         use_uniform_weighting: bool = False,
-        plateau_weight_multiplier: float = 10.0,
-        force_positive_slope: bool = False
+        plateau_weight_multiplier: float = 10.0
     ) -> Tuple[Dict[str, float], float]:
         """
         Single fitting attempt with random initial guess or LHS samples.
@@ -1731,29 +1723,15 @@ class MAK2Optimizer:
 
         p0 = [D0_init, k_init, P0_init, F_bg_int_init, F_bg_slope_init]
 
-        # Apply positive slope constraint as an exploration strategy if requested
-        # This is one attempt among many, not a universal constraint
         bounds_to_use = bounds.copy()
-        if force_positive_slope and bounds_to_use['F_bg_slope'][0] < 0:
-            # Constrain slope to be non-negative for this attempt
-            bounds_to_use['F_bg_slope'] = (
-                max(0.0, bounds_to_use['F_bg_slope'][0]),
-                bounds_to_use['F_bg_slope'][1]
-            )
-            # If initial slope is negative, move it to lower bound
-            if F_bg_slope_init < 0:
-                F_bg_slope_init = bounds_to_use['F_bg_slope'][0]
-                p0 = [D0_init, k_init, P0_init, F_bg_int_init, F_bg_slope_init]
 
         # Debug: print initial guesses
         print(f"    Initial guesses: D0={D0_init:.2e}, k={k_init:.4f}, P0={P0_init:.4f}")
-        if force_positive_slope:
-            print(f"    🔬 Exploring with positive slope constraint: [{bounds_to_use['F_bg_slope'][0]:.6f}, {bounds_to_use['F_bg_slope'][1]:.6f}]")
 
         # Check if we're using fixed background
         use_fixed_bg = hasattr(self, 'fixed_background') and self.fixed_background is not None
 
-        # Prepare bounds for curve_fit (use bounds_to_use which may have positive slope constraint)
+        # Prepare bounds for curve_fit
         if use_fixed_bg:
             # Fit only D0, k, P0 (background is fixed)
             lower_bounds = [
@@ -2254,79 +2232,3 @@ class MAK2Optimizer:
 
         return results
 
-    def plot_fit(self):
-        """
-        Create a plot of the fitted model vs data.
-        
-        Returns a Plotly figure object.
-        """
-        if self.optimal_params is None:
-            raise ValueError("No fitted parameters. Run fit() first.")
-        
-        import plotly.graph_objects as go
-        from plotly.subplots import make_subplots
-        
-        # Predict
-        y_pred = self.predict(self.cycles_fit)
-        residuals = self.fluorescence_fit - y_pred
-        
-        # Create subplots
-        fig = make_subplots(
-            rows=2, cols=1,
-            subplot_titles=("MAK2 Fit", "Residuals"),
-            vertical_spacing=0.12,
-            row_heights=[0.7, 0.3]
-        )
-        
-        # Data points
-        fig.add_trace(
-            go.Scatter(
-                x=self.cycles_fit,
-                y=self.fluorescence_fit,
-                mode='markers',
-                name='Data',
-                marker=dict(size=8, color='blue')
-            ),
-            row=1, col=1
-        )
-        
-        # Model fit
-        fig.add_trace(
-            go.Scatter(
-                x=self.cycles_fit,
-                y=y_pred,
-                mode='lines',
-                name='MAK2 Fit',
-                line=dict(color='red', width=2)
-            ),
-            row=1, col=1
-        )
-        
-        # Residuals
-        fig.add_trace(
-            go.Scatter(
-                x=self.cycles_fit,
-                y=residuals,
-                mode='markers',
-                name='Residuals',
-                marker=dict(size=6, color='green'),
-                showlegend=False
-            ),
-            row=2, col=1
-        )
-        
-        # Zero line for residuals
-        fig.add_hline(y=0, line_dash="dash", line_color="gray", row=2, col=1)
-        
-        # Layout
-        fig.update_xaxes(title_text="Cycle", row=2, col=1)
-        fig.update_yaxes(title_text="Fluorescence", row=1, col=1)
-        fig.update_yaxes(title_text="Residual", row=2, col=1)
-        
-        fig.update_layout(
-            height=600,
-            showlegend=True,
-            title_text=f"R² = {self.metrics['r_squared']:.6f}"
-        )
-        
-        return fig
