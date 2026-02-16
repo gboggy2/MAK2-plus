@@ -1128,6 +1128,23 @@ class MAK2Optimizer:
                     else:
                         print(f"\n  ❌ All pattern-based retries failed")
 
+                # Propagate refined bounds to downstream tiers only when
+                # the fit still needs improvement.  If Tier 1.5 already
+                # brought R² above threshold the refined (narrower) bounds
+                # can actually hurt downstream tiers (e.g. Tier 4 refit)
+                # by restricting their search space unnecessarily.
+                if best_r2 < r2_threshold:
+                    bounds['k'] = (k_new_lower, k_new_upper)
+                    bounds['D0'] = (D0_new_lower, D0_new_upper)
+                    bounds['P0'] = (P0_new_lower, P0_new_upper)
+                    bounds['F_bg_intercept'] = (bg_int_new_lower, bg_int_new_upper)
+                    bounds['F_bg_slope'] = (bg_slope_new_lower, bg_slope_new_upper)
+
+                    if verbose:
+                        print(f"\n  📤 Propagating refined bounds to downstream tiers (R² {best_r2:.4f} < {r2_threshold})")
+                elif verbose:
+                    print(f"\n  ⏭️  Skipping bounds propagation (R² {best_r2:.4f} ≥ {r2_threshold})")
+
         # --- End Tier 1.5 ---
         _tier1_5_elapsed = time.perf_counter() - _tier1_5_start
         _tier1_5_r2_after = best_r2

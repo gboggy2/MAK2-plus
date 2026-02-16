@@ -1,6 +1,6 @@
 # MAK2 Optimizer Tier Benchmark Report
 
-Generated: 2026-02-16 06:54:36
+Generated: 2026-02-16 09:07:17
 
 Dataset: Rutledge.csv
 
@@ -11,15 +11,15 @@ R² threshold: 0.999
 
 | Configuration | Passed | Failed | Total Time | Avg Time/Sample |
 |---|---|---|---|---|
-| all_tiers | 120/120 | ✅ | 52.5s | 0.44s |
-| no_tier1.5 | 120/120 | ✅ | 53.9s | 0.45s |
-| no_tier2 | 120/120 | ✅ | 44.4s | 0.37s |
-| no_tier2.5 | 120/120 | ✅ | 71.7s | 0.60s |
-| no_tier3 | 108/120 | ❌ (12 failed) | 18.7s | 0.16s |
-| no_tier4 | 120/120 | ✅ | 36.0s | 0.30s |
-| tier1_only | 89/120 | ❌ (31 failed) | 3.4s | 0.03s |
-| no_retry_tiers | 120/120 | ✅ | 50.2s | 0.42s |
-| no_global | 108/120 | ❌ (12 failed) | 18.7s | 0.16s |
+| all_tiers | 120/120 | ✅ | 52.2s | 0.44s |
+| no_tier1.5 | 120/120 | ✅ | 52.1s | 0.43s |
+| no_tier2 | 119/120 | ❌ (1 failed) | 46.4s | 0.39s |
+| no_tier2.5 | 120/120 | ✅ | 76.2s | 0.64s |
+| no_tier3 | 110/120 | ❌ (10 failed) | 20.9s | 0.17s |
+| no_tier4 | 120/120 | ✅ | 34.1s | 0.28s |
+| tier1_only | 89/120 | ❌ (31 failed) | 3.5s | 0.03s |
+| no_retry_tiers | 119/120 | ❌ (1 failed) | 48.5s | 0.40s |
+| no_global | 110/120 | ❌ (10 failed) | 20.5s | 0.17s |
 | minimal | 89/120 | ❌ (31 failed) | 3.7s | 0.03s |
 
 ## Baseline Tier Details
@@ -29,9 +29,9 @@ R² threshold: 0.999
 | tier1_multistart | 120/120 | 120 | 0.029s | 3.4s |
 | tier1.5_residual_patterns | 31/120 | 11 | 0.001s | 0.1s |
 | tier2_ssr_retry | 4/120 | 0 | 0.001s | 0.1s |
-| tier2.5_adaptive_fallback | 26/120 | 18 | 0.006s | 0.7s |
-| tier3_differential_evolution | 16/120 | 16 | 0.263s | 31.5s |
-| tier4_overshoot_refit | 33/120 | 25 | 0.138s | 16.6s |
+| tier2.5_adaptive_fallback | 26/120 | 19 | 0.006s | 0.7s |
+| tier3_differential_evolution | 15/120 | 15 | 0.246s | 29.5s |
+| tier4_overshoot_refit | 33/120 | 22 | 0.153s | 18.4s |
 
 ## Failed Samples by Configuration
 
@@ -42,17 +42,16 @@ R² threshold: 0.999
 ### no_tier1.5: All passed ✅
 
 
-### no_tier2: All passed ✅
+### no_tier2
 
+- **X5.R4.1**: R²=0.998962
 
 ### no_tier2.5: All passed ✅
 
 
 ### no_tier3
 
-- **X5.R2.4**: R²=0.997812
 - **X5.R3.1**: R²=0.997743
-- **X5.R3.4**: R²=0.998001
 - **X5.R4.1**: R²=0.995094
 - **X5.R4.3**: R²=0.998603
 - **X5.R5.3**: R²=0.997347
@@ -100,14 +99,13 @@ R² threshold: 0.999
 - **X6.R5.3**: R²=0.998926
 - **X6.R5.4**: R²=0.997208
 
-### no_retry_tiers: All passed ✅
+### no_retry_tiers
 
+- **X5.R4.1**: R²=0.998962
 
 ### no_global
 
-- **X5.R2.4**: R²=0.997812
 - **X5.R3.1**: R²=0.997743
-- **X5.R3.4**: R²=0.998001
 - **X5.R4.1**: R²=0.995094
 - **X5.R4.3**: R²=0.998603
 - **X5.R5.3**: R²=0.997347
@@ -157,11 +155,11 @@ R² threshold: 0.999
 Based on the ablation results:
 
 - **no_tier1.5**: Same pass rate, 1.0x speed change → ✅ tier may be removable
-- **no_tier2**: Same pass rate, 1.2x speed change → ✅ tier may be removable
+- **no_tier2**: Lost 1 samples → ❌ tier is needed
 - **no_tier2.5**: Same pass rate, 0.7x speed change → ✅ tier may be removable
-- **no_tier3**: Lost 12 samples → ❌ tier is needed
+- **no_tier3**: Lost 10 samples → ❌ tier is needed
 - **no_tier4**: Same pass rate, 1.5x speed change → ✅ tier may be removable
 - **tier1_only**: Lost 31 samples → ❌ tier is needed
-- **no_retry_tiers**: Same pass rate, 1.0x speed change → ✅ tier may be removable
-- **no_global**: Lost 12 samples → ❌ tier is needed
+- **no_retry_tiers**: Lost 1 samples → ❌ tier is needed
+- **no_global**: Lost 10 samples → ❌ tier is needed
 - **minimal**: Lost 31 samples → ❌ tier is needed
