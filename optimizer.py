@@ -8,10 +8,11 @@ print("="*80)
 print("🔄 OPTIMIZER MODULE LOADING - VERSION 2.0.0 (LHS + NOISE + STUCK DETECTION)")
 print("="*80)
 
+import time
 import numpy as np
 from scipy.optimize import curve_fit, differential_evolution
 from scipy.stats import qmc
-from typing import Tuple, Dict, Optional
+from typing import Tuple, Dict, Optional, Set
 from mak2_model import (
     MAK2Model,
     find_slope_threshold_cycle,
@@ -54,6 +55,7 @@ class MAK2Optimizer:
         self.fluorescence_fit = None
         self.metrics = None
         self.n_attempts = None
+        self.tier_log = []  # Records per-tier timing and improvement data
         self._skip_overshoot_refit = False  # Set True to prevent recursive refit
     
     def fit(
@@ -67,7 +69,8 @@ class MAK2Optimizer:
         max_attempts: int = 10,
         r2_threshold: float = 0.999,
         verbose: bool = False,
-        fix_background: bool = True  # Fix background with adaptive fallback
+        fix_background: bool = True,  # Fix background with adaptive fallback
+        disabled_tiers: Optional[Set[str]] = None  # For ablation testing
     ) -> Dict[str, float]:
         """
         Fit MAK2 model to qPCR data using adaptive multi-start optimization.
@@ -136,6 +139,12 @@ class MAK2Optimizer:
             cycles_fit = cycles
             fluorescence_fit = fluorescence
         
+        # Initialize disabled_tiers and tier_log
+        if disabled_tiers is None:
+            disabled_tiers = set()
+        self.tier_log = []
+        _tier1_start = time.perf_counter()
+
         # Use analytical parameter estimation from exponential fits
         if bounds is None:
             bounds = {}
@@ -681,9 +690,25 @@ class MAK2Optimizer:
                 print(f"    - SSR/(F_range²) = {ssr_ratio:.4f} (threshold: 0.01)")
                 print(f"    - Likely local minimum with poor parameters")
 
+        # --- End Tier 1 ---
+        _tier1_elapsed = time.perf_counter() - _tier1_start
+        self.tier_log.append({
+            'tier': 'tier1_multistart',
+            'fired': True,
+            'time_seconds': _tier1_elapsed,
+            'r2_before': None,
+            'r2_after': best_r2,
+            'improved': True,
+        })
+
+        # --- Tier 1.5: Residual Pattern Analysis ---
+        _tier1_5_start = time.perf_counter()
+        _tier1_5_fired = False
+
         # Analyze residual patterns to guide adaptive retry strategy
         # Different residual patterns indicate different problems requiring different fixes
-        if best_params is not None and best_r2 < r2_threshold:
+        if best_params is not None and best_r2 < r2_threshold and 'tier1.5' not in disabled_tiers:
+            _tier1_5_fired = True
             # Predict fluorescence for all fitted cycles
             predicted_F = self.model.simulate_to_cycle(
                 best_params['D0'], best_params['k'], best_params['P0'],
@@ -1103,14 +1128,32 @@ class MAK2Optimizer:
                     else:
                         print(f"\n  ❌ All pattern-based retries failed")
 
+        # --- End Tier 1.5 ---
+        _tier1_5_elapsed = time.perf_counter() - _tier1_5_start
+        _tier1_5_r2_after = best_r2
+        self.tier_log.append({
+            'tier': 'tier1.5_residual_patterns',
+            'fired': _tier1_5_fired,
+            'time_seconds': _tier1_5_elapsed,
+            'r2_before': self.tier_log[-1]['r2_after'] if self.tier_log else None,
+            'r2_after': _tier1_5_r2_after,
+            'improved': _tier1_5_fired and _tier1_5_r2_after > (self.tier_log[-1]['r2_after'] if self.tier_log else 0),
+        })
+
+        # --- Tier 2: SSR Retry with Adjusted Bounds ---
+        _tier2_start = time.perf_counter()
+        _tier2_fired = False
+        _tier2_r2_before = best_r2
+
         # Automatic retry if SSR too high (likely local minimum)
         F_max = np.max(fluorescence_fit)
         F_min = np.min(fluorescence_fit)
         F_range = F_max - F_min
         ssr = best_params['ssr']
         ssr_threshold = 0.01 * (F_range ** 2)
-        
-        if ssr > ssr_threshold and 'retry_attempted' not in locals():
+
+        if ssr > ssr_threshold and 'retry_attempted' not in locals() and 'tier2' not in disabled_tiers:
+            _tier2_fired = True
             # Check if this is a low-template well (wide D0 bounds)
             D0_range_log = np.log10(bounds['D0'][1]) - np.log10(bounds['D0'][0])
             is_low_template = D0_range_log > 5  # >100,000x range (very conservative)
@@ -1231,6 +1274,17 @@ class MAK2Optimizer:
                 if verbose:
                     print(f"  ↩️  Retry failed, keeping original fit")
         
+        # --- End Tier 2 ---
+        _tier2_elapsed = time.perf_counter() - _tier2_start
+        self.tier_log.append({
+            'tier': 'tier2_ssr_retry',
+            'fired': _tier2_fired,
+            'time_seconds': _tier2_elapsed,
+            'r2_before': _tier2_r2_before,
+            'r2_after': best_r2,
+            'improved': _tier2_fired and best_r2 > _tier2_r2_before,
+        })
+
         # Store results
         self.optimal_params = best_params
         self.cycles_fit = cycles_fit
@@ -1245,9 +1299,15 @@ class MAK2Optimizer:
         best_params['fallback_attempted'] = False
         best_params['fallback_succeeded'] = False
 
+        # --- Tier 2.5: Adaptive Background Fallback ---
+        _tier2_5_start = time.perf_counter()
+        _tier2_5_fired = False
+        _tier2_5_r2_before = self.metrics['r_squared']
+
         # ADAPTIVE BACKGROUND STRATEGY
         # If we used fixed background but R² < 0.999, retry with full 5-parameter fit
-        if used_fixed_bg and self.metrics['r_squared'] < 0.999:
+        if used_fixed_bg and self.metrics['r_squared'] < 0.999 and 'tier2.5' not in disabled_tiers:
+            _tier2_5_fired = True
             best_params['fallback_attempted'] = True
             # Always print fallback messages (even with verbose=False)
             print(f"\n🔄 ADAPTIVE FALLBACK: Fixed background R²={self.metrics['r_squared']:.4f} < 0.999")
@@ -1364,9 +1424,27 @@ class MAK2Optimizer:
                 print(f"   ⚠️  Fallback failed with error: {str(e)[:80]}")
                 print(f"   Keeping fixed background result (R² = {self.metrics['r_squared']:.4f})")
 
+        # --- End Tier 2.5 ---
+        _tier2_5_elapsed = time.perf_counter() - _tier2_5_start
+        _tier2_5_r2_after = self.metrics['r_squared']
+        self.tier_log.append({
+            'tier': 'tier2.5_adaptive_fallback',
+            'fired': _tier2_5_fired,
+            'time_seconds': _tier2_5_elapsed,
+            'r2_before': _tier2_5_r2_before,
+            'r2_after': _tier2_5_r2_after,
+            'improved': _tier2_5_fired and _tier2_5_r2_after > _tier2_5_r2_before,
+        })
+
+        # --- Tier 3: Differential Evolution ---
+        _tier3_start = time.perf_counter()
+        _tier3_fired = False
+        _tier3_r2_before = self.metrics['r_squared']
+
         # TIER 3: DIFFERENTIAL EVOLUTION for extremely challenging samples
         # If R² < 0.999, try global optimization to reach excellence threshold
-        if self.metrics['r_squared'] < 0.999:
+        if self.metrics['r_squared'] < 0.999 and 'tier3' not in disabled_tiers:
+            _tier3_fired = True
             print(f"\n🌍 TIER 3: DIFFERENTIAL EVOLUTION")
             print(f"   Current R²={self.metrics['r_squared']:.4f} < 0.999")
             print(f"   Attempting global optimization with Differential Evolution...")
@@ -1396,12 +1474,47 @@ class MAK2Optimizer:
             except Exception as e:
                 print(f"   ⚠️  DE failed: {str(e)[:80]}")
 
+        # --- End Tier 3 ---
+        _tier3_elapsed = time.perf_counter() - _tier3_start
+        _tier3_r2_after = self.metrics['r_squared']
+        self.tier_log.append({
+            'tier': 'tier3_differential_evolution',
+            'fired': _tier3_fired,
+            'time_seconds': _tier3_elapsed,
+            'r2_before': _tier3_r2_before,
+            'r2_after': _tier3_r2_after,
+            'improved': _tier3_fired and _tier3_r2_after > _tier3_r2_before,
+        })
+
         # ============================================================================
         # TIER 4: PLATEAU OVERSHOOT CHECK & REFIT
         # ============================================================================
+        _tier4_start = time.perf_counter()
+        _tier4_fired = False
+        _tier4_r2_before = self.metrics['r_squared']
+
         # Check if model overshoots the observed maximum (suggests P0 too high)
         # Uses full fit() pipeline on a new optimizer with P0 upper bound constrained
         if self._skip_overshoot_refit:
+            # Log Tier 4 as skipped (recursion guard)
+            self.tier_log.append({
+                'tier': 'tier4_overshoot_refit',
+                'fired': False,
+                'time_seconds': 0.0,
+                'r2_before': _tier4_r2_before,
+                'r2_after': _tier4_r2_before,
+                'improved': False,
+            })
+            return self.optimal_params
+        if 'tier4' in disabled_tiers:
+            self.tier_log.append({
+                'tier': 'tier4_overshoot_refit',
+                'fired': False,
+                'time_seconds': 0.0,
+                'r2_before': _tier4_r2_before,
+                'r2_after': _tier4_r2_before,
+                'improved': False,
+            })
             return self.optimal_params
         try:
             overshoots, overshoot_ratio = self.check_plateau_overshoot(
@@ -1410,6 +1523,7 @@ class MAK2Optimizer:
             )
 
             if overshoots:
+                _tier4_fired = True
                 if verbose:
                     print(f"\n⚠️  Model overshoots plateau by {overshoot_ratio:.1%}")
                     print(f"   Refitting with constrained P₀ using full optimization pipeline...")
@@ -1479,6 +1593,18 @@ class MAK2Optimizer:
         except Exception as e:
             if verbose:
                 print(f"   ⚠️  Overshoot check failed: {str(e)[:80]}")
+
+        # --- End Tier 4 ---
+        _tier4_elapsed = time.perf_counter() - _tier4_start
+        _tier4_r2_after = self.metrics['r_squared']
+        self.tier_log.append({
+            'tier': 'tier4_overshoot_refit',
+            'fired': _tier4_fired,
+            'time_seconds': _tier4_elapsed,
+            'r2_before': _tier4_r2_before,
+            'r2_after': _tier4_r2_after,
+            'improved': _tier4_fired and _tier4_r2_after > _tier4_r2_before,
+        })
 
         return self.optimal_params
 
