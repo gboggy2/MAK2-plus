@@ -14,7 +14,6 @@ from scipy.stats import qmc
 from typing import Tuple, Dict, Optional
 from mak2_model import (
     MAK2Model,
-    find_fluorescence_threshold_cycle,
     find_slope_threshold_cycle,
     estimate_D0_bounds,
     estimate_MAK2_params_from_exponential
@@ -61,9 +60,6 @@ class MAK2Optimizer:
         self,
         cycles: np.ndarray,
         fluorescence: np.ndarray,
-        truncation_method: str = 'fluorescence',
-        max_fluorescence_pct: float = 85.0,
-        max_slope_pct: float = None,
         cycles_after_max: int = 3,
         auto_truncate: bool = True,
         truncate_cycle: Optional[int] = None,
@@ -75,25 +71,18 @@ class MAK2Optimizer:
     ) -> Dict[str, float]:
         """
         Fit MAK2 model to qPCR data using adaptive multi-start optimization.
-        
+
         The optimizer tries different random initial guesses until R² ≥ r2_threshold
         or max_attempts is reached. Most good curves fit well on the first attempt.
-        
+
         Parameters
         ----------
         cycles : np.ndarray
             Cycle numbers
         fluorescence : np.ndarray
             Fluorescence measurements
-        truncation_method : str
-            'fluorescence' or 'slope' (default: 'fluorescence')
-        max_fluorescence_pct : float
-            Truncate at this % of max fluorescence (default: 85%)
-        max_slope_pct : float, optional
-            Truncate when slope drops below this % of max (default: None)
-            If None, uses cycles_after_max mode instead
         cycles_after_max : int
-            When max_slope_pct is None, cutoff = cycle at max slope + this value (default: 3)
+            Cutoff = cycle at max slope + this value (default: 3)
         auto_truncate : bool
             Apply automatic truncation (default: True)
         truncate_cycle : int, optional
@@ -130,20 +119,11 @@ class MAK2Optimizer:
                 print(f"Manually truncated at cycle {truncate_cycle}")
                 
         elif auto_truncate:
-            # Auto-truncate
-            if truncation_method == 'fluorescence':
-                trunc_idx = find_fluorescence_threshold_cycle(
-                    fluorescence, 
-                    threshold_pct=max_fluorescence_pct
-                )
-            elif truncation_method == 'slope':
-                trunc_idx = find_slope_threshold_cycle(
-                    fluorescence,
-                    slope_pct=max_slope_pct,
-                    cycles_after_max=cycles_after_max
-                )
-            else:
-                raise ValueError(f"Unknown truncation method: {truncation_method}")
+            # Auto-truncate at max slope + cycles_after_max
+            trunc_idx = find_slope_threshold_cycle(
+                fluorescence,
+                cycles_after_max=cycles_after_max
+            )
             
             cycles_fit = cycles[:trunc_idx + 1]
             fluorescence_fit = fluorescence[:trunc_idx + 1]
@@ -1455,9 +1435,6 @@ class MAK2Optimizer:
                     refit_optimizer._skip_overshoot_refit = True
                     refit_optimizer.fit(
                         cycles, fluorescence,
-                        truncation_method=truncation_method,
-                        max_fluorescence_pct=max_fluorescence_pct,
-                        max_slope_pct=max_slope_pct,
                         cycles_after_max=cycles_after_max,
                         auto_truncate=auto_truncate,
                         truncate_cycle=truncate_cycle,

@@ -191,105 +191,14 @@ def calculate_amplification_efficiency(D: np.ndarray) -> np.ndarray:
     return efficiency
 
 
-def find_plateau_onset(fluorescence: np.ndarray, threshold: float = 0.05) -> int:
-    """
-    Find the onset of the plateau phase where amplification stops.
-    
-    The plateau is detected when the slope drops below a threshold
-    relative to the maximum slope observed.
-    
-    Parameters
-    ----------
-    fluorescence : np.ndarray
-        Fluorescence values at each cycle
-    threshold : float
-        Fraction of max slope to use as cutoff (default: 0.05 = 5%)
-        
-    Returns
-    -------
-    plateau_cycle : int
-        Cycle number where plateau begins (or last cycle if no plateau)
-    """
-    # Calculate first derivative (slope)
-    slope = np.diff(fluorescence)
-    
-    if len(slope) == 0:
-        return len(fluorescence) - 1
-    
-    # Find maximum slope
-    max_slope = np.max(slope)
-    
-    # Find where slope drops below threshold of max slope
-    cutoff = threshold * max_slope
-    
-    # Find first cycle where slope is consistently below cutoff
-    plateau_idx = len(slope)  # Default to end
-    for i in range(len(slope)):
-        if slope[i] < cutoff:
-            # Check if it stays low for next few cycles
-            if i + 3 < len(slope):
-                if np.all(slope[i:i+3] < cutoff):
-                    plateau_idx = i
-                    break
-            else:
-                plateau_idx = i
-                break
-    
-    # Add 1 because diff loses one element
-    return min(plateau_idx + 1, len(fluorescence) - 1)
-
-
-def find_fluorescence_threshold_cycle(
-    fluorescence: np.ndarray, 
-    threshold_pct: float = 85.0
-) -> int:
-    """
-    Find the cycle where fluorescence reaches a percentage of maximum.
-    
-    This is useful for truncating data before deep plateau effects
-    (enzyme degradation, dNTP depletion, etc.) that aren't modeled
-    by primer depletion alone.
-    
-    Parameters
-    ----------
-    fluorescence : np.ndarray
-        Fluorescence values at each cycle
-    threshold_pct : float
-        Percentage of maximum fluorescence (default: 85.0%)
-        
-    Returns
-    -------
-    threshold_cycle : int
-        First cycle where fluorescence exceeds threshold_pct of maximum
-        Returns last cycle if threshold never reached
-    """
-    if len(fluorescence) == 0:
-        return 0
-    
-    max_F = np.max(fluorescence)
-    threshold_value = (threshold_pct / 100.0) * max_F
-    
-    # Find first cycle exceeding threshold
-    threshold_cycles = np.where(fluorescence >= threshold_value)[0]
-    
-    if len(threshold_cycles) > 0:
-        return int(threshold_cycles[0])
-    else:
-        # Threshold never reached - use all data
-        return len(fluorescence) - 1
-
-
 def find_slope_threshold_cycle(
     fluorescence: np.ndarray,
-    slope_pct: float = None,
     cycles_after_max: int = 3
 ) -> int:
     """
     Find the cutoff cycle based on the maximum slope (first derivative).
 
-    By default, returns the cycle at maximum slope + cycles_after_max.
-    If slope_pct is provided (not None), falls back to the old behavior
-    of finding where slope drops below a percentage of maximum slope.
+    Returns the cycle at maximum slope + cycles_after_max.
 
     Uses a 5-point stencil formula for first derivative calculation:
     f'[i] = (-f[i-2] + 8*f[i-1] - 8*f[i+1] + f[i+2]) / 12h
@@ -300,12 +209,8 @@ def find_slope_threshold_cycle(
     ----------
     fluorescence : np.ndarray
         Fluorescence values at each cycle
-    slope_pct : float, optional
-        If provided, finds where slope drops below this percentage of maximum slope.
-        If None (default), uses cycles_after_max instead.
     cycles_after_max : int
         Number of cycles after maximum slope to use as cutoff (default: 3)
-        Only used when slope_pct is None.
 
     Returns
     -------
@@ -323,18 +228,12 @@ def find_slope_threshold_cycle(
     n = len(f)
     f1 = np.zeros(n)
 
-    # f1[0] = 0 (boundary)
-    # f1[1] = 0 (boundary)
-    # Calculate for interior points (i = 2 to n-3)
     for i in range(2, n - 2):
         f1[i] = (f[i-2] - 8*f[i-1] + 8*f[i+1] - f[i+2]) / 12.0
-    # f1[n-2] = 0 (boundary)
-    # f1[n-1] = 0 (boundary)
 
     slope = f1
 
     # Find maximum slope and its position (only search interior points)
-    # Exclude boundary points where slope is set to 0
     interior_slope = slope[2:-2]
     if len(interior_slope) == 0:
         return len(fluorescence) - 1
@@ -345,49 +244,8 @@ def find_slope_threshold_cycle(
     if max_slope <= 0:
         return len(fluorescence) - 1
 
-    # Default behavior: return max slope cycle + cycles_after_max
-    if slope_pct is None:
-        cutoff_idx = max_slope_idx + cycles_after_max
-        # Ensure we don't exceed bounds
-        result = min(cutoff_idx, len(fluorescence) - 1)
-        return result
-
-    # Legacy behavior: find where slope drops below percentage threshold
-    # Calculate threshold
-    threshold_value = (slope_pct / 100.0) * max_slope
-
-    # Find first cycle AFTER max slope where slope drops below threshold
-    # and stays below for at least 2 more cycles
-    for i in range(max_slope_idx, n - 2):
-        if slope[i] < threshold_value:
-            # Check if it stays low
-            if i + 2 < n:
-                if np.all(slope[i:i+3] < threshold_value):
-                    return i
-            else:
-                return i
-
-    return len(fluorescence) - 1
-
-
-def find_truncation_cycle(fluorescence: np.ndarray) -> int:
-    """
-    Legacy function - now returns fluorescence threshold cycle.
-    
-    DEPRECATED: Use find_fluorescence_threshold_cycle() or 
-    find_slope_threshold_cycle() instead.
-    
-    Parameters
-    ----------
-    fluorescence : np.ndarray
-        Fluorescence values at each cycle
-        
-    Returns
-    -------
-    threshold_cycle : int
-        Cycle where fluorescence reaches 85% of maximum
-    """
-    return find_fluorescence_threshold_cycle(fluorescence, threshold_pct=85.0)
+    cutoff_idx = max_slope_idx + cycles_after_max
+    return min(cutoff_idx, len(fluorescence) - 1)
 
 
 def estimate_D0_bounds(

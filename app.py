@@ -628,67 +628,16 @@ if cycles is not None and fluorescence is not None:
     )
     
     if auto_truncate:
-        truncation_method = st.sidebar.radio(
-            "Truncation method:",
-            ["fluorescence", "slope"],
-            index=1,  # Default to slope method
-            format_func=lambda x: {
-                "fluorescence": "Fluorescence threshold (% of max)",
-                "slope": "Slope threshold (max derivative + cycles)"
-            }[x],
-            help="Fluorescence: truncate at % of max signal\nSlope: truncate at max derivative + N cycles"
+        cycles_after_max = st.sidebar.slider(
+            "Cycles after max slope",
+            min_value=0,
+            max_value=10,
+            value=3,
+            step=1,
+            help="Cutoff = cycle at maximum slope + this many cycles. "
+                 "Default: 3 cycles captures plateau onset."
         )
-        
-        if truncation_method == "fluorescence":
-            max_fluorescence_pct = st.sidebar.slider(
-                "Max fluorescence (%)",
-                min_value=50.0,
-                max_value=100.0,
-                value=85.0,
-                step=5.0,
-                help="Truncate when fluorescence reaches this % of maximum. "
-                     "85% captures early plateau, 100% uses all data."
-            )
-            max_slope_pct = None  # Default: use cycles_after_max mode
-            cycles_after_max = 3  # Default value
-        else:  # slope method
-            # Radio button to choose slope cutoff mode
-            st.sidebar.markdown("**Slope cutoff mode:**")
-            slope_mode = st.sidebar.radio(
-                "Slope cutoff mode:",
-                options=["Cycles after max slope (default)", "Percentage of max slope"],
-                index=0,
-                label_visibility="collapsed",
-                help="Choose how to determine the cutoff cycle"
-            )
-
-            if slope_mode == "Cycles after max slope (default)":
-                cycles_after_max = st.sidebar.slider(
-                    "Cycles after max slope",
-                    min_value=0,
-                    max_value=10,
-                    value=3,
-                    step=1,
-                    help="Cutoff = cycle at maximum slope + this many cycles. "
-                         "Default: 3 cycles captures plateau onset."
-                )
-                max_slope_pct = None
-            else:
-                max_slope_pct = st.sidebar.slider(
-                    "Max slope (%)",
-                    min_value=5.0,
-                    max_value=50.0,
-                    value=10.0,
-                    step=5.0,
-                    help="Truncate when slope drops below this % of maximum slope. "
-                         "10% is conservative, 25% includes more plateau data."
-                )
-                cycles_after_max = 3  # Not used, but needs to be defined
-            max_fluorescence_pct = 85.0  # Default for fluorescence method
     else:
-        truncation_method = "fluorescence"
-        max_fluorescence_pct = 100.0
-        max_slope_pct = None
         cycles_after_max = 3
         st.sidebar.warning("⚠️ Using all data may include non-primer plateau effects")
     
@@ -1067,9 +1016,6 @@ if cycles is not None and fluorescence is not None:
                     params_batch = optimizer_batch.fit(
                         cycles,
                         fluor_data,
-                        truncation_method=truncation_method,
-                        max_fluorescence_pct=max_fluorescence_pct,
-                        max_slope_pct=max_slope_pct,
                         cycles_after_max=cycles_after_max,
                         auto_truncate=auto_truncate,
                         truncate_cycle=truncate_cycle,
@@ -1240,9 +1186,7 @@ if cycles is not None and fluorescence is not None:
             st.session_state['batch_no_signal_samples'] = no_signal_samples  # Store flagged samples
             st.session_state['batch_cycles'] = cycles
             st.session_state['batch_settings'] = {
-                'truncation_method': truncation_method,
-                'max_fluorescence_pct': max_fluorescence_pct,
-                'max_slope_pct': max_slope_pct,
+                'cycles_after_max': cycles_after_max,
                 'auto_truncate': auto_truncate,
                 'truncate_cycle': truncate_cycle,
                 'custom_bounds_dict': custom_bounds_dict
@@ -1679,9 +1623,6 @@ if cycles is not None and fluorescence is not None:
                     fitted_params = optimizer.fit(
                         cycles,
                         fluorescence,
-                        truncation_method=truncation_method,
-                        max_fluorescence_pct=max_fluorescence_pct,
-                        max_slope_pct=max_slope_pct,
                         cycles_after_max=cycles_after_max,
                         auto_truncate=auto_truncate,
                         truncate_cycle=truncate_cycle,
@@ -1729,33 +1670,20 @@ if cycles is not None and fluorescence is not None:
                 F_pred = optimizer.predict(cycles)
                 
                 # Calculate truncation point for visualization
-                if truncation_method == 'fluorescence':
-                    from mak2_model import find_fluorescence_threshold_cycle
-                    threshold_idx = find_fluorescence_threshold_cycle(
-                        fluorescence, 
-                        threshold_pct=max_fluorescence_pct
-                    )
-                    threshold_label = f"{max_fluorescence_pct:.0f}% Max F"
-                else:  # slope method
-                    from mak2_model import find_slope_threshold_cycle
-                    threshold_idx = find_slope_threshold_cycle(
-                        fluorescence,
-                        slope_pct=max_slope_pct,
-                        cycles_after_max=cycles_after_max
-                    )
-                    if max_slope_pct is None:
-                        threshold_label = f"Max slope + {cycles_after_max} cycles"
-                    else:
-                        threshold_label = f"{max_slope_pct:.0f}% Max Slope"
+                from mak2_model import find_slope_threshold_cycle
+                threshold_idx = find_slope_threshold_cycle(
+                    fluorescence,
+                    cycles_after_max=cycles_after_max
+                )
+                threshold_label = f"Max slope + {cycles_after_max} cycles"
 
                 threshold_cycle_num = cycles[min(threshold_idx, len(cycles)-1)]
-                threshold_F = fluorescence[min(threshold_idx, len(cycles)-1)]
-                
+
                 # Create figure
                 fig = make_subplots(
                     rows=2, cols=1,
                     subplot_titles=(
-                        f"qPCR Curve Fit (Truncated by {truncation_method.title()} Method)", 
+                        f"qPCR Curve Fit (Truncated at Max Slope + {cycles_after_max})",
                         "Residuals"
                     ),
                     vertical_spacing=0.12,
@@ -1792,15 +1720,6 @@ if cycles is not None and fluorescence is not None:
                         annotation_text=threshold_label,
                         row=1, col=1
                     )
-                    # Add horizontal line at threshold fluorescence (for fluorescence method)
-                    if truncation_method == 'fluorescence':
-                        fig.add_hline(
-                            y=threshold_F,
-                            line_dash="dot",
-                            line_color="green",
-                            opacity=0.5,
-                            row=1, col=1
-                        )
                 
                 # Add manual truncation line if set
                 if truncate_cycle and not auto_truncate:
