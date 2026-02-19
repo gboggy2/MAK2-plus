@@ -27,6 +27,15 @@ from replicate_analysis import (
     compare_precision,
     plot_dilution_series_comparison
 )
+from calibration import (
+    build_standard_curve,
+    apply_calibration,
+    plot_calibration,
+    plot_replicate_overlay,
+    calculate_replicate_param_summary,
+    build_limited_dilution_calibration,
+    plot_limited_dilution_diagnostics,
+)
 
 # Page config
 st.set_page_config(
@@ -223,98 +232,73 @@ elif data_source == "Upload File":
             metadata = st.session_state.uploaded_metadata
             
             
-            # Check if we need target selection first
+            # Auto-load all targets for multiplexed files
             if metadata.get('requires_target_selection', False) and 'selected_target' not in st.session_state:
-                # Show target selector
-                st.markdown("## 🎯 Select Target to Analyze")
-                st.info(f"📊 This file contains **multiplexed qPCR data** with multiple targets per well")
-                
                 extra_info = metadata['extra_info']
                 targets = extra_info['targets']
-                
-                st.markdown("### Available Targets")
-                
-                # Show target info
-                target_counts = {}
-                raw_df = extra_info['raw_df']
-                for target in targets:
-                    count = raw_df[raw_df['Target'] == target]['Well_Position'].nunique()
-                    target_counts[target] = count
-                
-                # Display as table
-                target_df = pd.DataFrame({
-                    'Target Name': targets,
-                    'Wells': [target_counts[t] for t in targets]
-                })
-                st.dataframe(target_df, use_container_width=True)
-                
-                # Selection with auto-trigger on change
-                st.markdown("### Choose Target")
-                
-                def on_target_change():
-                    """Callback when target selection changes"""
-                    target = st.session_state.target_selectbox
-                    st.session_state.target_confirmed = False  # Reset confirmation
-                
-                selected_target = st.selectbox(
-                    "Select which target/gene to analyze:",
-                    targets,
-                    key="target_selectbox",
-                    on_change=on_target_change,
-                    help="Choose the target gene you want to fit with MAK2+"
-                )
-                
-                col1, col2, col3 = st.columns([1, 2, 1])
-                with col2:
-                    # Use a separate button that just sets a flag
-                    if st.button("📥 Load Samples for This Target", type="primary", use_container_width=True, key="load_target_btn"):
-                        st.session_state.target_confirmed = True
-                
-                # Check if we should process (outside the button callback)
-                if st.session_state.get('target_confirmed', False):
-                    try:
-                        # Filter data by target
-                        with st.spinner(f"Loading {selected_target} data..."):
-                            converter = QPCRDataConverter(add_offset=True, offset_value=1e-5)
-                            filtered_cycles, filtered_samples = converter.filter_by_target(extra_info, selected_target)
-                            
-                            # Update session state with filtered data
-                            st.session_state.selected_target = selected_target
-                            st.session_state.uploaded_cycles = filtered_cycles
-                            st.session_state.uploaded_samples = filtered_samples
-                            
-                            # Create new metadata without extra_info (no longer needed)
-                            st.session_state.uploaded_metadata = {
-                                'format': metadata['format'],
-                                'n_samples': len(filtered_samples),
-                                'n_cycles': len(filtered_cycles),
-                                'sample_names': list(filtered_samples.keys()),
-                                'cycle_range': (filtered_cycles.min(), filtered_cycles.max()),
-                                'requires_target_selection': False
-                            }
-                            
-                            # Clear the confirmation flag
-                            st.session_state.target_confirmed = False
-                            
-                            st.success(f"✅ Loaded {len(filtered_samples)} samples for {selected_target}")
-                            st.rerun()
-                    except Exception as e:
-                        st.error(f"Error filtering target: {e}")
-                        import traceback
-                        st.code(traceback.format_exc())
-                        st.session_state.target_confirmed = False
-                
-                # Don't proceed further until target is selected
+
+                try:
+                    with st.spinner(f"Loading {len(targets)} targets..."):
+                        converter = QPCRDataConverter(add_offset=True, offset_value=1e-5)
+                        all_target_data = converter.filter_all_targets(extra_info)
+
+                        # Combine all targets — prefix well names with target
+                        combined_samples = {}
+                        combined_metadata = {}
+                        ref_cycles = None
+
+                        for target_name, (t_cycles, t_samples, t_meta) in all_target_data.items():
+                            if ref_cycles is None:
+                                ref_cycles = t_cycles
+                            for well, fluor in t_samples.items():
+                                key = f"{target_name}::{well}"
+                                combined_samples[key] = fluor
+                                if t_meta and well in t_meta:
+                                    combined_metadata[key] = {**t_meta[well], '_target': target_name, '_well': well}
+                                else:
+                                    combined_metadata[key] = {'_target': target_name, '_well': well}
+
+                        # Store combined data
+                        st.session_state.selected_target = 'All'
+                        st.session_state.all_targets = targets
+                        st.session_state.uploaded_cycles = ref_cycles
+                        st.session_state.uploaded_samples = combined_samples
+                        st.session_state.sample_metadata = combined_metadata
+
+                        st.session_state.uploaded_metadata = {
+                            'format': metadata['format'],
+                            'n_samples': len(combined_samples),
+                            'n_cycles': len(ref_cycles),
+                            'sample_names': list(combined_samples.keys()),
+                            'cycle_range': (ref_cycles.min(), ref_cycles.max()),
+                            'requires_target_selection': False
+                        }
+
+                        st.success(f"✅ Loaded {len(combined_samples)} samples across {len(targets)} targets: {', '.join(targets)}")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Error loading targets: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
+
                 st.stop()
             
             # Show file info in sidebar
-            target_label = f" ({st.session_state.get('selected_target', 'all')})" if 'selected_target' in st.session_state else ""
+            all_targets = st.session_state.get('all_targets', [])
+            if all_targets:
+                target_label = f" ({len(all_targets)} targets)"
+            elif 'selected_target' in st.session_state:
+                target_label = f" ({st.session_state.selected_target})"
+            else:
+                target_label = ""
             st.sidebar.success(f"✅ {metadata['n_samples']} samples loaded{target_label}")
             with st.sidebar.expander("📋 File Details"):
                 st.write(f"**Format:** {metadata['format']}")
                 st.write(f"**Cycles:** {metadata['n_cycles']}")
                 st.write(f"**Cycle range:** {metadata['cycle_range'][0]} - {metadata['cycle_range'][1]}")
-                if 'selected_target' in st.session_state:
+                if all_targets:
+                    st.write(f"**Targets:** {', '.join(all_targets)}")
+                elif 'selected_target' in st.session_state:
                     st.write(f"**Target:** {st.session_state.selected_target}")
                 
                 # Debug info
@@ -634,6 +618,101 @@ if cycles is not None and fluorescence is not None:
     truncate_cycle = None
     custom_bounds_dict = None
 
+    # Copy Number Conversion (sidebar)
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Copy Number Conversion")
+    calibration_method = st.sidebar.radio(
+        "Calibration method",
+        ["Auto-detect standards", "Limited dilution", "Manual CF", "None"],
+        index=0,
+        help="Choose how to convert D0 to copy numbers."
+    )
+    st.session_state['calibration_method'] = {
+        "Auto-detect standards": "auto",
+        "Limited dilution": "limited_dilution",
+        "Manual CF": "manual_cf",
+        "None": "none",
+    }[calibration_method]
+
+    if calibration_method == "Limited dilution":
+        ld_source = st.sidebar.radio(
+            "Identify limited dilution wells by:",
+            ["Sample Name (from metadata)", "Manual well selection"],
+            index=0,
+        )
+        sample_metadata_sidebar = st.session_state.get('sample_metadata', {})
+
+        if ld_source == "Sample Name (from metadata)":
+            if sample_metadata_sidebar:
+                unique_names = sorted(set(
+                    str(m.get('Sample Name', '')).strip()
+                    for m in sample_metadata_sidebar.values()
+                    if m.get('Sample Name') and str(m.get('Sample Name')).strip()
+                    and str(m.get('Sample Name')).strip() != 'nan'
+                ))
+                if unique_names:
+                    ld_sample_name = st.sidebar.selectbox(
+                        "Select limited dilution sample name",
+                        unique_names,
+                        help="All wells with this Sample Name are limited dilution wells."
+                    )
+                    ld_wells = [
+                        well for well, meta in sample_metadata_sidebar.items()
+                        if str(meta.get('Sample Name', '')).strip() == ld_sample_name
+                    ]
+                    st.sidebar.info(f"Found {len(ld_wells)} wells for '{ld_sample_name}'")
+                    st.session_state['ld_wells'] = ld_wells
+                else:
+                    st.sidebar.warning("No sample names found in metadata.")
+                    st.session_state['ld_wells'] = []
+            else:
+                st.sidebar.warning(
+                    "No sample metadata available. "
+                    "Upload a QuantStudio file or use manual well selection."
+                )
+                st.session_state['ld_wells'] = []
+        else:  # Manual well selection
+            ld_wells_input = st.sidebar.text_area(
+                "Enter limited dilution well positions",
+                placeholder="A1, A2, A3, B1, B2, B3, ...",
+                help="Comma-separated well positions. Include ALL wells "
+                     "(both positive and negative)."
+            )
+            ld_wells = [w.strip() for w in ld_wells_input.split(',') if w.strip()]
+            st.session_state['ld_wells'] = ld_wells
+            if ld_wells:
+                st.sidebar.info(f"{len(ld_wells)} wells entered")
+
+    elif calibration_method == "Manual CF":
+        manual_cf = st.sidebar.number_input(
+            "Manual conversion factor (copies/D0)",
+            min_value=0.0,
+            value=0.0,
+            format="%.2e",
+            help="Enter a known copies-per-D0-unit conversion factor. "
+                 "Leave at 0 to skip."
+        )
+        if manual_cf > 0:
+            st.session_state['manual_conversion_factor'] = manual_cf
+        else:
+            st.session_state.pop('manual_conversion_factor', None)
+
+    elif calibration_method == "Auto-detect standards":
+        manual_cf = st.sidebar.number_input(
+            "Fallback manual CF (if no standards found)",
+            min_value=0.0,
+            value=0.0,
+            format="%.2e",
+            help="Used only if no standard curve is available."
+        )
+        if manual_cf > 0:
+            st.session_state['manual_conversion_factor'] = manual_cf
+        else:
+            st.session_state.pop('manual_conversion_factor', None)
+
+    else:  # None
+        st.session_state.pop('manual_conversion_factor', None)
+
     # Replicate Analysis Options (only show for batch mode)
     if batch_mode and all_samples:
         with st.sidebar.expander("📊 Replicate Analysis", expanded=False):
@@ -646,19 +725,37 @@ if cycles is not None and fluorescence is not None:
             )
 
             if enable_replicate_analysis:
+                # Build grouping options — include metadata option if available
+                grouping_options = []
+                sample_metadata_check = st.session_state.get('sample_metadata')
+                has_file_names = (
+                    sample_metadata_check is not None and
+                    any(
+                        m.get('Sample Name') and str(m.get('Sample Name')).strip()
+                        and str(m.get('Sample Name')).strip() != 'nan'
+                        for m in sample_metadata_check.values()
+                    )
+                )
+                if has_file_names:
+                    grouping_options.append("Sample name (from file)")
+                grouping_options.extend([
+                    "Dot - last (F1.1, F1.2 → F1)",
+                    "Dot - first (X1.R1.1, X1.R2.1 → X1)",
+                    "Underscore (Sample_A_1, Sample_A_2 → Sample_A)",
+                    "Manual grouping (define your own)",
+                ])
+
                 grouping_pattern = st.radio(
                     "Group samples by:",
-                    ["Dot - last (F1.1, F1.2 → F1)",
-                     "Dot - first (X1.R1.1, X1.R2.1 → X1)",
-                     "Underscore (Sample_A_1, Sample_A_2 → Sample_A)",
-                     "Manual grouping (define your own)",
-                     "No grouping (show all samples)"],
+                    grouping_options,
                     index=0,
                     help="How to parse sample names into replicate groups"
                 )
 
                 # Preview groups with current samples
-                if "Dot - last" in grouping_pattern:
+                if grouping_pattern == "Sample name (from file)":
+                    pattern_key = 'sample_name'
+                elif "Dot - last" in grouping_pattern:
                     pattern_key = 'dot'
                 elif "Dot - first" in grouping_pattern:
                     pattern_key = 'first_part'
@@ -667,7 +764,7 @@ if cycles is not None and fluorescence is not None:
                 elif grouping_pattern == "Manual grouping (define your own)":
                     pattern_key = 'manual'
                 else:
-                    pattern_key = None
+                    pattern_key = 'dot'
 
                 # Show preview of groups that will be created
                 if pattern_key == 'manual':
@@ -706,6 +803,24 @@ if cycles is not None and fluorescence is not None:
                                     preview_groups[group_name] = valid_samples
                                 else:
                                     st.warning(f"⚠️ Group '{group_name}' has no valid samples")
+                elif pattern_key == 'sample_name' and sample_metadata_check:
+                    # Group by Sample Name from file metadata
+                    preview_groups = {}
+                    has_mt = any('::' in k for k in all_samples.keys())
+                    for key, meta in sample_metadata_check.items():
+                        sname = meta.get('Sample Name')
+                        if sname and str(sname) != 'nan' and str(sname).strip():
+                            sname = str(sname).strip()
+                            if has_mt and meta.get('_target'):
+                                group_label = f"{meta['_target']} — {sname}"
+                            else:
+                                group_label = sname
+                            if key in all_samples:
+                                if group_label not in preview_groups:
+                                    preview_groups[group_label] = []
+                                preview_groups[group_label].append(key)
+                    # Keep only groups with > 1 replicate
+                    preview_groups = {k: v for k, v in preview_groups.items() if len(v) > 1}
                 else:
                     preview_groups = parse_sample_groups(list(all_samples.keys()), pattern=pattern_key)
 
@@ -1068,7 +1183,34 @@ if cycles is not None and fluorescence is not None:
             # Create results dataframe (remove fluor_data before display)
             display_results = [{k: v for k, v in r.items() if k != 'fluor_data'} for r in results_list]
             results_df = pd.DataFrame(display_results)
-            
+
+            # Add Target and Well columns for multiplexed data (target::well format)
+            all_targets = st.session_state.get('all_targets', [])
+            if all_targets and results_df['Sample'].str.contains('::').any():
+                results_df.insert(0, 'Target', results_df['Sample'].str.split('::').str[0])
+                results_df.insert(1, 'Well', results_df['Sample'].str.split('::').str[1])
+
+            # Annotate with sample metadata (Sample Name, Task, Known_Copies) if available
+            sample_metadata = st.session_state.get('sample_metadata')
+            if sample_metadata:
+                results_df.insert(
+                    results_df.columns.get_loc('Sample') + 1,
+                    'Sample_Name',
+                    results_df['Sample'].map(
+                        lambda w: sample_metadata.get(w, {}).get('Sample Name', '')
+                    )
+                )
+                results_df.insert(
+                    results_df.columns.get_loc('Sample_Name') + 1,
+                    'Task',
+                    results_df['Sample'].map(
+                        lambda w: sample_metadata.get(w, {}).get('Task', '')
+                    )
+                )
+                results_df['Known_Copies'] = results_df['Sample'].map(
+                    lambda w: sample_metadata.get(w, {}).get('Quantity', np.nan)
+                )
+
             # Store in session state for persistence
             st.session_state['batch_results'] = results_df
             st.session_state['batch_results_list'] = results_list
@@ -1087,7 +1229,20 @@ if cycles is not None and fluorescence is not None:
             st.subheader("🔄 Batch Fitting Results")
             results_df = st.session_state['batch_results']
             results_list = st.session_state['batch_results_list']
-            
+
+            # Target filter for multiplexed data
+            display_df = results_df
+            if 'Target' in results_df.columns:
+                unique_targets = results_df['Target'].unique().tolist()
+                if len(unique_targets) > 1:
+                    target_filter = st.selectbox(
+                        "Filter by target:",
+                        ["All targets"] + unique_targets,
+                        key="target_display_filter"
+                    )
+                    if target_filter != "All targets":
+                        display_df = results_df[results_df['Target'] == target_filter]
+
             # Format numeric columns
             format_dict = {
                 'D0': '{:.2e}',
@@ -1098,10 +1253,12 @@ if cycles is not None and fluorescence is not None:
                 'R2': '{:.6f}',
                 'RMSE': '{:.4f}',
                 'NRMSE': '{:.2f}',
-                'SSR': '{:.6f}'
+                'SSR': '{:.6f}',
+                'Known_Copies': '{:.2e}',
+                'Copies': '{:.2e}',
             }
-            
-            st.dataframe(results_df.style.format(format_dict, na_rep='-'), use_container_width=True)
+
+            st.dataframe(display_df.style.format(format_dict, na_rep='-'), use_container_width=True)
             
             # Summary statistics
             col1, col2, col3 = st.columns(3)
@@ -1126,7 +1283,200 @@ if cycles is not None and fluorescence is not None:
                     ])
                     st.dataframe(no_signal_df, use_container_width=True)
 
-            # Export button
+            # ============================================================================
+            # CALIBRATION SECTION
+            # ============================================================================
+            sample_metadata = st.session_state.get('sample_metadata')
+            manual_cf_val = st.session_state.get('manual_conversion_factor')
+            cal_method = st.session_state.get('calibration_method', 'auto')
+
+            has_standards = (
+                cal_method == 'auto' and
+                sample_metadata is not None and
+                any(m.get('Task') == 'STANDARD' for m in sample_metadata.values())
+            )
+
+            ld_wells = st.session_state.get('ld_wells', [])
+            no_signal_wells = list(st.session_state.get('batch_no_signal_samples', {}).keys())
+
+            if has_standards:
+                st.markdown("---")
+                st.subheader("📐 Standard Curve Calibration")
+
+                calibration = build_standard_curve(results_df, sample_metadata)
+
+                if calibration is None:
+                    st.warning("Could not build standard curve (need ≥ 2 concentration levels with successful fits)")
+                    # Fall back to manual CF if available
+                    if manual_cf_val and manual_cf_val > 0:
+                        results_df = apply_calibration(results_df, manual_cf=manual_cf_val)
+                        st.session_state['batch_results'] = results_df
+                        st.info(f"Using manual conversion factor: {manual_cf_val:.2e} copies/D0")
+                else:
+                    # Display calibration metrics
+                    col1, col2, col3, col4 = st.columns(4)
+                    col1.metric("R²", f"{calibration['r_squared']:.4f}")
+                    col2.metric("Slope", f"{calibration['slope']:.3f}")
+                    col3.metric("Intercept", f"{calibration['intercept']:.3f}")
+                    col4.metric("Standards", f"{calibration['n_standards']} wells, {calibration['n_concentrations']} levels")
+
+                    # Conversion factor with error estimates
+                    st.markdown(
+                        f"**Conversion Factor:** {calibration['conversion_factor']:.2e} copies/D0 "
+                        f"(95% CI: {calibration['cf_ci_lower']:.2e} – {calibration['cf_ci_upper']:.2e})"
+                    )
+                    if not np.isnan(calibration['pooled_replicate_cv']):
+                        st.markdown(
+                            f"**Replicate Variance:** pooled CV = {calibration['pooled_replicate_cv']:.1f}% across standard replicates"
+                        )
+
+                    # Show per-level replicate variance in expander
+                    with st.expander("📊 Replicate variance by concentration level"):
+                        var_data = []
+                        for copies_val, var_info in sorted(
+                            calibration['replicate_variance'].items(), reverse=True
+                        ):
+                            var_data.append({
+                                'Known Copies': f"{copies_val:.2e}",
+                                'N Replicates': var_info['n_replicates'],
+                                'Mean D0': f"{var_info['mean_D0']:.4e}",
+                                'SD D0': f"{var_info['sd_D0']:.4e}" if not np.isnan(var_info['sd_D0']) else '-',
+                                'CV%': f"{var_info['cv_D0_pct']:.1f}" if not np.isnan(var_info['cv_D0_pct']) else '-',
+                            })
+                        st.dataframe(pd.DataFrame(var_data), use_container_width=True)
+
+                    # Warnings
+                    for w in calibration.get('warnings', []):
+                        st.warning(w)
+
+                    # Diagnostic plot
+                    fig_cal = plot_calibration(calibration)
+                    st.plotly_chart(fig_cal, use_container_width=True)
+
+                    # Apply calibration to add Copies column
+                    # For multi-target data, only calibrate the target that has standards
+                    if 'Target' in results_df.columns:
+                        # Find which target the standards belong to
+                        std_targets = set()
+                        for key, meta in (sample_metadata or {}).items():
+                            if meta.get('Task') == 'STANDARD':
+                                std_targets.add(meta.get('_target', ''))
+                        if std_targets and len(std_targets) == 1:
+                            cal_target = list(std_targets)[0]
+                            mask = results_df['Target'] == cal_target
+                            cal_subset = apply_calibration(results_df[mask].copy(), calibration=calibration)
+                            results_df.loc[mask, 'Copies'] = cal_subset['Copies']
+                            st.session_state['batch_results'] = results_df
+                            st.success(f"✅ Copies column added for **{cal_target}** from standard curve calibration")
+                            other_targets = [t for t in results_df['Target'].unique() if t != cal_target]
+                            if other_targets:
+                                st.info(f"ℹ️ Other targets ({', '.join(other_targets)}) do not have standards — no copy numbers assigned.")
+                        else:
+                            results_df = apply_calibration(results_df, calibration=calibration)
+                            st.session_state['batch_results'] = results_df
+                            st.success("✅ Copies column added to results from standard curve calibration")
+                    else:
+                        results_df = apply_calibration(results_df, calibration=calibration)
+                        st.session_state['batch_results'] = results_df
+                        st.success("✅ Copies column added to results from standard curve calibration")
+
+            elif cal_method == 'limited_dilution' and len(ld_wells) >= 3:
+                st.markdown("---")
+                st.subheader("📐 Limited Dilution Calibration")
+
+                ld_calibration = build_limited_dilution_calibration(
+                    results_df=results_df,
+                    ld_wells=ld_wells,
+                    no_signal_wells=no_signal_wells,
+                )
+
+                if ld_calibration is None or 'conversion_factor' not in ld_calibration:
+                    st.error("Limited dilution calibration failed.")
+                    if ld_calibration and ld_calibration.get('warnings'):
+                        for w in ld_calibration['warnings']:
+                            st.warning(w)
+                else:
+                    # Display metrics
+                    col1, col2, col3, col4 = st.columns(4)
+                    col1.metric("\u03bb (copies/well)", f"{ld_calibration['lambda_hat']:.3f}")
+                    col2.metric("Conversion Factor", f"{ld_calibration['conversion_factor']:.2e}")
+                    col3.metric("Positive Wells",
+                                f"{ld_calibration['n_positive']}/{ld_calibration['n_total']}")
+                    col4.metric("D0 (1 copy)", f"{ld_calibration['d0_single_copy']:.3e}")
+
+                    # CF with CI
+                    if not np.isnan(ld_calibration['cf_ci_lower']):
+                        st.markdown(
+                            f"**Conversion Factor:** {ld_calibration['conversion_factor']:.2e} copies/D0 "
+                            f"(95% CI: {ld_calibration['cf_ci_lower']:.2e} \u2013 "
+                            f"{ld_calibration['cf_ci_upper']:.2e})"
+                        )
+                    else:
+                        st.markdown(
+                            f"**Conversion Factor:** {ld_calibration['conversion_factor']:.2e} copies/D0"
+                        )
+
+                    st.markdown(
+                        f"**Poisson rate (\u03bb):** {ld_calibration['lambda_hat']:.3f} copies/well "
+                        f"(SE: {ld_calibration['lambda_se']:.3f})"
+                    )
+                    st.markdown(
+                        f"**Expected copies per positive well:** "
+                        f"{ld_calibration['expected_copies_per_positive']:.3f}"
+                    )
+
+                    # Warnings
+                    for w in ld_calibration.get('warnings', []):
+                        st.warning(w)
+
+                    # Diagnostic plots
+                    fig_ld = plot_limited_dilution_diagnostics(ld_calibration)
+                    st.plotly_chart(fig_ld, use_container_width=True)
+
+                    # Positive well D0 details
+                    with st.expander("🔬 Positive well D0 details"):
+                        pos_wells_list = ld_calibration['positive_wells']
+                        pos_details = results_df[
+                            results_df['Sample'].isin(pos_wells_list)
+                        ][['Sample', 'D0', 'R2']].copy()
+                        pos_details['Est. Copies'] = (
+                            pos_details['D0'] * ld_calibration['conversion_factor']
+                        )
+                        st.dataframe(pos_details, use_container_width=True)
+
+                        st.markdown(
+                            f"**D0 statistics:** mean = {ld_calibration['mean_d0_positive']:.3e}, "
+                            f"median = {ld_calibration['median_d0_positive']:.3e}"
+                        )
+                        if not np.isnan(ld_calibration['cv_d0_positive']):
+                            st.markdown(
+                                f"**CV:** {ld_calibration['cv_d0_positive']:.1f}%"
+                            )
+
+                    # Apply calibration — feed CF into apply_calibration via manual_cf
+                    results_df = apply_calibration(
+                        results_df, manual_cf=ld_calibration['conversion_factor']
+                    )
+                    st.session_state['batch_results'] = results_df
+                    st.success("✅ Copies column added from limited dilution calibration")
+
+            elif cal_method == 'manual_cf' and manual_cf_val and manual_cf_val > 0:
+                # Manual CF provided
+                st.markdown("---")
+                st.subheader("📐 Copy Number Conversion (Manual)")
+                results_df = apply_calibration(results_df, manual_cf=manual_cf_val)
+                st.session_state['batch_results'] = results_df
+                st.info(f"Applied manual conversion factor: {manual_cf_val:.2e} copies/D0")
+
+            elif cal_method == 'auto' and manual_cf_val and manual_cf_val > 0:
+                # Auto mode but no standards found — use fallback manual CF
+                st.markdown("---")
+                st.subheader("📐 Copy Number Conversion (Manual Fallback)")
+                results_df = apply_calibration(results_df, manual_cf=manual_cf_val)
+                st.session_state['batch_results'] = results_df
+                st.info(f"No standards detected. Applied fallback manual CF: {manual_cf_val:.2e} copies/D0")
+
+            # Export button (after calibration so Copies column is included)
             csv = results_df.to_csv(index=False)
             st.download_button(
                 "📥 Download All Results (CSV)",
@@ -1146,8 +1496,35 @@ if cycles is not None and fluorescence is not None:
                 # Get grouping pattern from session state
                 pattern = st.session_state.get('grouping_pattern', 'dot')
 
-                # Parse sample groups
-                if pattern == 'manual':
+                # Parse sample groups — use Sample Name from metadata when available
+                sample_metadata_for_groups = st.session_state.get('sample_metadata')
+                has_multi_targets = 'Target' in results_df.columns and results_df['Target'].nunique() > 1
+                if sample_metadata_for_groups and pattern == 'sample_name':
+                    # Group by Sample Name from instrument metadata
+                    name_groups = {}
+                    for key, meta in sample_metadata_for_groups.items():
+                        sname = meta.get('Sample Name')
+                        if sname and str(sname) != 'nan' and str(sname).strip():
+                            sname = str(sname).strip()
+                            # For multi-target, prefix group name with target
+                            if has_multi_targets and meta.get('_target'):
+                                group_label = f"{meta['_target']} — {sname}"
+                            else:
+                                group_label = sname
+                            if key in results_df['Sample'].values:
+                                if group_label not in name_groups:
+                                    name_groups[group_label] = []
+                                name_groups[group_label].append(key)
+                    # Keep only groups with > 1 replicate
+                    sample_groups = {k: v for k, v in name_groups.items() if len(v) > 1}
+                    if sample_groups:
+                        st.info("Grouping by Sample Name from instrument metadata")
+                    else:
+                        # Fall back to pattern-based grouping
+                        sample_groups = parse_sample_groups(
+                            results_df['Sample'].tolist(), pattern='dot'
+                        )
+                elif pattern == 'manual':
                     # Use manually defined groups from session state
                     sample_groups = {}
                     manual_groups_text = st.session_state.get('manual_groups_text', '')
@@ -1191,11 +1568,16 @@ if cycles is not None and fluorescence is not None:
                     else:
                         st.success(f"✅ Analyzed {len(sample_groups)} replicate groups ({len(results_with_groups)} samples total)")
 
+                        # Determine which metrics to track
+                        rep_metrics = ['Ct', 'D0']
+                        if 'Copies' in results_with_groups.columns and results_with_groups['Copies'].notna().any():
+                            rep_metrics.append('Copies')
+
                         # Calculate replicate statistics
                         replicate_stats = calculate_replicate_stats(
                             results_with_groups,
                             group_column='Group',
-                            metrics=['Ct', 'D0']
+                            metrics=rep_metrics
                         )
 
                         # Precision comparison (use default efficiency unless dilution series provides better estimate)
@@ -1203,8 +1585,9 @@ if cycles is not None and fluorescence is not None:
                         precision_comparison = compare_precision(replicate_stats, efficiency=0.95)
 
                         # Display tabs for different analyses
-                        tab1, tab2, tab3 = st.tabs([
+                        tab1, tab2, tab3, tab4 = st.tabs([
                             "📈 Replicate Statistics",
+                            "🔬 Replicate Visualization",
                             "🎯 Precision Comparison",
                             "📉 Dilution Series"
                         ])
@@ -1221,7 +1604,10 @@ if cycles is not None and fluorescence is not None:
                                 'Ct_CV': '{:.2f}%',
                                 'D0_Mean': '{:.2e}',
                                 'D0_SD': '{:.2e}',
-                                'D0_CV': '{:.2f}%'
+                                'D0_CV': '{:.2f}%',
+                                'Copies_Mean': '{:.2e}',
+                                'Copies_SD': '{:.2e}',
+                                'Copies_CV': '{:.2f}%',
                             }
 
                             st.dataframe(
@@ -1240,6 +1626,57 @@ if cycles is not None and fluorescence is not None:
                             )
 
                         with tab2:
+                            st.markdown("### Replicate Overlay")
+                            st.markdown("Select a replicate group to overlay all replicates on one plot.")
+
+                            group_names = sorted(sample_groups.keys())
+                            selected_group = st.selectbox(
+                                "Select replicate group:",
+                                group_names,
+                                key="replicate_group_selector"
+                            )
+
+                            if selected_group:
+                                group_wells = sample_groups[selected_group]
+
+                                # Plot overlay
+                                batch_cycles = st.session_state.get('batch_cycles')
+                                batch_all_samples = st.session_state.get('batch_all_samples', {})
+                                batch_results_list = st.session_state.get('batch_results_list', [])
+
+                                if batch_cycles is not None and batch_all_samples:
+                                    fig_overlay = plot_replicate_overlay(
+                                        cycles=batch_cycles,
+                                        all_samples=batch_all_samples,
+                                        results_list=batch_results_list,
+                                        group_wells=group_wells,
+                                        group_name=selected_group
+                                    )
+                                    st.plotly_chart(fig_overlay, use_container_width=True)
+
+                                    # Parameter summary table (mean +/- SE)
+                                    st.markdown("**Parameter Summary (Mean ± SE)**")
+                                    param_summary = calculate_replicate_param_summary(
+                                        results_df, group_wells
+                                    )
+                                    # Format for display
+                                    def format_mean_se(row):
+                                        mean = row['Mean']
+                                        se = row['SE']
+                                        n = int(row['N'])
+                                        if pd.isna(mean):
+                                            return '-'
+                                        if pd.isna(se):
+                                            return f'{mean:.4e} (n={n})'
+                                        return f'{mean:.4e} ± {se:.4e} (n={n})'
+
+                                    summary_display = param_summary.apply(format_mean_se, axis=1)
+                                    summary_display.name = 'Mean ± SE (n)'
+                                    st.dataframe(summary_display.to_frame(), use_container_width=True)
+                                else:
+                                    st.warning("Batch fitting data not available for visualization.")
+
+                        with tab3:
                             st.markdown("**Precision Comparison: Ct vs D0**")
                             st.markdown("*Lower CV% = Better precision*")
 
@@ -1312,7 +1749,7 @@ if cycles is not None and fluorescence is not None:
                                 key="precision_comparison_download"
                             )
 
-                        with tab3:
+                        with tab4:
                             # Check if dilution series analysis is enabled
                             if st.session_state.get('analyze_as_dilution', False):
                                 st.markdown("**Dilution Series Analysis**")

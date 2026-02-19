@@ -1,3 +1,4 @@
 .streamlit/*
 !.streamlit/config.toml
 secrets.toml
+__pycache__/
