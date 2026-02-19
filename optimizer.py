@@ -1074,11 +1074,7 @@ class MAK2Optimizer:
                         if verbose:
                             print(f"    Pattern retry {retry_i}: D0_init = {D0_sample:.2e}, k_init = {k_sample:.4f}, P0_init = {P0_sample:.4f}")
 
-                        # Use uniform weighting for first retry
-                        # Use STRONG adaptive weighting for retries 2-3 (20×, 30×) for plateau emphasis
-                        use_uniform = (retry_i == 1)
-                        weight_multiplier = 10.0 + (retry_i - 1) * 10.0  # 10×, 20×, 30×
-
+                        # Use uniform weighting for all retries (no plateau emphasis)
                         retry_params, retry_r2 = self._fit_attempt(
                             cycles_fit,
                             fluorescence_fit,
@@ -1092,8 +1088,6 @@ class MAK2Optimizer:
                             lhs_D0=D0_sample,
                             lhs_k=k_sample,
                             lhs_P0=P0_sample,
-                            use_uniform_weighting=use_uniform,
-                            plateau_weight_multiplier=weight_multiplier
                         )
 
                         if verbose:
@@ -1740,7 +1734,7 @@ class MAK2Optimizer:
         lhs_k: Optional[float] = None,
         lhs_P0: Optional[float] = None,
         use_uniform_weighting: bool = False,
-        plateau_weight_multiplier: float = 10.0
+        plateau_weight_multiplier: float = 1.0
     ) -> Tuple[Dict[str, float], float]:
         """
         Single fitting attempt with random initial guess or LHS samples.
