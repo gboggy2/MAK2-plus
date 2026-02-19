@@ -1313,21 +1313,26 @@ if cycles is not None and fluorescence is not None:
                         st.session_state['batch_results'] = results_df
                         st.info(f"Using manual conversion factor: {manual_cf_val:.2e} copies/D0")
                 else:
-                    # Display calibration metrics
+                    # Display calibration metrics — CF is primary
                     col1, col2, col3, col4 = st.columns(4)
-                    col1.metric("R²", f"{calibration['r_squared']:.4f}")
-                    col2.metric("Slope", f"{calibration['slope']:.3f}")
-                    col3.metric("Intercept", f"{calibration['intercept']:.3f}")
+                    col1.metric("CF (copies/D0)", f"{calibration['conversion_factor']:.2e}")
+                    col2.metric("95% CI lower", f"{calibration['cf_ci_lower']:.2e}")
+                    col3.metric("95% CI upper", f"{calibration['cf_ci_upper']:.2e}")
                     col4.metric("Standards", f"{calibration['n_standards']} wells, {calibration['n_concentrations']} levels")
 
-                    # Conversion factor with error estimates
                     st.markdown(
-                        f"**Conversion Factor:** {calibration['conversion_factor']:.2e} copies/D0 "
-                        f"(95% CI: {calibration['cf_ci_lower']:.2e} – {calibration['cf_ci_upper']:.2e})"
+                        f"**copies = {calibration['conversion_factor']:.2e} \u00d7 D0** "
+                        f"(median CF across all standard wells)"
                     )
+                    cf_spread = calibration.get('cf_spread', np.nan)
+                    if not np.isnan(cf_spread):
+                        st.markdown(
+                            f"**CF spread:** {cf_spread:.2f}\u00d7 across concentration levels "
+                            f"(diagnostic slope = {calibration['slope']:.3f}, R\u00b2 = {calibration['r_squared']:.4f})"
+                        )
                     if not np.isnan(calibration['pooled_replicate_cv']):
                         st.markdown(
-                            f"**Replicate Variance:** pooled CV = {calibration['pooled_replicate_cv']:.1f}% across standard replicates"
+                            f"**Replicate variance:** pooled CV = {calibration['pooled_replicate_cv']:.1f}% across standard replicates"
                         )
 
                     # Show per-level replicate variance in expander
