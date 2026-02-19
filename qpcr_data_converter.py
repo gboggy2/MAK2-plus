@@ -442,18 +442,72 @@ class QPCRDataConverter:
         
         return cycles, samples
     
+    def _parse_sample_setup(self, xls: pd.ExcelFile) -> Optional[pd.DataFrame]:
+        """
+        Parse Sample Setup sheet for well metadata (Sample Name, Task, Quantity).
+
+        QuantStudio exports include a "Sample Setup" sheet with metadata about each well,
+        including sample names, task types (UNKNOWN, STANDARD, NTC), and known quantities
+        for standards. The header row position varies (typically around row 46).
+
+        Parameters
+        ----------
+        xls : pd.ExcelFile
+            Open Excel file handle
+
+        Returns
+        -------
+        pd.DataFrame or None
+            DataFrame with columns like Well, Well Position, Sample Name, Target Name,
+            Task, Quantity. Returns None if sheet not found or unparseable.
+        """
+        setup_sheets = ['Sample Setup', 'Sample Setup ']  # trailing space variant
+        for sheet in setup_sheets:
+            if sheet in xls.sheet_names:
+                try:
+                    df_raw = pd.read_excel(xls, sheet_name=sheet, header=None)
+                    # Find header row (contains "Well" and "Sample Name")
+                    for i in range(min(60, len(df_raw))):
+                        row_vals = [str(v).strip() for v in df_raw.iloc[i].values]
+                        if 'Well' in row_vals and 'Sample Name' in row_vals:
+                            # Use this row as column names
+                            col_names = [str(v).strip() for v in df_raw.iloc[i].values]
+                            # Read data rows below the header
+                            df = df_raw.iloc[i+1:].copy()
+                            df.columns = col_names
+                            df = df.reset_index(drop=True)
+
+                            # Keep relevant columns
+                            keep = ['Well', 'Well Position', 'Sample Name', 'Target Name',
+                                    'Task', 'Quantity']
+                            keep = [c for c in keep if c in df.columns]
+                            df = df[keep]
+
+                            # Drop rows where Well is empty/NaN
+                            df = df.dropna(subset=['Well'])
+
+                            # Convert Quantity to numeric
+                            if 'Quantity' in df.columns:
+                                df['Quantity'] = pd.to_numeric(df['Quantity'], errors='coerce')
+
+                            return df
+                except Exception:
+                    pass
+        return None
+
     def _try_quantstudio_multisheet(self, filepath: Union[str, Path, io.BytesIO]) -> Tuple[np.ndarray, Dict[str, np.ndarray], Optional[Dict]]:
         """
         Try to read QuantStudio format from multi-sheet Excel file.
-        
+
         Looks for "Amplification Data" sheet and skips header rows.
-        
+        Also reads "Sample Setup" sheet for well metadata (Sample Name, Task, Quantity).
+
         Returns
         -------
         cycles : np.ndarray
         samples : Dict[str, np.ndarray]
         extra_info : Dict
-            Contains 'targets' for multiplexed data
+            Contains 'targets' for multiplexed data and 'sample_setup' for well metadata
         """
         try:
             # Check if it's an Excel file with multiple sheets
@@ -512,20 +566,24 @@ class QPCRDataConverter:
             # Find well position column
             well_col = 'Well_Position' if 'Well_Position' in df.columns else 'Well'
             
+            # Parse Sample Setup sheet for metadata (Sample Name, Task, Quantity)
+            sample_setup = self._parse_sample_setup(xls)
+
             # Check if we have Target column (multiplexed data)
             has_targets = 'Target' in df.columns and df['Target'].notna().any()
-            
+
             if has_targets:
                 # Get unique targets
                 targets = df['Target'].dropna().unique().tolist()
-                
+
                 # Return data organized by target
                 extra_info = {
                     'has_targets': True,
                     'targets': targets,
                     'raw_df': df,  # Store for later filtering
                     'well_col': well_col,
-                    'fluor_col': fluor_col
+                    'fluor_col': fluor_col,
+                    'sample_setup': sample_setup,  # Well metadata (may be None)
                 }
                 
                 # For now, return empty samples dict - will be populated after target selection
@@ -575,50 +633,111 @@ class QPCRDataConverter:
         self,
         extra_info: Dict,
         target_name: str
-    ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    ) -> Tuple[np.ndarray, Dict[str, np.ndarray], Optional[Dict]]:
         """
         Filter multiplexed qPCR data by target name.
-        
+
         Parameters
         ----------
         extra_info : Dict
             Extra info dict from _try_quantstudio_multisheet containing raw_df
+            and optionally sample_setup DataFrame
         target_name : str
             Target name to filter for
-            
+
         Returns
         -------
         cycles : np.ndarray
             Cycle numbers
         samples : Dict[str, np.ndarray]
             Samples for the selected target only
+        sample_metadata : Dict or None
+            Per-well metadata dict keyed by well position, e.g.:
+            {'A1': {'Sample Name': 'Patient_1', 'Task': 'UNKNOWN', 'Quantity': NaN}, ...}
+            None if Sample Setup sheet was not available.
         """
         if not extra_info or not extra_info.get('has_targets'):
             raise ValueError("No target information available")
-        
+
         df = extra_info['raw_df']
         well_col = extra_info['well_col']
         fluor_col = extra_info['fluor_col']
-        
+
         # Filter for selected target
         df_target = df[df['Target'] == target_name].copy()
-        
+
         if len(df_target) == 0:
             raise ValueError(f"No data found for target '{target_name}'")
-        
+
         # Pivot to get samples
         pivot = df_target.pivot_table(index='Cycle', columns=well_col, values=fluor_col, aggfunc='first')
-        
+
         cycles = pivot.index.values
         samples = {str(col): pivot[col].values for col in pivot.columns}
-        
+
         # Add offset if requested
         if self.add_offset:
             for name in samples:
                 samples[name] = samples[name] + self.offset_value
-        
-        return cycles, samples
-    
+
+        # Build per-well metadata from Sample Setup (if available)
+        sample_metadata = None
+        setup_df = extra_info.get('sample_setup')
+        if setup_df is not None:
+            # Filter setup by target name if Target Name column exists
+            if 'Target Name' in setup_df.columns:
+                target_setup = setup_df[setup_df['Target Name'] == target_name].copy()
+            else:
+                target_setup = setup_df.copy()
+
+            if len(target_setup) > 0:
+                # Key by Well Position to match sample dict keys
+                wp_col = 'Well Position' if 'Well Position' in target_setup.columns else 'Well'
+                # Build dict: {well_pos: {col: value, ...}}
+                sample_metadata = {}
+                for _, row in target_setup.iterrows():
+                    well_pos = str(row[wp_col])
+                    meta = {}
+                    for col in target_setup.columns:
+                        if col != wp_col:
+                            val = row[col]
+                            # Convert NaN to None for cleaner handling
+                            if pd.isna(val):
+                                meta[col] = None
+                            else:
+                                meta[col] = val
+                    sample_metadata[well_pos] = meta
+
+        return cycles, samples, sample_metadata
+
+    def filter_all_targets(
+        self,
+        extra_info: Dict,
+    ) -> Dict[str, Tuple[np.ndarray, Dict[str, np.ndarray], Optional[Dict]]]:
+        """
+        Filter multiplexed qPCR data for ALL targets at once.
+
+        Parameters
+        ----------
+        extra_info : Dict
+            Extra info dict from _try_quantstudio_multisheet.
+
+        Returns
+        -------
+        dict
+            Keyed by target name, values are (cycles, samples, sample_metadata)
+            tuples — same as filter_by_target() returns for each target.
+        """
+        if not extra_info or not extra_info.get('has_targets'):
+            raise ValueError("No target information available")
+
+        targets = extra_info['targets']
+        result = {}
+        for target in targets:
+            cycles, samples, metadata = self.filter_by_target(extra_info, target)
+            result[target] = (cycles, samples, metadata)
+        return result
+
     def filter_samples(
         self,
         samples: Dict[str, np.ndarray],
