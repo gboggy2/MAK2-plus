@@ -28,10 +28,14 @@ def build_standard_curve(
     r2_min: float = 0.99
 ) -> Optional[Dict]:
     """
-    Build log-log standard curve: log10(known_copies) vs log10(D0).
+    Build standard curve calibration: copies = CF * D0.
 
-    Identifies standard wells from sample_metadata (Task == 'STANDARD'),
-    matches to D0 values from results_df, and performs linear regression.
+    Uses a single, mechanism-based conversion factor (CF) computed as the
+    median of (copies / D0) across all standard wells.  No power-law or
+    empirical slope correction -- the relationship is strictly linear.
+
+    A log-log regression is still computed for diagnostic purposes (slope
+    ideally = 1.0, R² ideally = 1.0) but is NOT used for the conversion.
 
     Parameters
     ----------
@@ -41,21 +45,17 @@ def build_standard_curve(
         Per-well metadata keyed by well position, e.g.:
         {'D1': {'Task': 'STANDARD', 'Quantity': 3313000.0, ...}, ...}
     r2_min : float
-        Minimum R² to accept the calibration (default 0.99).
+        Minimum R² for diagnostic warning (default 0.99).
 
     Returns
     -------
     dict or None
         Calibration dict with keys:
-            slope, intercept, r_squared,
-            slope_stderr, intercept_stderr,
             conversion_factor, cf_ci_lower, cf_ci_upper,
-            cf_error_regression (str description),
-            replicate_variance (dict per concentration),
-            pooled_replicate_cv,
+            slope, intercept, r_squared (diagnostics only),
+            replicate_variance, pooled_replicate_cv,
             n_standards, n_concentrations,
-            per_point_data (DataFrame for plotting),
-            warnings (list of str)
+            per_point_data, warnings
         Returns None if < 2 concentration levels or no valid standards.
     """
     if not sample_metadata:
@@ -77,11 +77,10 @@ def build_standard_curve(
         if len(match) == 0:
             continue
         row = match.iloc[0]
-        # Skip failed fits
         if pd.isna(row.get('D0')) or row.get('D0', 0) <= 0:
             continue
         success = str(row.get('Success', ''))
-        if '✗' in success:
+        if '\u2717' in success:
             continue
         points.append({
             'Well': well,
@@ -90,6 +89,7 @@ def build_standard_curve(
             'R2': row.get('R2', np.nan),
             'log10_D0': np.log10(row['D0']),
             'log10_Copies': np.log10(copies),
+            'CF': copies / row['D0'],
         })
 
     if len(points) < 2:
@@ -97,15 +97,43 @@ def build_standard_curve(
 
     points_df = pd.DataFrame(points)
 
-    # Check we have at least 2 concentration levels
     unique_copies = points_df['Known_Copies'].unique()
     if len(unique_copies) < 2:
         return None
 
-    # 3. Linear regression: log10(copies) = slope * log10(D0) + intercept
+    # 3. Conversion factor: median CF across all standard wells
+    cf_values = points_df['CF'].values
+    conversion_factor = float(np.median(cf_values))
+
+    # 95% CI on CF via bootstrap (percentile method)
+    n = len(cf_values)
+    rng = np.random.default_rng(42)
+    n_boot = 2000
+    boot_medians = np.array([
+        np.median(rng.choice(cf_values, size=n, replace=True))
+        for _ in range(n_boot)
+    ])
+    cf_ci_lower = float(np.percentile(boot_medians, 2.5))
+    cf_ci_upper = float(np.percentile(boot_medians, 97.5))
+
+    # Per-concentration-level median CF
+    per_level_cf = {}
+    for copies_val in sorted(unique_copies, reverse=True):
+        mask = points_df['Known_Copies'] == copies_val
+        group_cfs = points_df.loc[mask, 'CF'].values
+        per_level_cf[copies_val] = {
+            'median_cf': float(np.median(group_cfs)),
+            'mean_cf': float(np.mean(group_cfs)),
+            'n': len(group_cfs),
+        }
+
+    # CF spread: max / min of per-level medians
+    level_medians = [v['median_cf'] for v in per_level_cf.values()]
+    cf_spread = max(level_medians) / min(level_medians) if min(level_medians) > 0 else np.nan
+
+    # 4. Diagnostic log-log regression (NOT used for conversion)
     log_d0 = points_df['log10_D0'].values
     log_copies = points_df['log10_Copies'].values
-
     result = linregress(log_d0, log_copies)
     slope = result.slope
     intercept = result.intercept
@@ -113,27 +141,7 @@ def build_standard_curve(
     slope_stderr = result.stderr
     intercept_stderr = result.intercept_stderr
 
-    # 4. Conversion factor: when slope ≈ 1, CF = 10^intercept
-    conversion_factor = 10 ** intercept
-
-    # 95% CI on intercept → CI on conversion factor
-    n = len(points_df)
-    dof = n - 2
-    t_crit = t_dist.ppf(0.975, dof) if dof > 0 else 2.0
-    intercept_ci_low = intercept - t_crit * intercept_stderr
-    intercept_ci_high = intercept + t_crit * intercept_stderr
-    cf_ci_lower = 10 ** intercept_ci_low
-    cf_ci_upper = 10 ** intercept_ci_high
-
-    # Regression error description
-    slope_ci_low = slope - t_crit * slope_stderr
-    slope_ci_high = slope + t_crit * slope_stderr
-    cf_error_regression = (
-        f"Slope: {slope:.3f} (95% CI: {slope_ci_low:.3f}–{slope_ci_high:.3f}), "
-        f"CF: {conversion_factor:.2e} (95% CI: {cf_ci_lower:.2e}–{cf_ci_upper:.2e})"
-    )
-
-    # 5. Replicate variance: SD of log10(D0) within each concentration level
+    # 5. Replicate variance
     replicate_variance = {}
     all_cvs = []
     for copies_val in sorted(unique_copies, reverse=True):
@@ -168,30 +176,39 @@ def build_standard_curve(
     warnings = []
     if abs(slope - 1.0) > 0.1:
         warnings.append(
-            f"Slope ({slope:.3f}) deviates from expected value of 1.0 by "
-            f"{abs(slope - 1.0):.3f}. This may indicate non-linear amplification."
+            f"Diagnostic slope ({slope:.3f}) deviates from 1.0 by "
+            f"{abs(slope - 1.0):.3f}. D0 compression may affect accuracy "
+            f"at extreme copy numbers."
         )
     if r_squared < r2_min:
         warnings.append(
-            f"R² ({r_squared:.4f}) is below threshold ({r2_min}). "
-            f"Standard curve fit may be unreliable."
+            f"Diagnostic R\u00b2 ({r_squared:.4f}) is below {r2_min}. "
+            f"Standard data may have high variability."
         )
     if pooled_cv and not np.isnan(pooled_cv) and pooled_cv > 20:
         warnings.append(
             f"High replicate variability (pooled CV = {pooled_cv:.1f}%). "
             f"Consider re-running standards."
         )
+    if cf_spread and not np.isnan(cf_spread) and cf_spread > 3.0:
+        warnings.append(
+            f"CF varies {cf_spread:.1f}\u00d7 across concentration levels. "
+            f"A limiting dilution calibration may give more accurate results."
+        )
 
     return {
+        'conversion_factor': conversion_factor,
+        'cf_ci_lower': cf_ci_lower,
+        'cf_ci_upper': cf_ci_upper,
+        'cf_spread': cf_spread,
+        'per_level_cf': per_level_cf,
+        # Diagnostic regression (not used for conversion)
         'slope': slope,
         'intercept': intercept,
         'r_squared': r_squared,
         'slope_stderr': slope_stderr,
         'intercept_stderr': intercept_stderr,
-        'conversion_factor': conversion_factor,
-        'cf_ci_lower': cf_ci_lower,
-        'cf_ci_upper': cf_ci_upper,
-        'cf_error_regression': cf_error_regression,
+        # Replicate stats
         'replicate_variance': replicate_variance,
         'pooled_replicate_cv': pooled_cv,
         'n_standards': len(points_df),
@@ -230,13 +247,10 @@ def apply_calibration(
     df = results_df.copy()
 
     if calibration is not None:
-        slope = calibration['slope']
-        intercept = calibration['intercept']
-        # copies = 10^(slope * log10(D0) + intercept)
+        cf = calibration['conversion_factor']
+        # copies = CF * D0 (mechanism-based, no power-law)
         valid_d0 = df['D0'].notna() & (df['D0'] > 0)
-        df.loc[valid_d0, 'Copies'] = 10 ** (
-            slope * np.log10(df.loc[valid_d0, 'D0']) + intercept
-        )
+        df.loc[valid_d0, 'Copies'] = cf * df.loc[valid_d0, 'D0']
         df.loc[~valid_d0, 'Copies'] = np.nan
     elif manual_cf is not None and manual_cf > 0:
         valid_d0 = df['D0'].notna() & (df['D0'] > 0)
@@ -515,7 +529,8 @@ def plot_calibration(calibration: Dict) -> go.Figure:
     Create diagnostic log-log scatter plot of standard curve.
 
     Shows individual standard wells, concentration means with error bars,
-    regression line, and annotation with slope, intercept, R².
+    the CF line (copies = CF * D0, i.e. slope=1 on log-log), and the
+    diagnostic regression line.
 
     Parameters
     ----------
@@ -527,6 +542,7 @@ def plot_calibration(calibration: Dict) -> go.Figure:
     plotly.graph_objects.Figure
     """
     points_df = calibration['per_point_data']
+    cf = calibration['conversion_factor']
     slope = calibration['slope']
     intercept = calibration['intercept']
     r_squared = calibration['r_squared']
@@ -558,10 +574,11 @@ def plot_calibration(calibration: Dict) -> go.Figure:
                 'Well: %{customdata[0]}<br>'
                 'D0: %{customdata[1]:.4e}<br>'
                 'Known Copies: %{customdata[2]:.2e}<br>'
-                'R²: %{customdata[3]:.4f}'
+                'CF: %{customdata[4]:.2e}<br>'
+                'R\u00b2: %{customdata[3]:.4f}'
                 '<extra></extra>'
             ),
-            customdata=group[['Well', 'D0', 'Known_Copies', 'R2']].values,
+            customdata=group[['Well', 'D0', 'Known_Copies', 'R2', 'CF']].values,
         ))
 
     # Plot concentration means with error bars
@@ -592,32 +609,45 @@ def plot_calibration(calibration: Dict) -> go.Figure:
         showlegend=True,
     ))
 
-    # Regression line
+    # CF line: copies = CF * D0, i.e. log10(copies) = log10(D0) + log10(CF)
+    # This is the mechanism-based line with slope=1
     x_range = np.array([
         min(points_df['log10_D0']) - 0.3,
         max(points_df['log10_D0']) + 0.3
     ])
-    y_fit = slope * x_range + intercept
+    y_cf = x_range + np.log10(cf)
 
+    fig.add_trace(go.Scatter(
+        x=x_range,
+        y=y_cf,
+        mode='lines',
+        name=f'CF = {cf:.2e} (slope=1)',
+        line=dict(color='blue', width=2),
+    ))
+
+    # Diagnostic regression line (dashed, for reference)
+    y_fit = slope * x_range + intercept
     fig.add_trace(go.Scatter(
         x=x_range,
         y=y_fit,
         mode='lines',
-        name=f'Fit (slope={slope:.3f})',
-        line=dict(color='red', dash='dash', width=2),
+        name=f'Regression (slope={slope:.3f})',
+        line=dict(color='red', dash='dash', width=1.5),
     ))
 
-    # Annotation with equation
+    # Annotation
+    cf_spread = calibration.get('cf_spread', np.nan)
+    spread_str = f", spread={cf_spread:.2f}\u00d7" if not np.isnan(cf_spread) else ""
+
     fig.add_annotation(
         x=0.02, y=0.98,
         xref='paper', yref='paper',
         text=(
-            f"log<sub>10</sub>(copies) = {slope:.3f} \u00d7 log<sub>10</sub>(D0) + {intercept:.3f}<br>"
-            f"R\u00b2 = {r_squared:.4f}<br>"
+            f"<b>CF = {cf:.2e}</b> (median, copies = CF \u00d7 D0)<br>"
+            f"95% CI: {calibration['cf_ci_lower']:.2e}\u2013{calibration['cf_ci_upper']:.2e}{spread_str}<br>"
             f"n = {calibration['n_standards']} wells, "
             f"{calibration['n_concentrations']} levels<br>"
-            f"CF = {calibration['conversion_factor']:.2e} "
-            f"(95% CI: {calibration['cf_ci_lower']:.2e}\u2013{calibration['cf_ci_upper']:.2e})"
+            f"<i>Diagnostic: slope={slope:.3f}, R\u00b2={r_squared:.4f}</i>"
         ),
         showarrow=False,
         font=dict(size=11),
