@@ -1683,6 +1683,19 @@ if cycles is not None and fluorescence is not None:
 
                             # Format for display
                             display_stats = replicate_stats.copy()
+
+                            # Add Wells column so user can identify which wells belong to each group
+                            def _get_well_ids(group_name):
+                                keys = sample_groups.get(group_name, [])
+                                # Extract well ID: "Target::Well" -> "Well", or just use key as-is
+                                wells = [k.split('::')[-1] if '::' in k else k for k in keys]
+                                return ', '.join(sorted(wells))
+
+                            display_stats.insert(
+                                1, 'Wells',
+                                display_stats['Group'].apply(_get_well_ids)
+                            )
+
                             format_stats_dict = {
                                 'Ct_Mean': '{:.2f}',
                                 'Ct_SD': '{:.3f}',
