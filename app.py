@@ -1083,6 +1083,7 @@ if cycles is not None and fluorescence is not None:
                 except Exception as e:
                     results_list.append({
                         'Sample': sample_name,
+                        'Ct': np.nan,
                         'D0': None,
                         'k': None,
                         'P0': None,
@@ -1092,7 +1093,11 @@ if cycles is not None and fluorescence is not None:
                         'SSR': None,
                         'RMSE': None,
                         'NRMSE': None,
+                        'Tier': None,
                         'Success': f'✗ Error: {str(e)[:30]}',
+                        'FixedBG': '',
+                        'Fallback': '',
+                        'FallbackOK': '',
                         'fluor_data': fluor_data
                     })
                 
@@ -1655,8 +1660,11 @@ if cycles is not None and fluorescence is not None:
                     else:
                         st.success(f"✅ Analyzed {len(sample_groups)} replicate groups ({len(results_with_groups)} samples total)")
 
-                        # Determine which metrics to track
-                        rep_metrics = ['Ct', 'D0']
+                        # Determine which metrics to track (only include columns that exist)
+                        rep_metrics = []
+                        for m in ['Ct', 'D0']:
+                            if m in results_with_groups.columns:
+                                rep_metrics.append(m)
                         if 'Copies_D0' in results_with_groups.columns and results_with_groups['Copies_D0'].notna().any():
                             rep_metrics.append('Copies_D0')
                         if 'Copies_Ct' in results_with_groups.columns and results_with_groups['Copies_Ct'].notna().any():
