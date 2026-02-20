@@ -29,8 +29,11 @@ from replicate_analysis import (
 )
 from calibration import (
     build_standard_curve,
+    build_ct_standard_curve,
     apply_calibration,
+    apply_ct_calibration,
     plot_calibration,
+    plot_ct_calibration,
     plot_replicate_overlay,
     calculate_replicate_param_summary,
     build_limited_dilution_calibration,
@@ -1255,7 +1258,8 @@ if cycles is not None and fluorescence is not None:
                 'NRMSE': '{:.2f}',
                 'SSR': '{:.6f}',
                 'Known_Copies': '{:.2e}',
-                'Copies': '{:.2e}',
+                'Copies_D0': '{:.2e}',
+                'Copies_Ct': '{:.2e}',
             }
 
             st.dataframe(display_df.style.format(format_dict, na_rep='-'), use_container_width=True)
@@ -1303,9 +1307,11 @@ if cycles is not None and fluorescence is not None:
                 st.markdown("---")
                 st.subheader("📐 Standard Curve Calibration")
 
+                # Build both calibrations
                 calibration = build_standard_curve(results_df, sample_metadata)
+                ct_calibration = build_ct_standard_curve(results_df, sample_metadata)
 
-                if calibration is None:
+                if calibration is None and ct_calibration is None:
                     st.warning("Could not build standard curve (need ≥ 2 concentration levels with successful fits)")
                     # Fall back to manual CF if available
                     if manual_cf_val and manual_cf_val > 0:
@@ -1313,55 +1319,102 @@ if cycles is not None and fluorescence is not None:
                         st.session_state['batch_results'] = results_df
                         st.info(f"Using manual conversion factor: {manual_cf_val:.2e} copies/D0")
                 else:
-                    # Display calibration metrics — CF is primary
-                    col1, col2, col3, col4 = st.columns(4)
-                    col1.metric("CF (copies/D0)", f"{calibration['conversion_factor']:.2e}")
-                    col2.metric("95% CI lower", f"{calibration['cf_ci_lower']:.2e}")
-                    col3.metric("95% CI upper", f"{calibration['cf_ci_upper']:.2e}")
-                    col4.metric("Standards", f"{calibration['n_standards']} wells, {calibration['n_concentrations']} levels")
+                    # Determine side-by-side layout
+                    both_succeeded = calibration is not None and ct_calibration is not None
+                    if both_succeeded:
+                        col_d0, col_ct = st.columns(2)
+                    else:
+                        # Use full width for whichever one succeeded
+                        col_d0 = st.container() if calibration is not None else None
+                        col_ct = st.container() if ct_calibration is not None else None
 
-                    st.markdown(
-                        f"**copies = {calibration['conversion_factor']:.2e} \u00d7 D0** "
-                        f"(median CF across all standard wells)"
-                    )
-                    cf_spread = calibration.get('cf_spread', np.nan)
-                    if not np.isnan(cf_spread):
-                        st.markdown(
-                            f"**CF spread:** {cf_spread:.2f}\u00d7 across concentration levels "
-                            f"(diagnostic slope = {calibration['slope']:.3f}, R\u00b2 = {calibration['r_squared']:.4f})"
-                        )
-                    if not np.isnan(calibration['pooled_replicate_cv']):
-                        st.markdown(
-                            f"**Replicate variance:** pooled CV = {calibration['pooled_replicate_cv']:.1f}% across standard replicates"
-                        )
+                    # ── D0 Calibration (left column) ──────────────────────
+                    if calibration is not None and col_d0 is not None:
+                        with col_d0:
+                            st.markdown("#### D0-Based Calibration")
+                            m1, m2 = st.columns(2)
+                            m1.metric("CF (copies/D0)", f"{calibration['conversion_factor']:.2e}")
+                            m2.metric("Standards", f"{calibration['n_standards']} wells, {calibration['n_concentrations']} levels")
 
-                    # Show per-level replicate variance in expander
+                            st.markdown(
+                                f"**copies = {calibration['conversion_factor']:.2e} \u00d7 D0** "
+                                f"(median CF)"
+                            )
+                            st.caption(
+                                f"95% CI: {calibration['cf_ci_lower']:.2e} \u2013 {calibration['cf_ci_upper']:.2e}"
+                            )
+                            cf_spread = calibration.get('cf_spread', np.nan)
+                            if not np.isnan(cf_spread):
+                                st.caption(
+                                    f"CF spread: {cf_spread:.2f}\u00d7 | "
+                                    f"Diagnostic slope = {calibration['slope']:.3f}, "
+                                    f"R\u00b2 = {calibration['r_squared']:.4f}"
+                                )
+                            if not np.isnan(calibration['pooled_replicate_cv']):
+                                st.caption(
+                                    f"Replicate pooled CV = {calibration['pooled_replicate_cv']:.1f}%"
+                                )
+
+                            for w in calibration.get('warnings', []):
+                                st.warning(w)
+
+                            fig_cal = plot_calibration(calibration)
+                            st.plotly_chart(fig_cal, use_container_width=True)
+
+                    # ── Ct Calibration (right column) ─────────────────────
+                    if ct_calibration is not None and col_ct is not None:
+                        with col_ct:
+                            st.markdown("#### Ct-Based Standard Curve")
+                            m1, m2 = st.columns(2)
+                            m1.metric("Efficiency", f"{ct_calibration['efficiency']*100:.1f}%")
+                            m2.metric("R\u00b2", f"{ct_calibration['r_squared']:.4f}")
+
+                            st.markdown(
+                                f"**log\u2081\u2080(copies) = {ct_calibration['slope']:.4f} \u00d7 Ct "
+                                f"+ {ct_calibration['intercept']:.4f}**"
+                            )
+                            st.caption(
+                                f"Standards: {ct_calibration['n_standards']} wells, "
+                                f"{ct_calibration['n_concentrations']} levels"
+                            )
+                            if not np.isnan(ct_calibration['pooled_replicate_cv']):
+                                st.caption(
+                                    f"Replicate pooled Ct CV = {ct_calibration['pooled_replicate_cv']:.1f}%"
+                                )
+
+                            for w in ct_calibration.get('warnings', []):
+                                st.warning(w)
+
+                            fig_ct = plot_ct_calibration(ct_calibration)
+                            st.plotly_chart(fig_ct, use_container_width=True)
+
+                    # ── Per-level replicate variance (full width) ─────────
                     with st.expander("📊 Replicate variance by concentration level"):
                         var_data = []
-                        for copies_val, var_info in sorted(
-                            calibration['replicate_variance'].items(), reverse=True
-                        ):
-                            var_data.append({
-                                'Known Copies': f"{copies_val:.2e}",
-                                'N Replicates': var_info['n_replicates'],
-                                'Mean D0': f"{var_info['mean_D0']:.4e}",
-                                'SD D0': f"{var_info['sd_D0']:.4e}" if not np.isnan(var_info['sd_D0']) else '-',
-                                'CV%': f"{var_info['cv_D0_pct']:.1f}" if not np.isnan(var_info['cv_D0_pct']) else '-',
-                            })
+                        if calibration is not None:
+                            for copies_val, var_info in sorted(
+                                calibration['replicate_variance'].items(), reverse=True
+                            ):
+                                row = {
+                                    'Known Copies': f"{copies_val:.2e}",
+                                    'N Replicates': var_info['n_replicates'],
+                                    'Mean D0': f"{var_info['mean_D0']:.4e}",
+                                    'SD D0': f"{var_info['sd_D0']:.4e}" if not np.isnan(var_info['sd_D0']) else '-',
+                                    'D0 CV%': f"{var_info['cv_D0_pct']:.1f}" if not np.isnan(var_info['cv_D0_pct']) else '-',
+                                }
+                                # Add Ct stats if available
+                                if ct_calibration is not None:
+                                    ct_var = ct_calibration['replicate_variance'].get(copies_val)
+                                    if ct_var:
+                                        row['Mean Ct'] = f"{ct_var['mean_Ct']:.2f}"
+                                        row['SD Ct'] = f"{ct_var['sd_Ct']:.3f}" if not np.isnan(ct_var['sd_Ct']) else '-'
+                                        row['Ct CV%'] = f"{ct_var['cv_Ct_pct']:.2f}" if not np.isnan(ct_var['cv_Ct_pct']) else '-'
+                                var_data.append(row)
                         st.dataframe(pd.DataFrame(var_data), use_container_width=True)
 
-                    # Warnings
-                    for w in calibration.get('warnings', []):
-                        st.warning(w)
-
-                    # Diagnostic plot
-                    fig_cal = plot_calibration(calibration)
-                    st.plotly_chart(fig_cal, use_container_width=True)
-
-                    # Apply calibration to add Copies column
+                    # ── Apply calibrations ─────────────────────────────────
                     # For multi-target data, only calibrate the target that has standards
                     if 'Target' in results_df.columns:
-                        # Find which target the standards belong to
                         std_targets = set()
                         for key, meta in (sample_metadata or {}).items():
                             if meta.get('Task') == 'STANDARD':
@@ -1369,21 +1422,46 @@ if cycles is not None and fluorescence is not None:
                         if std_targets and len(std_targets) == 1:
                             cal_target = list(std_targets)[0]
                             mask = results_df['Target'] == cal_target
-                            cal_subset = apply_calibration(results_df[mask].copy(), calibration=calibration)
-                            results_df.loc[mask, 'Copies'] = cal_subset['Copies']
+                            if calibration is not None:
+                                cal_subset = apply_calibration(results_df[mask].copy(), calibration=calibration)
+                                results_df.loc[mask, 'Copies_D0'] = cal_subset['Copies_D0']
+                            if ct_calibration is not None:
+                                ct_subset = apply_ct_calibration(results_df[mask].copy(), ct_calibration)
+                                results_df.loc[mask, 'Copies_Ct'] = ct_subset['Copies_Ct']
                             st.session_state['batch_results'] = results_df
-                            st.success(f"✅ Copies column added for **{cal_target}** from standard curve calibration")
+                            cols_added = []
+                            if calibration is not None:
+                                cols_added.append('Copies_D0')
+                            if ct_calibration is not None:
+                                cols_added.append('Copies_Ct')
+                            st.success(f"✅ {' and '.join(cols_added)} columns added for **{cal_target}**")
                             other_targets = [t for t in results_df['Target'].unique() if t != cal_target]
                             if other_targets:
                                 st.info(f"ℹ️ Other targets ({', '.join(other_targets)}) do not have standards — no copy numbers assigned.")
                         else:
-                            results_df = apply_calibration(results_df, calibration=calibration)
+                            if calibration is not None:
+                                results_df = apply_calibration(results_df, calibration=calibration)
+                            if ct_calibration is not None:
+                                results_df = apply_ct_calibration(results_df, ct_calibration)
                             st.session_state['batch_results'] = results_df
-                            st.success("✅ Copies column added to results from standard curve calibration")
+                            cols_added = []
+                            if calibration is not None:
+                                cols_added.append('Copies_D0')
+                            if ct_calibration is not None:
+                                cols_added.append('Copies_Ct')
+                            st.success(f"✅ {' and '.join(cols_added)} columns added from standard curve calibration")
                     else:
-                        results_df = apply_calibration(results_df, calibration=calibration)
+                        if calibration is not None:
+                            results_df = apply_calibration(results_df, calibration=calibration)
+                        if ct_calibration is not None:
+                            results_df = apply_ct_calibration(results_df, ct_calibration)
                         st.session_state['batch_results'] = results_df
-                        st.success("✅ Copies column added to results from standard curve calibration")
+                        cols_added = []
+                        if calibration is not None:
+                            cols_added.append('Copies_D0')
+                        if ct_calibration is not None:
+                            cols_added.append('Copies_Ct')
+                        st.success(f"✅ {' and '.join(cols_added)} columns added from standard curve calibration")
 
             elif cal_method == 'limited_dilution' and len(ld_wells) >= 3:
                 st.markdown("---")
@@ -1463,7 +1541,7 @@ if cycles is not None and fluorescence is not None:
                         results_df, manual_cf=ld_calibration['conversion_factor']
                     )
                     st.session_state['batch_results'] = results_df
-                    st.success("✅ Copies column added from limited dilution calibration")
+                    st.success("✅ Copies_D0 column added from limited dilution calibration")
 
             elif cal_method == 'manual_cf' and manual_cf_val and manual_cf_val > 0:
                 # Manual CF provided
@@ -1575,8 +1653,10 @@ if cycles is not None and fluorescence is not None:
 
                         # Determine which metrics to track
                         rep_metrics = ['Ct', 'D0']
-                        if 'Copies' in results_with_groups.columns and results_with_groups['Copies'].notna().any():
-                            rep_metrics.append('Copies')
+                        if 'Copies_D0' in results_with_groups.columns and results_with_groups['Copies_D0'].notna().any():
+                            rep_metrics.append('Copies_D0')
+                        if 'Copies_Ct' in results_with_groups.columns and results_with_groups['Copies_Ct'].notna().any():
+                            rep_metrics.append('Copies_Ct')
 
                         # Calculate replicate statistics
                         replicate_stats = calculate_replicate_stats(
@@ -1610,9 +1690,12 @@ if cycles is not None and fluorescence is not None:
                                 'D0_Mean': '{:.2e}',
                                 'D0_SD': '{:.2e}',
                                 'D0_CV': '{:.2f}%',
-                                'Copies_Mean': '{:.2e}',
-                                'Copies_SD': '{:.2e}',
-                                'Copies_CV': '{:.2f}%',
+                                'Copies_D0_Mean': '{:.2e}',
+                                'Copies_D0_SD': '{:.2e}',
+                                'Copies_D0_CV': '{:.2f}%',
+                                'Copies_Ct_Mean': '{:.2e}',
+                                'Copies_Ct_SD': '{:.2e}',
+                                'Copies_Ct_CV': '{:.2f}%',
                             }
 
                             st.dataframe(
