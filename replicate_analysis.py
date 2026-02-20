@@ -90,6 +90,11 @@ def calculate_replicate_stats(
         stat_row = {'Group': group, 'N': len(group_df)}
 
         for metric in metrics:
+            if metric not in group_df.columns:
+                stat_row[f'{metric}_Mean'] = np.nan
+                stat_row[f'{metric}_SD'] = np.nan
+                stat_row[f'{metric}_CV'] = np.nan
+                continue
             values = group_df[metric].dropna()
 
             if len(values) == 0:
