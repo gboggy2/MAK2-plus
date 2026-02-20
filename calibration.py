@@ -218,6 +218,151 @@ def build_standard_curve(
     }
 
 
+# ── Ct-Based Standard Curve ──────────────────────────────────────────────────
+
+
+def build_ct_standard_curve(
+    results_df: pd.DataFrame,
+    sample_metadata: Dict[str, Dict],
+) -> Optional[Dict]:
+    """
+    Build traditional Ct-based standard curve: log10(copies) = slope * Ct + intercept.
+
+    Parameters
+    ----------
+    results_df : pd.DataFrame
+        Batch fitting results with 'Sample' and 'Ct' columns.
+    sample_metadata : dict
+        Per-well metadata with Task='STANDARD' and Quantity.
+
+    Returns
+    -------
+    dict or None
+        Calibration dict with slope, intercept, r_squared, efficiency,
+        per_point_data, replicate_variance, warnings, etc.
+    """
+    if not sample_metadata:
+        return None
+    if 'Ct' not in results_df.columns:
+        return None
+
+    # 1. Identify standard wells
+    standard_wells = {}
+    for well, meta in sample_metadata.items():
+        if meta.get('Task') == 'STANDARD' and meta.get('Quantity') is not None:
+            standard_wells[well] = meta['Quantity']
+
+    if len(standard_wells) < 2:
+        return None
+
+    # 2. Match to results_df
+    points = []
+    for well, copies in standard_wells.items():
+        match = results_df[results_df['Sample'] == well]
+        if len(match) == 0:
+            continue
+        row = match.iloc[0]
+        ct_val = row.get('Ct', np.nan)
+        if pd.isna(ct_val) or ct_val <= 0:
+            continue
+        success = str(row.get('Success', ''))
+        if '\u2717' in success:
+            continue
+        points.append({
+            'Well': well,
+            'Ct': ct_val,
+            'Known_Copies': copies,
+            'log10_Copies': np.log10(copies),
+        })
+
+    if len(points) < 3:
+        return None
+
+    points_df = pd.DataFrame(points)
+    unique_copies = points_df['Known_Copies'].unique()
+    if len(unique_copies) < 2:
+        return None
+
+    # 3. Linear regression: log10(copies) = slope * Ct + intercept
+    ct_vals = points_df['Ct'].values
+    log_copies = points_df['log10_Copies'].values
+
+    result = linregress(ct_vals, log_copies)
+    slope = result.slope
+    intercept = result.intercept
+    r_squared = result.rvalue ** 2
+    slope_stderr = result.stderr
+    intercept_stderr = result.intercept_stderr
+
+    # 4. Efficiency: E = 10^(-1/slope) - 1
+    efficiency = (10 ** (-1.0 / slope) - 1) if slope != 0 else np.nan
+
+    # 5. Replicate variance
+    replicate_variance = {}
+    all_cvs = []
+    for copies_val in sorted(unique_copies, reverse=True):
+        mask = points_df['Known_Copies'] == copies_val
+        group = points_df[mask]
+        ct_group = group['Ct'].values
+
+        if len(ct_group) > 1:
+            mean_ct = np.mean(ct_group)
+            sd_ct = np.std(ct_group, ddof=1)
+            cv_ct = (sd_ct / mean_ct) * 100 if mean_ct > 0 else np.nan
+            all_cvs.append(cv_ct)
+        else:
+            mean_ct = ct_group[0]
+            sd_ct = np.nan
+            cv_ct = np.nan
+
+        replicate_variance[copies_val] = {
+            'n_replicates': len(ct_group),
+            'mean_Ct': mean_ct,
+            'sd_Ct': sd_ct,
+            'cv_Ct_pct': cv_ct,
+        }
+
+    pooled_cv = np.mean([cv for cv in all_cvs if not np.isnan(cv)]) if all_cvs else np.nan
+
+    # 6. Warnings
+    warnings = []
+    if r_squared < 0.98:
+        warnings.append(
+            f"R\u00b2 ({r_squared:.4f}) is below 0.98. "
+            f"Ct standard curve may be unreliable."
+        )
+    if not np.isnan(efficiency):
+        if efficiency < 0.80:
+            warnings.append(
+                f"Low amplification efficiency ({efficiency*100:.1f}%). "
+                f"Expected 80\u2013110%."
+            )
+        elif efficiency > 1.10:
+            warnings.append(
+                f"High amplification efficiency ({efficiency*100:.1f}%). "
+                f"Expected 80\u2013110%. May indicate inhibition or primer dimers."
+            )
+    if pooled_cv and not np.isnan(pooled_cv) and pooled_cv > 3.0:
+        warnings.append(
+            f"High Ct replicate variability (pooled CV = {pooled_cv:.1f}%)."
+        )
+
+    return {
+        'slope': slope,
+        'intercept': intercept,
+        'r_squared': r_squared,
+        'slope_stderr': slope_stderr,
+        'intercept_stderr': intercept_stderr,
+        'efficiency': efficiency,
+        'replicate_variance': replicate_variance,
+        'pooled_replicate_cv': pooled_cv,
+        'n_standards': len(points_df),
+        'n_concentrations': len(unique_copies),
+        'per_point_data': points_df,
+        'warnings': warnings,
+    }
+
+
 # ── Calibration Application ──────────────────────────────────────────────────
 
 
@@ -227,7 +372,7 @@ def apply_calibration(
     manual_cf: Optional[float] = None
 ) -> pd.DataFrame:
     """
-    Add 'Copies' column to results_df using calibration or manual conversion factor.
+    Add 'Copies_D0' column to results_df using D0-based calibration or manual CF.
 
     Parameters
     ----------
@@ -242,23 +387,53 @@ def apply_calibration(
     Returns
     -------
     pd.DataFrame
-        Copy of results_df with 'Copies' column added.
+        Copy of results_df with 'Copies_D0' column added.
     """
     df = results_df.copy()
 
     if calibration is not None:
         cf = calibration['conversion_factor']
-        # copies = CF * D0 (mechanism-based, no power-law)
         valid_d0 = df['D0'].notna() & (df['D0'] > 0)
-        df.loc[valid_d0, 'Copies'] = cf * df.loc[valid_d0, 'D0']
-        df.loc[~valid_d0, 'Copies'] = np.nan
+        df.loc[valid_d0, 'Copies_D0'] = cf * df.loc[valid_d0, 'D0']
+        df.loc[~valid_d0, 'Copies_D0'] = np.nan
     elif manual_cf is not None and manual_cf > 0:
         valid_d0 = df['D0'].notna() & (df['D0'] > 0)
-        df.loc[valid_d0, 'Copies'] = manual_cf * df.loc[valid_d0, 'D0']
-        df.loc[~valid_d0, 'Copies'] = np.nan
+        df.loc[valid_d0, 'Copies_D0'] = manual_cf * df.loc[valid_d0, 'D0']
+        df.loc[~valid_d0, 'Copies_D0'] = np.nan
     else:
-        # No calibration available
         return df
+
+    return df
+
+
+def apply_ct_calibration(
+    results_df: pd.DataFrame,
+    ct_calibration: Dict,
+) -> pd.DataFrame:
+    """
+    Add 'Copies_Ct' column to results_df using Ct-based standard curve.
+
+    Parameters
+    ----------
+    results_df : pd.DataFrame
+        Batch fitting results with 'Ct' column.
+    ct_calibration : dict
+        Output from build_ct_standard_curve().
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy of results_df with 'Copies_Ct' column added.
+    """
+    df = results_df.copy()
+    slope = ct_calibration['slope']
+    intercept = ct_calibration['intercept']
+
+    valid_ct = df['Ct'].notna() & (df['Ct'] > 0)
+    df.loc[valid_ct, 'Copies_Ct'] = 10 ** (
+        slope * df.loc[valid_ct, 'Ct'] + intercept
+    )
+    df.loc[~valid_ct, 'Copies_Ct'] = np.nan
 
     return df
 
@@ -670,6 +845,138 @@ def plot_calibration(calibration: Dict) -> go.Figure:
     return fig
 
 
+# ── Ct Standard Curve Plot ───────────────────────────────────────────────────
+
+
+def plot_ct_calibration(ct_calibration: Dict) -> go.Figure:
+    """
+    Create Ct standard curve plot: Ct (x) vs log10(Known Copies) (y).
+
+    Shows individual standard wells, concentration means with Ct error bars,
+    regression line, and annotation with slope, R², efficiency.
+
+    Parameters
+    ----------
+    ct_calibration : dict
+        Output from build_ct_standard_curve().
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+    """
+    points_df = ct_calibration['per_point_data']
+    slope = ct_calibration['slope']
+    intercept = ct_calibration['intercept']
+    r_squared = ct_calibration['r_squared']
+    efficiency = ct_calibration['efficiency']
+    replicate_var = ct_calibration['replicate_variance']
+
+    fig = go.Figure()
+
+    unique_copies = sorted(points_df['Known_Copies'].unique(), reverse=True)
+    colors = [
+        '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728',
+        '#9467bd', '#8c564b', '#e377c2', '#7f7f7f',
+        '#bcbd22', '#17becf'
+    ]
+
+    # Individual wells
+    for i, copies_val in enumerate(unique_copies):
+        mask = points_df['Known_Copies'] == copies_val
+        group = points_df[mask]
+        color = colors[i % len(colors)]
+
+        fig.add_trace(go.Scatter(
+            x=group['Ct'],
+            y=group['log10_Copies'],
+            mode='markers',
+            name=f'{copies_val:.2e} copies',
+            marker=dict(size=8, color=color, opacity=0.6),
+            hovertemplate=(
+                'Well: %{customdata[0]}<br>'
+                'Ct: %{x:.2f}<br>'
+                'Known Copies: %{customdata[1]:.2e}'
+                '<extra></extra>'
+            ),
+            customdata=group[['Well', 'Known_Copies']].values,
+        ))
+
+    # Concentration means with Ct error bars
+    mean_x = []
+    mean_y = []
+    error_x_vals = []
+    for copies_val in unique_copies:
+        mask = points_df['Known_Copies'] == copies_val
+        group = points_df[mask]
+        mean_ct = group['Ct'].mean()
+        mean_log_copies = group['log10_Copies'].mean()
+        mean_x.append(mean_ct)
+        mean_y.append(mean_log_copies)
+
+        var_info = replicate_var.get(copies_val, {})
+        sd_ct = var_info.get('sd_Ct', 0)
+        error_x_vals.append(sd_ct if not np.isnan(sd_ct) else 0)
+
+    fig.add_trace(go.Scatter(
+        x=mean_x,
+        y=mean_y,
+        mode='markers',
+        name='Concentration means',
+        marker=dict(size=14, color='black', symbol='diamond',
+                    line=dict(width=2, color='white')),
+        error_x=dict(type='data', array=error_x_vals, visible=True,
+                     color='black', thickness=2, width=6),
+        showlegend=True,
+    ))
+
+    # Regression line
+    ct_min = min(points_df['Ct'])
+    ct_max = max(points_df['Ct'])
+    ct_margin = (ct_max - ct_min) * 0.1
+    x_range = np.array([ct_min - ct_margin, ct_max + ct_margin])
+    y_fit = slope * x_range + intercept
+
+    fig.add_trace(go.Scatter(
+        x=x_range,
+        y=y_fit,
+        mode='lines',
+        name=f'Fit (slope={slope:.4f})',
+        line=dict(color='red', dash='dash', width=2),
+    ))
+
+    # Annotation
+    eff_str = f"{efficiency*100:.1f}%" if not np.isnan(efficiency) else "N/A"
+    fig.add_annotation(
+        x=0.02, y=0.98,
+        xref='paper', yref='paper',
+        text=(
+            f"log\u2081\u2080(copies) = {slope:.4f} \u00d7 Ct + {intercept:.3f}<br>"
+            f"R\u00b2 = {r_squared:.4f}<br>"
+            f"Efficiency = {eff_str}<br>"
+            f"n = {ct_calibration['n_standards']} wells, "
+            f"{ct_calibration['n_concentrations']} levels"
+        ),
+        showarrow=False,
+        font=dict(size=11),
+        align='left',
+        bgcolor='rgba(255,255,255,0.85)',
+        bordercolor='gray',
+        borderwidth=1,
+        borderpad=6,
+    )
+
+    fig.update_layout(
+        title='Ct Standard Curve',
+        xaxis_title='Ct (threshold cycle)',
+        yaxis_title='log\u2081\u2080(Known Copy Number)',
+        height=500,
+        showlegend=True,
+        legend=dict(x=0.7, y=0.95, bgcolor='rgba(255,255,255,0.8)'),
+    )
+
+    return fig
+
+
 # ── Limited Dilution Diagnostic Plot ─────────────────────────────────────────
 
 
@@ -988,8 +1295,10 @@ def calculate_replicate_param_summary(
 
     if param_cols is None:
         param_cols = ['D0', 'k', 'P0', 'Ct']
-        if 'Copies' in results_df.columns:
-            param_cols.append('Copies')
+        if 'Copies_D0' in results_df.columns:
+            param_cols.append('Copies_D0')
+        if 'Copies_Ct' in results_df.columns:
+            param_cols.append('Copies_Ct')
 
     summary = {}
     for col in param_cols:
