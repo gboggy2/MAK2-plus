@@ -1972,7 +1972,7 @@ if cycles is not None and fluorescence is not None:
                         F_bg_slope=selected_result['F_bg_slope']
                     )
 
-                    # Cycle-by-cycle amplification efficiency plot
+                    # Cycle-by-cycle amplification efficiency
                     _, D_batch_eff, _ = model_viz.simulate_cycles(
                         D0=selected_result['D0'],
                         k=selected_result['k'],
@@ -1983,32 +1983,16 @@ if cycles is not None and fluorescence is not None:
                     )
                     eff_batch = calculate_amplification_efficiency(D_batch_eff)
 
-                    fig_eff_batch = go.Figure()
-                    fig_eff_batch.add_trace(
-                        go.Scatter(
-                            x=np.arange(1, len(eff_batch)+1),
-                            y=eff_batch,
-                            mode='lines+markers',
-                            name='Efficiency',
-                            marker=dict(size=5),
-                        )
-                    )
-                    fig_eff_batch.update_layout(
-                        title=f"Amplification Efficiency: {selected_sample}",
-                        xaxis_title="Cycle",
-                        yaxis_title="Amplification Efficiency",
-                        height=300,
-                    )
-                    st.plotly_chart(fig_eff_batch, use_container_width=True)
-
+                    # 3-row stacked plot: Fit, Residuals, Efficiency (shared x-axis)
                     fig_batch = make_subplots(
-                        rows=2, cols=1,
-                        subplot_titles=(f"MAK2 Fit: {selected_sample}", "Residuals"),
-                        vertical_spacing=0.12,
-                        row_heights=[0.7, 0.3]
+                        rows=3, cols=1,
+                        subplot_titles=(f"MAK2 Fit: {selected_sample}", "Residuals", "Amplification Efficiency"),
+                        vertical_spacing=0.08,
+                        row_heights=[0.50, 0.22, 0.28],
+                        shared_xaxes=True,
                     )
-                    
-                    # Plot data and fit
+
+                    # Row 1: Data and fit
                     fig_batch.add_trace(
                         go.Scatter(
                             x=cycles, y=sample_fluor,
@@ -2018,7 +2002,6 @@ if cycles is not None and fluorescence is not None:
                         ),
                         row=1, col=1
                     )
-                    
                     fig_batch.add_trace(
                         go.Scatter(
                             x=cycles, y=F_pred,
@@ -2028,8 +2011,8 @@ if cycles is not None and fluorescence is not None:
                         ),
                         row=1, col=1
                     )
-                    
-                    # Residuals
+
+                    # Row 2: Residuals
                     residuals = sample_fluor - F_pred
                     fig_batch.add_trace(
                         go.Scatter(
@@ -2041,13 +2024,39 @@ if cycles is not None and fluorescence is not None:
                         row=2, col=1
                     )
                     fig_batch.add_hline(y=0, line_dash="dash", line_color="gray", row=2, col=1)
-                    
-                    fig_batch.update_xaxes(title_text="Cycle", row=2, col=1)
-                    fig_batch.update_xaxes(title_text="Cycle", row=1, col=1)
+
+                    # Row 3: Efficiency
+                    fig_batch.add_trace(
+                        go.Scatter(
+                            x=np.arange(1, len(eff_batch)+1),
+                            y=eff_batch,
+                            mode='lines+markers',
+                            name='Efficiency',
+                            marker=dict(size=4),
+                            line=dict(color='orange'),
+                        ),
+                        row=3, col=1
+                    )
+
+                    # Ct vertical line on all rows
+                    ct_val = selected_result.get('Ct', np.nan)
+                    if not np.isnan(ct_val):
+                        for row_idx in range(1, 4):
+                            fig_batch.add_vline(
+                                x=ct_val,
+                                line_dash="dot",
+                                line_color="gray",
+                                annotation_text="Ct" if row_idx == 1 else None,
+                                annotation_position="top right" if row_idx == 1 else None,
+                                row=row_idx, col=1,
+                            )
+
+                    fig_batch.update_xaxes(title_text="Cycle", row=3, col=1)
                     fig_batch.update_yaxes(title_text="Fluorescence", row=1, col=1)
                     fig_batch.update_yaxes(title_text="Residual", row=2, col=1)
-                    fig_batch.update_layout(height=600, showlegend=True)
-                    
+                    fig_batch.update_yaxes(title_text="Efficiency", row=3, col=1)
+                    fig_batch.update_layout(height=800, showlegend=True)
+
                     st.plotly_chart(fig_batch, use_container_width=True)
                     
                     # Show parameters
@@ -2123,9 +2132,10 @@ if cycles is not None and fluorescence is not None:
         tab1, tab2, tab3, tab4 = st.tabs(["📊 Fit Visualization", "📈 Parameters & Metrics", "🔬 Bootstrap CI", "💾 Export"])
         
         with tab1:
-                # Cycle-by-cycle amplification efficiency plot (shown above the fit)
-                st.subheader("Amplification Efficiency Over Cycles")
+                # Predict fitted curve
+                F_pred = optimizer.predict(cycles)
 
+                # Cycle-by-cycle amplification efficiency
                 _, D_eff, _ = optimizer.model.simulate_cycles(
                     D0=fitted_params['D0'],
                     k=fitted_params['k'],
@@ -2134,28 +2144,8 @@ if cycles is not None and fluorescence is not None:
                     F_bg_intercept=fitted_params['F_bg_intercept'],
                     F_bg_slope=fitted_params['F_bg_slope']
                 )
-
                 eff_per_cycle = calculate_amplification_efficiency(D_eff)
 
-                fig_eff = go.Figure()
-                fig_eff.add_trace(
-                    go.Scatter(
-                        x=np.arange(1, len(eff_per_cycle)+1),
-                        y=eff_per_cycle,
-                        mode='lines+markers',
-                        name='Efficiency'
-                    )
-                )
-                fig_eff.update_layout(
-                    xaxis_title="Cycle",
-                    yaxis_title="Amplification Efficiency",
-                    height=350
-                )
-                st.plotly_chart(fig_eff, use_container_width=True)
-
-                # Predict fitted curve
-                F_pred = optimizer.predict(cycles)
-                
                 # Calculate truncation point for visualization
                 from mak2_model import find_slope_threshold_cycle
                 threshold_idx = find_slope_threshold_cycle(
@@ -2163,21 +2153,29 @@ if cycles is not None and fluorescence is not None:
                     cycles_after_max=cycles_after_max
                 )
                 threshold_label = f"Max slope + {cycles_after_max} cycles"
-
                 threshold_cycle_num = cycles[min(threshold_idx, len(cycles)-1)]
 
-                # Create figure
+                # Calculate Ct for vertical line
+                try:
+                    ct_res_single = optimizer.calculate_ct(method='threshold')
+                    ct_val_single = ct_res_single['ct']
+                except Exception:
+                    ct_val_single = np.nan
+
+                # 3-row stacked plot: Fit, Residuals, Efficiency (shared x-axis)
                 fig = make_subplots(
-                    rows=2, cols=1,
+                    rows=3, cols=1,
                     subplot_titles=(
                         f"qPCR Curve Fit (Truncated at Max Slope + {cycles_after_max})",
-                        "Residuals"
+                        "Residuals",
+                        "Amplification Efficiency"
                     ),
-                    vertical_spacing=0.12,
-                    row_heights=[0.7, 0.3]
+                    vertical_spacing=0.08,
+                    row_heights=[0.50, 0.22, 0.28],
+                    shared_xaxes=True,
                 )
-                
-                # Plot data and fit
+
+                # Row 1: Data and fit
                 fig.add_trace(
                     go.Scatter(
                         x=cycles, y=fluorescence,
@@ -2187,7 +2185,6 @@ if cycles is not None and fluorescence is not None:
                     ),
                     row=1, col=1
                 )
-                
                 fig.add_trace(
                     go.Scatter(
                         x=cycles, y=F_pred,
@@ -2197,7 +2194,7 @@ if cycles is not None and fluorescence is not None:
                     ),
                     row=1, col=1
                 )
-                
+
                 # Add threshold line (where truncation occurs)
                 if threshold_cycle_num < cycles[-1]:
                     fig.add_vline(
@@ -2207,8 +2204,8 @@ if cycles is not None and fluorescence is not None:
                         annotation_text=threshold_label,
                         row=1, col=1
                     )
-                
-                # Plot residuals
+
+                # Row 2: Residuals
                 residuals = fluorescence - F_pred
                 fig.add_trace(
                     go.Scatter(
@@ -2219,15 +2216,39 @@ if cycles is not None and fluorescence is not None:
                     ),
                     row=2, col=1
                 )
-                
                 fig.add_hline(y=0, line_dash="dash", line_color="gray", row=2, col=1)
-                
-                # Update layout
-                fig.update_xaxes(title_text="Cycle", row=2, col=1)
+
+                # Row 3: Efficiency
+                fig.add_trace(
+                    go.Scatter(
+                        x=np.arange(1, len(eff_per_cycle)+1),
+                        y=eff_per_cycle,
+                        mode='lines+markers',
+                        name='Efficiency',
+                        marker=dict(size=4),
+                        line=dict(color='orange'),
+                    ),
+                    row=3, col=1
+                )
+
+                # Ct vertical line on all rows
+                if not np.isnan(ct_val_single):
+                    for row_idx in range(1, 4):
+                        fig.add_vline(
+                            x=ct_val_single,
+                            line_dash="dot",
+                            line_color="gray",
+                            annotation_text="Ct" if row_idx == 1 else None,
+                            annotation_position="top right" if row_idx == 1 else None,
+                            row=row_idx, col=1,
+                        )
+
+                fig.update_xaxes(title_text="Cycle", row=3, col=1)
                 fig.update_yaxes(title_text="Fluorescence", row=1, col=1)
                 fig.update_yaxes(title_text="Residual", row=2, col=1)
-                fig.update_layout(height=700, showlegend=True)
-                
+                fig.update_yaxes(title_text="Efficiency", row=3, col=1)
+                fig.update_layout(height=800, showlegend=True)
+
                 st.plotly_chart(fig, use_container_width=True)
                 
                 # Comprehensive goodness-of-fit metrics (calculated on fitted data only)
