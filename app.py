@@ -1016,6 +1016,9 @@ if cycles is not None and fluorescence is not None:
 
                 st.info(f"📊 Using global threshold: {global_threshold:.6f} (calculated from all {len(all_samples_to_fit)} samples)")
 
+            # Get sample metadata for instrument CT values
+            sample_metadata = st.session_state.get('sample_metadata')
+
             # Pass 1: Fit all samples normally
             for i, (sample_name, fluor_data) in enumerate(all_samples_to_fit.items()):
                 status_text.text(f"Pass 1: Fitting {sample_name}... ({i+1}/{len(all_samples_to_fit)})")
@@ -1261,6 +1264,7 @@ if cycles is not None and fluorescence is not None:
 
             # Format numeric columns
             format_dict = {
+                'Ct': '{:.2f}',
                 'D0': '{:.2e}',
                 'k': '{:.6f}',
                 'P0': '{:.2e}',
