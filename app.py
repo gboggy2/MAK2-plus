@@ -1331,24 +1331,24 @@ if cycles is not None and fluorescence is not None:
                     # ── D0 Calibration (left column) ──────────────────────
                     if calibration is not None and col_d0 is not None:
                         with col_d0:
-                            st.markdown("#### D0-Based Calibration")
+                            st.markdown("#### D0-Based Standard Curve")
                             m1, m2 = st.columns(2)
-                            m1.metric("CF (copies/D0)", f"{calibration['conversion_factor']:.2e}")
-                            m2.metric("Standards", f"{calibration['n_standards']} wells, {calibration['n_concentrations']} levels")
+                            m1.metric("Slope", f"{calibration['slope']:.4f}")
+                            m2.metric("R\u00b2", f"{calibration['r_squared']:.6f}")
 
                             st.markdown(
-                                f"**copies = {calibration['conversion_factor']:.2e} \u00d7 D0** "
-                                f"(median CF)"
+                                f"**log\u2081\u2080(copies) = {calibration['slope']:.4f} "
+                                f"\u00d7 log\u2081\u2080(D0) + {calibration['intercept']:.4f}**"
                             )
                             st.caption(
-                                f"95% CI: {calibration['cf_ci_lower']:.2e} \u2013 {calibration['cf_ci_upper']:.2e}"
+                                f"Standards: {calibration['n_standards']} wells, "
+                                f"{calibration['n_concentrations']} levels"
                             )
                             cf_spread = calibration.get('cf_spread', np.nan)
                             if not np.isnan(cf_spread):
                                 st.caption(
-                                    f"CF spread: {cf_spread:.2f}\u00d7 | "
-                                    f"Diagnostic slope = {calibration['slope']:.3f}, "
-                                    f"R\u00b2 = {calibration['r_squared']:.4f}"
+                                    f"Median CF = {calibration['median_cf']:.2e} "
+                                    f"(spread: {cf_spread:.2f}\u00d7 across levels)"
                                 )
                             if not np.isnan(calibration['pooled_replicate_cv']):
                                 st.caption(
