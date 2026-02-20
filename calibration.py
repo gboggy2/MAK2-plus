@@ -279,8 +279,12 @@ def build_ct_standard_curve(
     slope_stderr = result.stderr
     intercept_stderr = result.intercept_stderr
 
-    # 4. Efficiency: E = 10^(-1/slope) - 1
-    efficiency = (10 ** (-1.0 / slope) - 1) if slope != 0 else np.nan
+    # 4. Efficiency: E = 10^(-slope) - 1
+    # Our regression is log10(copies) = slope * Ct + intercept, so our slope
+    # is the reciprocal of the traditional Ct-vs-log10(copies) slope.
+    # The standard formula E = 10^(-1/m) - 1 uses the traditional slope m,
+    # which equals 1/slope here, giving E = 10^(-1/(1/slope)) - 1 = 10^(-slope) - 1.
+    efficiency = (10 ** (-slope) - 1) if slope != 0 else np.nan
 
     # 5. Replicate variance
     replicate_variance = {}
