@@ -2046,10 +2046,40 @@ if cycles is not None and fluorescence is not None:
                                 x=ct_val,
                                 line_dash="dot",
                                 line_color="gray",
-                                annotation_text="Ct" if row_idx == 1 else None,
-                                annotation_position="top right" if row_idx == 1 else None,
                                 row=row_idx, col=1,
                             )
+                            if row_idx == 1:
+                                fig_batch.add_annotation(
+                                    x=ct_val, y=1, yref="y domain",
+                                    text="Ct", showarrow=False,
+                                    xanchor="left", yanchor="top",
+                                    font=dict(size=11, color="gray"),
+                                    row=1, col=1,
+                                )
+
+                    # Final fitted cycle vertical line on all rows
+                    from mak2_model import find_slope_threshold_cycle
+                    trunc_idx = find_slope_threshold_cycle(
+                        sample_fluor,
+                        cycles_after_max=batch_settings.get('cycles_after_max', 3)
+                    )
+                    final_cycle = cycles[min(trunc_idx, len(cycles) - 1)]
+                    if final_cycle < cycles[-1]:
+                        for row_idx in range(1, 4):
+                            fig_batch.add_vline(
+                                x=final_cycle,
+                                line_dash="dash",
+                                line_color="green",
+                                row=row_idx, col=1,
+                            )
+                            if row_idx == 1:
+                                fig_batch.add_annotation(
+                                    x=final_cycle, y=1, yref="y domain",
+                                    text="Final fitted cycle", showarrow=False,
+                                    xanchor="right", yanchor="top",
+                                    font=dict(size=11, color="green"),
+                                    row=1, col=1,
+                                )
 
                     fig_batch.update_xaxes(title_text="Cycle", row=3, col=1)
                     fig_batch.update_yaxes(title_text="Fluorescence", row=1, col=1)
@@ -2195,16 +2225,6 @@ if cycles is not None and fluorescence is not None:
                     row=1, col=1
                 )
 
-                # Add threshold line (where truncation occurs)
-                if threshold_cycle_num < cycles[-1]:
-                    fig.add_vline(
-                        x=threshold_cycle_num,
-                        line_dash="dash",
-                        line_color="green",
-                        annotation_text=threshold_label,
-                        row=1, col=1
-                    )
-
                 # Row 2: Residuals
                 residuals = fluorescence - F_pred
                 fig.add_trace(
@@ -2238,10 +2258,34 @@ if cycles is not None and fluorescence is not None:
                             x=ct_val_single,
                             line_dash="dot",
                             line_color="gray",
-                            annotation_text="Ct" if row_idx == 1 else None,
-                            annotation_position="top right" if row_idx == 1 else None,
                             row=row_idx, col=1,
                         )
+                        if row_idx == 1:
+                            fig.add_annotation(
+                                x=ct_val_single, y=1, yref="y domain",
+                                text="Ct", showarrow=False,
+                                xanchor="left", yanchor="top",
+                                font=dict(size=11, color="gray"),
+                                row=1, col=1,
+                            )
+
+                # Final fitted cycle vertical line on all rows
+                if threshold_cycle_num < cycles[-1]:
+                    for row_idx in range(1, 4):
+                        fig.add_vline(
+                            x=threshold_cycle_num,
+                            line_dash="dash",
+                            line_color="green",
+                            row=row_idx, col=1,
+                        )
+                        if row_idx == 1:
+                            fig.add_annotation(
+                                x=threshold_cycle_num, y=1, yref="y domain",
+                                text="Final fitted cycle", showarrow=False,
+                                xanchor="right", yanchor="top",
+                                font=dict(size=11, color="green"),
+                                row=1, col=1,
+                            )
 
                 fig.update_xaxes(title_text="Cycle", row=3, col=1)
                 fig.update_yaxes(title_text="Fluorescence", row=1, col=1)
