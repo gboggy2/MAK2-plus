@@ -495,6 +495,49 @@ class QPCRDataConverter:
                     pass
         return None
 
+    def _parse_results_sheet(self, xls: pd.ExcelFile) -> Optional[pd.DataFrame]:
+        """
+        Parse Results sheet for instrument-reported CT values and thresholds.
+
+        QuantStudio exports include a "Results" sheet with per-well CT, Ct Threshold,
+        and other analysis results. The header row position varies.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            DataFrame with columns like Well Position, Target Name, CT, Ct Threshold.
+            Returns None if sheet not found or unparseable.
+        """
+        results_sheets = ['Results', 'Results ']
+        for sheet in results_sheets:
+            if sheet in xls.sheet_names:
+                try:
+                    df_raw = pd.read_excel(xls, sheet_name=sheet, header=None)
+                    for i in range(min(60, len(df_raw))):
+                        row_vals = [str(v).strip() for v in df_raw.iloc[i].values]
+                        if 'Well Position' in row_vals and 'CT' in row_vals:
+                            col_names = [str(v).strip() for v in df_raw.iloc[i].values]
+                            df = df_raw.iloc[i+1:].copy()
+                            df.columns = col_names
+                            df = df.reset_index(drop=True)
+
+                            keep = ['Well Position', 'Target Name', 'CT', 'Ct Threshold']
+                            keep = [c for c in keep if c in df.columns]
+                            df = df[keep]
+                            df = df.dropna(subset=['Well Position'])
+
+                            if 'CT' in df.columns:
+                                df['CT'] = pd.to_numeric(df['CT'], errors='coerce')
+                            if 'Ct Threshold' in df.columns:
+                                df['Ct Threshold'] = pd.to_numeric(
+                                    df['Ct Threshold'], errors='coerce'
+                                )
+
+                            return df
+                except Exception:
+                    pass
+        return None
+
     def _try_quantstudio_multisheet(self, filepath: Union[str, Path, io.BytesIO]) -> Tuple[np.ndarray, Dict[str, np.ndarray], Optional[Dict]]:
         """
         Try to read QuantStudio format from multi-sheet Excel file.
@@ -569,6 +612,9 @@ class QPCRDataConverter:
             # Parse Sample Setup sheet for metadata (Sample Name, Task, Quantity)
             sample_setup = self._parse_sample_setup(xls)
 
+            # Parse Results sheet for instrument-reported CT values
+            results_sheet = self._parse_results_sheet(xls)
+
             # Check if we have Target column (multiplexed data)
             has_targets = 'Target' in df.columns and df['Target'].notna().any()
 
@@ -584,6 +630,7 @@ class QPCRDataConverter:
                     'well_col': well_col,
                     'fluor_col': fluor_col,
                     'sample_setup': sample_setup,  # Well metadata (may be None)
+                    'results_sheet': results_sheet,  # Instrument CT values (may be None)
                 }
                 
                 # For now, return empty samples dict - will be populated after target selection
@@ -707,6 +754,22 @@ class QPCRDataConverter:
                             else:
                                 meta[col] = val
                     sample_metadata[well_pos] = meta
+
+        # Merge instrument-reported CT values from Results sheet (if available)
+        results_df = extra_info.get('results_sheet')
+        if results_df is not None and sample_metadata is not None:
+            if 'Target Name' in results_df.columns:
+                target_results = results_df[results_df['Target Name'] == target_name]
+            else:
+                target_results = results_df
+
+            for _, row in target_results.iterrows():
+                well_pos = str(row.get('Well Position', ''))
+                if well_pos in sample_metadata:
+                    if 'CT' in results_df.columns and pd.notna(row.get('CT')):
+                        sample_metadata[well_pos]['Instrument_CT'] = float(row['CT'])
+                    if 'Ct Threshold' in results_df.columns and pd.notna(row.get('Ct Threshold')):
+                        sample_metadata[well_pos]['Ct_Threshold'] = float(row['Ct Threshold'])
 
         return cycles, samples, sample_metadata
 

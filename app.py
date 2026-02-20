@@ -1036,16 +1036,20 @@ if cycles is not None and fluorescence is not None:
                     
                     metrics_batch = optimizer_batch.calculate_fit_metrics()
 
-                    # Calculate Ct (threshold cycle) for comparison with traditional methods
-                    # Use global threshold for consistency across all samples
-                    try:
-                        ct_results = optimizer_batch.calculate_ct(
-                            method='threshold',
-                            threshold=global_threshold
-                        )
-                        ct_value = ct_results['ct']
-                    except:
-                        ct_value = np.nan
+                    # Get Ct value: prefer instrument-reported CT, fall back to calculated
+                    well_meta = sample_metadata.get(sample_name, {}) if sample_metadata else {}
+                    instrument_ct = well_meta.get('Instrument_CT')
+                    if instrument_ct is not None and not np.isnan(instrument_ct):
+                        ct_value = instrument_ct
+                    else:
+                        try:
+                            ct_results = optimizer_batch.calculate_ct(
+                                method='threshold',
+                                threshold=global_threshold
+                            )
+                            ct_value = ct_results['ct']
+                        except Exception:
+                            ct_value = np.nan
 
                     # Determine which tier was used
                     if params_batch.get('de_used', False):
