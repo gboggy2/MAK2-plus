@@ -1693,8 +1693,8 @@ if cycles is not None and fluorescence is not None:
                             st.markdown("**Replicate Statistics (Mean ± SD)**")
                             st.markdown("*Coefficient of Variation (CV%) = (SD / Mean) × 100*")
 
-                            # Format for display
-                            display_stats = replicate_stats.copy()
+                            # Format for display (convert None to NaN for proper na_rep display)
+                            display_stats = replicate_stats.fillna(value=np.nan).copy()
 
                             # Add Wells column so user can identify which wells belong to each group
                             def _get_well_ids(group_name):
