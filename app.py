@@ -1971,7 +1971,36 @@ if cycles is not None and fluorescence is not None:
                         F_bg_intercept=selected_result['F_bg_intercept'],
                         F_bg_slope=selected_result['F_bg_slope']
                     )
-                    
+
+                    # Cycle-by-cycle amplification efficiency plot
+                    _, D_batch_eff, _ = model_viz.simulate_cycles(
+                        D0=selected_result['D0'],
+                        k=selected_result['k'],
+                        P0=selected_result['P0'],
+                        n_cycles=len(cycles),
+                        F_bg_intercept=selected_result['F_bg_intercept'],
+                        F_bg_slope=selected_result['F_bg_slope']
+                    )
+                    eff_batch = calculate_amplification_efficiency(D_batch_eff)
+
+                    fig_eff_batch = go.Figure()
+                    fig_eff_batch.add_trace(
+                        go.Scatter(
+                            x=np.arange(1, len(eff_batch)+1),
+                            y=eff_batch,
+                            mode='lines+markers',
+                            name='Efficiency',
+                            marker=dict(size=5),
+                        )
+                    )
+                    fig_eff_batch.update_layout(
+                        title=f"Amplification Efficiency: {selected_sample}",
+                        xaxis_title="Cycle",
+                        yaxis_title="Amplification Efficiency",
+                        height=300,
+                    )
+                    st.plotly_chart(fig_eff_batch, use_container_width=True)
+
                     fig_batch = make_subplots(
                         rows=2, cols=1,
                         subplot_titles=(f"MAK2 Fit: {selected_sample}", "Residuals"),
