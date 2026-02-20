@@ -2094,6 +2094,36 @@ if cycles is not None and fluorescence is not None:
         tab1, tab2, tab3, tab4 = st.tabs(["📊 Fit Visualization", "📈 Parameters & Metrics", "🔬 Bootstrap CI", "💾 Export"])
         
         with tab1:
+                # Cycle-by-cycle amplification efficiency plot (shown above the fit)
+                st.subheader("Amplification Efficiency Over Cycles")
+
+                _, D_eff, _ = optimizer.model.simulate_cycles(
+                    D0=fitted_params['D0'],
+                    k=fitted_params['k'],
+                    P0=fitted_params['P0'],
+                    n_cycles=len(cycles),
+                    F_bg_intercept=fitted_params['F_bg_intercept'],
+                    F_bg_slope=fitted_params['F_bg_slope']
+                )
+
+                eff_per_cycle = calculate_amplification_efficiency(D_eff)
+
+                fig_eff = go.Figure()
+                fig_eff.add_trace(
+                    go.Scatter(
+                        x=np.arange(1, len(eff_per_cycle)+1),
+                        y=eff_per_cycle,
+                        mode='lines+markers',
+                        name='Efficiency'
+                    )
+                )
+                fig_eff.update_layout(
+                    xaxis_title="Cycle",
+                    yaxis_title="Amplification Efficiency",
+                    height=350
+                )
+                st.plotly_chart(fig_eff, use_container_width=True)
+
                 # Predict fitted curve
                 F_pred = optimizer.predict(cycles)
                 
@@ -2235,37 +2265,6 @@ if cycles is not None and fluorescence is not None:
             })
                 
             st.dataframe(param_df, use_container_width=True)
-                
-            # Amplification efficiency plot
-            st.subheader("Amplification Efficiency Over Cycles")
-                
-            # Simulate full model to get DNA concentrations
-            _, D, _ = optimizer.model.simulate_cycles(
-                D0=fitted_params['D0'],
-                k=fitted_params['k'],
-                P0=fitted_params['P0'],
-                n_cycles=len(cycles),
-                F_bg_intercept=fitted_params['F_bg_intercept'],
-                F_bg_slope=fitted_params['F_bg_slope']
-            )
-                
-            efficiency = calculate_amplification_efficiency(D)
-                
-            fig_eff = go.Figure()
-            fig_eff.add_trace(
-                go.Scatter(
-                    x=np.arange(1, len(efficiency)+1),
-                    y=efficiency,
-                    mode='lines+markers',
-                    name='Efficiency'
-                )
-            )
-            fig_eff.update_layout(
-                xaxis_title="Cycle",
-                yaxis_title="Amplification Efficiency",
-                height=400
-            )
-            st.plotly_chart(fig_eff, use_container_width=True)
             
         with tab3:
             st.subheader("🔬 Bootstrap Confidence Intervals")
