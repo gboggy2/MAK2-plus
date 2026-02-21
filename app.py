@@ -1720,15 +1720,23 @@ if cycles is not None and fluorescence is not None:
                                 'Ct_Mean': '{:.2f}',
                                 'Ct_SD': '{:.3f}',
                                 'Ct_CV': '{:.2f}%',
+                                'Ct_Min': '{:.2f}',
+                                'Ct_Max': '{:.2f}',
                                 'D0_Mean': '{:.2e}',
                                 'D0_SD': '{:.2e}',
                                 'D0_CV': '{:.2f}%',
+                                'D0_Min': '{:.2e}',
+                                'D0_Max': '{:.2e}',
                                 'Copies_D0_Mean': '{:.2e}',
                                 'Copies_D0_SD': '{:.2e}',
                                 'Copies_D0_CV': '{:.2f}%',
+                                'Copies_D0_Min': '{:.2e}',
+                                'Copies_D0_Max': '{:.2e}',
                                 'Copies_Ct_Mean': '{:.2e}',
                                 'Copies_Ct_SD': '{:.2e}',
                                 'Copies_Ct_CV': '{:.2f}%',
+                                'Copies_Ct_Min': '{:.2e}',
+                                'Copies_Ct_Max': '{:.2e}',
                             }
 
                             st.dataframe(
