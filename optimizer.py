@@ -2226,8 +2226,9 @@ class MAK2Optimizer:
         fluorescence = self.fluorescence_fit
 
         # Auto-detect if data is already baseline-subtracted
-        # Check first 25% of cycles: if many are near-zero or negative, likely pre-subtracted
-        baseline_end = max(3, int(len(cycles) * 0.25))
+        # Use conservative baseline window (first 15%) to avoid including
+        # early amplification from high-copy samples
+        baseline_end = max(3, int(len(cycles) * 0.15))
         early_fluor = fluorescence[0:baseline_end]
 
         # Data is likely pre-baseline-subtracted if:
