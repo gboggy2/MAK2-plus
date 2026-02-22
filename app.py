@@ -1007,6 +1007,7 @@ if cycles is not None and fluorescence is not None:
                 if already_baseline_subtracted:
                     # For baseline-subtracted data, use SD of early cycles across all samples
                     global_baseline_sd = np.std(all_baseline_values)
+                    global_baseline_mean = 0.0
                     global_threshold = 10 * global_baseline_sd if global_baseline_sd > 0 else 0.01
                 else:
                     # For raw data, calculate baseline mean and SD
@@ -1242,6 +1243,7 @@ if cycles is not None and fluorescence is not None:
                 'truncate_cycle': truncate_cycle,
                 'custom_bounds_dict': custom_bounds_dict,
                 'global_threshold': global_threshold,
+                'global_baseline_mean': global_baseline_mean,
             }
         
         # Display batch results (outside button block, always visible if results exist)
@@ -2069,16 +2071,27 @@ if cycles is not None and fluorescence is not None:
                     )
 
                     # Ct threshold horizontal line on fit plot (row 1)
+                    # The threshold is relative to baseline-subtracted data (delta_rn),
+                    # so plot it at baseline_mean + threshold on the raw fluorescence axis
                     ct_threshold = batch_settings.get('global_threshold')
-                    # Prefer instrument threshold if available
+                    ct_baseline_mean = batch_settings.get('global_baseline_mean', 0.0)
+                    # Prefer instrument threshold if available (already on raw scale)
+                    use_instrument_threshold = False
                     if sample_metadata:
                         well_meta = sample_metadata.get(selected_sample, {})
                         inst_threshold = well_meta.get('Ct_Threshold')
                         if inst_threshold is not None:
                             ct_threshold = inst_threshold
+                            use_instrument_threshold = True
                     if ct_threshold is not None and ct_threshold > 0:
+                        # Instrument threshold is already on the raw fluorescence scale;
+                        # our calculated threshold is on the delta_rn scale
+                        if use_instrument_threshold:
+                            threshold_plot_y = ct_threshold
+                        else:
+                            threshold_plot_y = ct_threshold + ct_baseline_mean
                         fig_batch.add_hline(
-                            y=ct_threshold,
+                            y=threshold_plot_y,
                             line_dash="dot",
                             line_color="purple",
                             line_width=1,
@@ -2086,8 +2099,8 @@ if cycles is not None and fluorescence is not None:
                         )
                         fig_batch.add_annotation(
                             x=0, xref="x domain",
-                            y=ct_threshold,
-                            text=f"Threshold ({ct_threshold:.4f})",
+                            y=threshold_plot_y,
+                            text=f"Threshold ({threshold_plot_y:.4f})",
                             showarrow=False,
                             xanchor="left", yanchor="bottom",
                             font=dict(size=10, color="purple"),
@@ -2243,10 +2256,12 @@ if cycles is not None and fluorescence is not None:
 
                 # Calculate Ct for vertical line
                 ct_threshold_single = None
+                ct_baseline_mean_single = 0.0
                 try:
                     ct_res_single = optimizer.calculate_ct(method='threshold')
                     ct_val_single = ct_res_single['ct']
                     ct_threshold_single = ct_res_single.get('threshold')
+                    ct_baseline_mean_single = ct_res_single.get('baseline_mean', 0.0)
                 except Exception:
                     ct_val_single = np.nan
 
@@ -2310,9 +2325,12 @@ if cycles is not None and fluorescence is not None:
                 )
 
                 # Ct threshold horizontal line on fit plot (row 1)
+                # The threshold is relative to baseline-subtracted data (delta_rn),
+                # so plot it at baseline_mean + threshold on the raw fluorescence axis
                 if ct_threshold_single is not None and ct_threshold_single > 0:
+                    threshold_plot_y = ct_threshold_single + ct_baseline_mean_single
                     fig.add_hline(
-                        y=ct_threshold_single,
+                        y=threshold_plot_y,
                         line_dash="dot",
                         line_color="purple",
                         line_width=1,
@@ -2320,8 +2338,8 @@ if cycles is not None and fluorescence is not None:
                     )
                     fig.add_annotation(
                         x=0, xref="x domain",
-                        y=ct_threshold_single,
-                        text=f"Threshold ({ct_threshold_single:.4f})",
+                        y=threshold_plot_y,
+                        text=f"Threshold ({threshold_plot_y:.4f})",
                         showarrow=False,
                         xanchor="left", yanchor="bottom",
                         font=dict(size=10, color="purple"),
