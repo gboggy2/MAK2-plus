@@ -1240,7 +1240,8 @@ if cycles is not None and fluorescence is not None:
                 'cycles_after_max': cycles_after_max,
                 'auto_truncate': auto_truncate,
                 'truncate_cycle': truncate_cycle,
-                'custom_bounds_dict': custom_bounds_dict
+                'custom_bounds_dict': custom_bounds_dict,
+                'global_threshold': global_threshold,
             }
         
         # Display batch results (outside button block, always visible if results exist)
@@ -1965,7 +1966,8 @@ if cycles is not None and fluorescence is not None:
             all_samples = st.session_state['batch_all_samples']
             cycles = st.session_state['batch_cycles']
             batch_settings = st.session_state['batch_settings']
-            
+            sample_metadata = st.session_state.get('sample_metadata')
+
             # Sample selector
             sample_names = [r['Sample'] for r in results_list]
             selected_sample = st.selectbox(
@@ -2065,6 +2067,32 @@ if cycles is not None and fluorescence is not None:
                         ),
                         row=3, col=1
                     )
+
+                    # Ct threshold horizontal line on fit plot (row 1)
+                    ct_threshold = batch_settings.get('global_threshold')
+                    # Prefer instrument threshold if available
+                    if sample_metadata:
+                        well_meta = sample_metadata.get(selected_sample, {})
+                        inst_threshold = well_meta.get('Ct_Threshold')
+                        if inst_threshold is not None:
+                            ct_threshold = inst_threshold
+                    if ct_threshold is not None and ct_threshold > 0:
+                        fig_batch.add_hline(
+                            y=ct_threshold,
+                            line_dash="dot",
+                            line_color="purple",
+                            line_width=1,
+                            row=1, col=1,
+                        )
+                        fig_batch.add_annotation(
+                            x=0, xref="x domain",
+                            y=ct_threshold,
+                            text=f"Threshold ({ct_threshold:.4f})",
+                            showarrow=False,
+                            xanchor="left", yanchor="bottom",
+                            font=dict(size=10, color="purple"),
+                            row=1, col=1,
+                        )
 
                     # Ct vertical line on all rows
                     ct_val = selected_result.get('Ct', np.nan)
@@ -2214,9 +2242,11 @@ if cycles is not None and fluorescence is not None:
                 threshold_cycle_num = cycles[min(threshold_idx, len(cycles)-1)]
 
                 # Calculate Ct for vertical line
+                ct_threshold_single = None
                 try:
                     ct_res_single = optimizer.calculate_ct(method='threshold')
                     ct_val_single = ct_res_single['ct']
+                    ct_threshold_single = ct_res_single.get('threshold')
                 except Exception:
                     ct_val_single = np.nan
 
@@ -2278,6 +2308,25 @@ if cycles is not None and fluorescence is not None:
                     ),
                     row=3, col=1
                 )
+
+                # Ct threshold horizontal line on fit plot (row 1)
+                if ct_threshold_single is not None and ct_threshold_single > 0:
+                    fig.add_hline(
+                        y=ct_threshold_single,
+                        line_dash="dot",
+                        line_color="purple",
+                        line_width=1,
+                        row=1, col=1,
+                    )
+                    fig.add_annotation(
+                        x=0, xref="x domain",
+                        y=ct_threshold_single,
+                        text=f"Threshold ({ct_threshold_single:.4f})",
+                        showarrow=False,
+                        xanchor="left", yanchor="bottom",
+                        font=dict(size=10, color="purple"),
+                        row=1, col=1,
+                    )
 
                 # Ct vertical line on all rows
                 if not np.isnan(ct_val_single):
