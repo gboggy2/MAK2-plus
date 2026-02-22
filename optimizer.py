@@ -2262,16 +2262,14 @@ class MAK2Optimizer:
         if method == 'threshold':
             # Auto-calculate threshold if not provided
             if threshold is None:
+                # Use the larger of 10×SD or 5% of the dynamic range.
+                # 10×SD can be too low when baseline noise is very small,
+                # whether data is baseline-subtracted or not. The 5% floor
+                # ensures the threshold sits in the early exponential phase.
                 sd_threshold = 10 * baseline_sd
-                if not already_baseline_subtracted:
-                    # For raw data, 10×SD can be too low when baseline noise
-                    # is very small. Use the larger of 10×SD or 5% of
-                    # the fluorescence dynamic range.
-                    dynamic_range = np.max(fluorescence) - baseline_mean
-                    range_threshold = 0.05 * dynamic_range
-                    threshold = max(sd_threshold, range_threshold)
-                else:
-                    threshold = sd_threshold
+                dynamic_range = np.max(fluorescence) - baseline_mean
+                range_threshold = 0.05 * dynamic_range
+                threshold = max(sd_threshold, range_threshold)
 
             results['threshold'] = threshold
 
