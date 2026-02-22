@@ -992,28 +992,34 @@ if cycles is not None and fluorescence is not None:
                 all_fluorescence.append(fluor_data)
 
             if len(all_fluorescence) > 0:
-                # Calculate global baseline statistics from early cycles of all samples
-                baseline_end = max(3, int(len(cycles) * 0.25))
+                # Calculate global baseline statistics using per-sample medians
+                # Use a conservative baseline window (first 15% of cycles, min 3)
+                # to avoid including early amplification from high-copy samples
+                baseline_end = max(3, int(len(cycles) * 0.15))
                 all_baseline_values = []
+                per_sample_sds = []
+                per_sample_means = []
 
                 for fluor_data in all_fluorescence:
                     early_fluor = fluor_data[0:baseline_end]
                     all_baseline_values.extend(early_fluor)
+                    per_sample_sds.append(np.std(early_fluor))
+                    per_sample_means.append(np.mean(early_fluor))
 
                 # Check if data is baseline-subtracted
                 mean_early = np.mean(all_baseline_values)
                 already_baseline_subtracted = (mean_early < 0.1) or (np.any(np.array(all_baseline_values) < 0))
 
+                # Use MEDIAN per-sample SD to be robust against high-copy samples
+                # whose early cycles already include amplification signal
+                median_baseline_sd = np.median(per_sample_sds)
+
                 if already_baseline_subtracted:
-                    # For baseline-subtracted data, use SD of early cycles across all samples
-                    global_baseline_sd = np.std(all_baseline_values)
                     global_baseline_mean = 0.0
-                    global_threshold = 10 * global_baseline_sd if global_baseline_sd > 0 else 0.01
+                    global_threshold = 10 * median_baseline_sd if median_baseline_sd > 0 else 0.01
                 else:
-                    # For raw data, calculate baseline mean and SD
-                    global_baseline_mean = np.mean(all_baseline_values)
-                    global_baseline_sd = np.std(all_baseline_values)
-                    global_threshold = 10 * global_baseline_sd
+                    global_baseline_mean = np.median(per_sample_means)
+                    global_threshold = 10 * median_baseline_sd
 
                 st.info(f"📊 Using global threshold: {global_threshold:.6f} (calculated from all {len(all_samples_to_fit)} samples)")
 
