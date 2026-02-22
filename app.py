@@ -1019,7 +1019,16 @@ if cycles is not None and fluorescence is not None:
                     global_threshold = 10 * median_baseline_sd if median_baseline_sd > 0 else 0.01
                 else:
                     global_baseline_mean = np.median(per_sample_means)
-                    global_threshold = 10 * median_baseline_sd
+                    # For raw (non-subtracted) data, 10×SD can be too low when
+                    # baseline noise is very small. Use the larger of:
+                    #   - 10 × baseline SD (standard approach)
+                    #   - 10% of the plate's fluorescence dynamic range
+                    # This ensures the threshold is meaningfully above baseline
+                    sd_threshold = 10 * median_baseline_sd
+                    plate_max = np.max([np.max(f) for f in all_fluorescence])
+                    dynamic_range = plate_max - global_baseline_mean
+                    range_threshold = 0.10 * dynamic_range
+                    global_threshold = max(sd_threshold, range_threshold)
 
                 st.info(f"📊 Using global threshold: {global_threshold:.6f} (calculated from all {len(all_samples_to_fit)} samples)")
 
