@@ -2265,10 +2265,10 @@ class MAK2Optimizer:
                 sd_threshold = 10 * baseline_sd
                 if not already_baseline_subtracted:
                     # For raw data, 10×SD can be too low when baseline noise
-                    # is very small. Use the larger of 10×SD or 10% of
+                    # is very small. Use the larger of 10×SD or 5% of
                     # the fluorescence dynamic range.
                     dynamic_range = np.max(fluorescence) - baseline_mean
-                    range_threshold = 0.10 * dynamic_range
+                    range_threshold = 0.05 * dynamic_range
                     threshold = max(sd_threshold, range_threshold)
                 else:
                     threshold = sd_threshold
