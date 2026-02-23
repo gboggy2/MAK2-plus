@@ -56,18 +56,15 @@ st.title("🧬 qPCR Model Fitting with MAK2+")
 # Community signup banner
 st.info("""
 👋 **MAK2+ is in open beta!** Free to use for research and education.
-📬 [Join our mailing list](https://docs.google.com/forms/d/e/PLACEHOLDER/viewform) for updates | 💬 [GitHub Discussions](https://github.com/gboggy2/MAK2-plus/discussions) for questions | 🌟 [Community Guide](https://github.com/gboggy2/MAK2-plus/blob/main/COMMUNITY.md)
+💬 [GitHub Discussions](https://github.com/gboggy2/MAK2-plus/discussions) for questions | 🐛 [Report issues](https://github.com/gboggy2/MAK2-plus/issues)
 """, icon="🧬")
 st.markdown("""
 This tool fits the MAK2 mechanistic model to qPCR data, including primer depletion effects.
 
-**Two Smart Truncation Methods:**
-- **Fluorescence threshold**: Truncate at % of max fluorescence (default: 85%)
-- **Slope threshold**: Truncate at max derivative + N cycles (default: 3 cycles)
+**Smart Truncation:** Data is automatically truncated at the max derivative + N cycles (default: 3),
+avoiding deep plateau artifacts (enzyme degradation, dNTP depletion) not modeled by primer depletion.
 
-Both avoid deep plateau artifacts (enzyme degradation, dNTP depletion) not modeled by primer depletion.
-
-Based on Boggy & Woolf (2010) with extensions for primer concentration tracking.
+Based on [Boggy & Woolf (2010)](https://doi.org/10.1371/journal.pone.0012355) with extensions for primer concentration tracking.
 """)
 
 # Sidebar for data input
@@ -2818,13 +2815,14 @@ else:
     of Quantitative PCR Data. PLOS ONE 5(8): e12355.
     
     ### Example Datasets
-    
-    **Boggy et al.** - Classic dilution series from the original MAK2 paper  
-    **Rutledge** - High-throughput screen with 120 wells  
-    **Technical Replicates** - Precision study with quad replicates
-    
-    Each dataset includes detailed metadata and expected results.  
-    [View full documentation](https://github.com/gboggy2/MAK2-plus/tree/main/example_data)
+
+    All three example datasets are from the [qpcR](https://cran.r-project.org/package=qpcR) R package:
+
+    **Boggy** - 10-fold dilution series (Boggy & Woolf, 2010, *PLOS ONE*)
+    **Rutledge** - High-throughput screen with 120 wells (Rutledge, 2004, *Nucleic Acids Research*)
+    **Technical Replicates** - `reps` dataset: 7 dilutions with quad replicates (Spiess & Mueller, IHF Hamburg)
+
+    [View dataset documentation](https://github.com/gboggy2/MAK2-plus/tree/main/example_data)
     """)
 
 # Footer

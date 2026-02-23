@@ -2,22 +2,22 @@
   "datasets": {
     "Boggy.csv": {
       "display_name": "Boggy et al. - Dilution Series",
-      "description": "qPCR dilution series demonstrating MAK2 model fitting across a range of template concentrations. Six 2-fold dilution points (F1-F6) with duplicate technical replicates showing characteristic exponential amplification and plateau phases.",
-      "source": "Boggy, G.J., & Woolf, P.J. (2010). A Mechanistic Model of PCR for Accurate Quantification of Quantitative PCR Data. PLOS ONE, 5(8), e12355.",
+      "description": "qPCR dilution series demonstrating MAK2 model fitting across a range of template concentrations. Six 10-fold dilution points (F1-F6) with duplicate technical replicates showing characteristic exponential amplification and plateau phases. Synthetic template (129 bp), Syto-13 dye, Chromo4 (BioRad).",
+      "source": "Boggy, G.J., & Woolf, P.J. (2010). A Mechanistic Model of PCR for Accurate Quantification of Quantitative PCR Data. PLOS ONE, 5(8), e12355. Dataset from the qpcR R package (CRAN).",
       "n_samples": 12,
       "n_cycles": 40,
       "sample_description": {
-        "F1": "Highest concentration (2^0 dilution)",
-        "F2": "2^1 dilution",
-        "F3": "2^2 dilution",
-        "F4": "2^3 dilution",
-        "F5": "2^4 dilution",
-        "F6": "2^5 dilution (lowest)"
+        "F1": "Highest concentration (10^0 dilution)",
+        "F2": "10^-1 dilution",
+        "F3": "10^-2 dilution",
+        "F4": "10^-3 dilution",
+        "F5": "10^-4 dilution",
+        "F6": "10^-5 dilution (lowest)"
       },
       "technical_replicates": 2,
       "characteristics": [
         "Clean amplification curves",
-        "Wide concentration range (32-fold)",
+        "Wide concentration range (10^5-fold)",
         "Demonstrates primer depletion at high concentration",
         "Good for testing model across dynamic range"
       ],
@@ -26,7 +26,7 @@
     "Rutledge.csv": {
       "display_name": "Rutledge - High-Throughput Screen",
       "description": "Large-scale qPCR dataset with 6 concentration levels (X1-X6) and 5 experimental replicates (R1-R5), each with 4 technical replicates. **Note:** This data is background-subtracted with many zero values in early cycles. X5-X6 (low template) wells often fail fitting - this is expected and demonstrates MAK2+ behavior on challenging data.",
-      "source": "Dataset adapted from Rutledge, R.G. qPCR amplification efficiency studies",
+      "source": "Rutledge, R.G. (2004). Sigmoidal curve-fitting redefines quantitative real-time PCR. Nucleic Acids Research, 32(22), e178. Dataset from the qpcR R package (CRAN).",
       "n_samples": 120,
       "n_cycles": 45,
       "sample_description": {
@@ -53,7 +53,7 @@
     "reps.csv": {
       "display_name": "Technical Replicates Study",
       "description": "Seven concentration levels (F1-F7) with 4 technical replicates each, designed to assess measurement precision and reproducibility across a wide dynamic range. Demonstrates coefficient of variation analysis and quality control metrics.",
-      "source": "Internal validation dataset",
+      "source": "Spiess, A.-N. & Mueller, N., Institute for Hormone and Fertility Research, Hamburg. S27a housekeeping gene, Lightcycler 1.0 (Roche), SybrGreen I. Dataset from the qpcR R package (CRAN).",
       "n_samples": 28,
       "n_cycles": 49,
       "sample_description": {
