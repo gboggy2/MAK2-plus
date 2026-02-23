@@ -1,24 +1,25 @@
 # MAK2+ Example Datasets
 
-This folder contains real qPCR datasets for demonstrating and testing MAK2+ analysis capabilities.
+This folder contains real qPCR datasets for demonstrating and testing MAK2+ analysis capabilities. All three datasets are from the [qpcR](https://cran.r-project.org/package=qpcR) R package.
 
 ## Available Datasets
 
 ### 1. **Boggy.csv** - Dilution Series (Recommended for new users)
-- **Description**: Classic 2-fold dilution series with 6 concentration points
+- **Description**: 10-fold dilution series with 6 concentration points
 - **Samples**: 12 wells (6 dilutions × 2 technical replicates)
 - **Cycles**: 40
-- **Source**: Boggy & Woolf (2010) PLOS ONE
+- **Hardware**: Chromo4 (BioRad), Syto-13 dye, synthetic template (129 bp)
+- **Source**: Boggy & Woolf (2010) *PLOS ONE* 5(8): e12355
 - **Best for**: Learning MAK2+ basics, understanding primer depletion effects
 
 **Sample layout:**
 ```
-F1.1, F1.2  →  Highest concentration
-F2.1, F2.2  →  2-fold dilution
-F3.1, F3.2  →  4-fold dilution
-F4.1, F4.2  →  8-fold dilution
-F5.1, F5.2  →  16-fold dilution
-F6.1, F6.2  →  32-fold dilution (lowest)
+F1.1, F1.2  →  Highest concentration (10^0)
+F2.1, F2.2  →  10^-1 dilution
+F3.1, F3.2  →  10^-2 dilution
+F4.1, F4.2  →  10^-3 dilution
+F5.1, F5.2  →  10^-4 dilution
+F6.1, F6.2  →  10^-5 dilution (lowest)
 ```
 
 **Expected behavior:**
@@ -30,10 +31,11 @@ F6.1, F6.2  →  32-fold dilution (lowest)
 ---
 
 ### 2. **Rutledge.csv** - High-Throughput Screen
-- **Description**: Large-scale experiment with multiple concentration levels and replicates
+- **Description**: Large-scale experiment with 10-fold dilutions across multiple replicates
 - **Samples**: 120 wells (6 concentrations × 5 exp. replicates × 4 tech. replicates)
 - **Cycles**: 45
-- **Source**: Rutledge qPCR efficiency studies
+- **Hardware**: Opticon 2 (MJ Research), SybrGreen I dye, 102 bp amplicon, background-subtracted
+- **Source**: Rutledge (2004) *Nucleic Acids Research* 32(22): e178
 - **Best for**: Batch processing, testing bootstrap at low signal, quality control
 
 **Sample layout:**
@@ -55,10 +57,11 @@ X6.R1.1 to X6.R5.4  →  Lowest concentration (20 wells)
 ---
 
 ### 3. **reps.csv** - Technical Replicates Study
-- **Description**: Seven concentration levels with quad replicates for precision analysis
+- **Description**: Seven 10-fold dilution levels with quad replicates for precision analysis
 - **Samples**: 28 wells (7 concentrations × 4 technical replicates)
 - **Cycles**: 49
-- **Source**: Internal validation dataset
+- **Hardware**: Lightcycler 1.0 (Roche), SybrGreen I dye, S27a housekeeping gene
+- **Source**: Spiess & Mueller, Institute for Hormone and Fertility Research, Hamburg
 - **Best for**: Reproducibility testing, CV analysis, quality metrics
 
 **Sample layout:**
@@ -154,15 +157,26 @@ If you use these datasets in publications, please cite:
 
 **Software:**
 ```
-Boggy, G. (2024). MAK2+: Open-source computational tool for absolute 
+Boggy, G. (2024). MAK2+: Open-source computational tool for absolute
 nucleic acid quantification. GitHub. https://github.com/gboggy2/MAK2-plus
 ```
 
-**Original MAK2 model (for Boggy.csv):**
+**Datasets (qpcR R package):**
 ```
-Boggy, G.J., & Woolf, P.J. (2010). A Mechanistic Model of PCR for 
+Ritz, C. & Spiess, A.-N. (2008). qpcR: an R package for sigmoidal model
+selection in quantitative real-time polymerase chain reaction analysis.
+Bioinformatics 24(13): 1549-1551.
+```
+
+**Original publications for individual datasets:**
+```
+Boggy, G.J., & Woolf, P.J. (2010). A Mechanistic Model of PCR for
 Accurate Quantification of Quantitative PCR Data. PLOS ONE, 5(8), e12355.
 https://doi.org/10.1371/journal.pone.0012355
+
+Rutledge, R.G. (2004). Sigmoidal curve-fitting redefines quantitative
+real-time PCR. Nucleic Acids Research, 32(22), e178.
+https://doi.org/10.1093/nar/gnh177
 ```
 
 ---
