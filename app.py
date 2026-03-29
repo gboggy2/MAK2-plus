@@ -3752,6 +3752,19 @@ if cycles is not None and fluorescence is not None:
                             _s_bg_slope  = float(_s_bg_coeffs[0])
                             _s_bg_int    = float(_s_bg_coeffs[1])
 
+                    # ── Pre-fit fold-change gate (same as batch mode) ────
+                    _s_bg_at_max = _s_bg_slope * cycles[-1] + _s_bg_int
+                    _s_bg_at_start = _s_bg_slope * cycles[_single_start] + _s_bg_int
+                    _s_bl_ref = max(_s_bg_at_max, _s_bg_at_start, 1e-10)
+                    _s_fold = float(np.max(fluorescence)) / _s_bl_ref
+                    if _s_fold < 2.0:
+                        sys.stdout = old_stdout
+                        st.warning(
+                            f"⚠️ No amplification detected: fold change {_s_fold:.2f}× < 2×. "
+                            f"The signal does not rise sufficiently above baseline."
+                        )
+                        st.stop()
+
                     fitted_params = optimizer.fit(
                         cycles[_single_start:],
                         fluorescence[_single_start:],
