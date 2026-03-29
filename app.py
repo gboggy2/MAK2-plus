@@ -3738,6 +3738,32 @@ if cycles is not None and fluorescence is not None:
                         verbose=True  # Enable progress output
                     )
 
+                    # ── Post-fit quality gates (same as batch mode) ──
+                    _sq_warnings = []
+                    # Gate 1: minimum fold change (2×)
+                    _sq_fs = float(optimizer.cycles_fit[0]) if optimizer.cycles_fit is not None and len(optimizer.cycles_fit) > 0 else None
+                    _sq_fe = float(optimizer.cycles_fit[-1]) if optimizer.cycles_fit is not None and len(optimizer.cycles_fit) > 0 else None
+                    if _sq_fs is not None and _sq_fe is not None:
+                        _sq_mask = (cycles >= _sq_fs) & (cycles <= _sq_fe)
+                        _sq_win = fluorescence[_sq_mask]
+                        if len(_sq_win) >= 3:
+                            _sq_bl = float(np.mean(_sq_win[:3]))
+                            _sq_mx = float(np.max(_sq_win))
+                            if _sq_bl > 0 and _sq_mx / _sq_bl < 2.0:
+                                _sq_warnings.append(f"Fold change {_sq_mx/_sq_bl:.2f}× < 2×")
+                        # Gate 2: fit window width (≥ 5 cycles)
+                        if _sq_fe - _sq_fs < 5:
+                            _sq_warnings.append(f"Fit window {_sq_fe - _sq_fs:.0f} cycles < 5")
+                    # Gate 3: sigmoid shape (inflection in fitted curve)
+                    try:
+                        _sq_pred = optimizer.predict(cycles)
+                        if len(_sq_pred) >= 5:
+                            _sq_d2 = np.gradient(np.gradient(_sq_pred))
+                            if not (np.any(_sq_d2 > 0) and np.any(_sq_d2 < 0)):
+                                _sq_warnings.append("No inflection (monotone curve)")
+                    except Exception:
+                        pass
+
                     st.session_state['fitted_params'] = fitted_params
                     st.session_state['optimizer'] = optimizer
 
@@ -3749,6 +3775,9 @@ if cycles is not None and fluorescence is not None:
                     import hashlib
                     data_hash = hashlib.md5(f"{cycles.tobytes()}{fluorescence.tobytes()}".encode()).hexdigest()
                     st.session_state['fitted_data_hash'] = data_hash
+
+                    if _sq_warnings:
+                        st.warning(f"⚠️ Possible non-amplification: {'; '.join(_sq_warnings)}")
                     st.success("✅ Fitting complete!")
 
                 except Exception as e:
