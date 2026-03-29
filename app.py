@@ -2430,14 +2430,87 @@ if cycles is not None and fluorescence is not None:
                             results_list[idx]['Success'] = '⚠️ Retry failed'
             
             # ── Post-fit non-amplification check ───────────────────────
-            # Wells with very poor R² after all retry attempts are
-            # reclassified as non-amplifying (signal indistinguishable
-            # from baseline noise).
+            # Even when the optimizer converges, the well may not show
+            # real amplification.  Three quality gates catch false
+            # positives (fitting noise/drift rather than a real sigmoid):
+            #
+            #  1. Minimum fold change: F_max / F_baseline within the fit
+            #     window must exceed 2×.  Real amplification shows ≥ 3×.
+            #  2. Fit window width: fit_end − fit_start must be ≥ 5
+            #     cycles.  A narrower window means no clear transition.
+            #  3. Sigmoid shape: the fitted curve must show a clear
+            #     inflection (second derivative sign change) within the
+            #     fit window.  A monotone curve is drift, not sigmoid.
+            #
+            # Wells failing ANY gate are reclassified as non-amplifying.
             for _pf_idx, _pf_r in enumerate(results_list):
+                if _pf_r.get('error') is not None:
+                    continue  # already flagged
                 _pf_r2 = _pf_r.get('R2')
+                _pf_reject = False
+                _pf_reason = ''
+
+                # Gate 0: very poor R² (original check)
                 if _pf_r2 is not None and _pf_r2 < 0.90:
+                    _pf_reject = True
+                    _pf_reason = 'R² < 0.90'
+
+                # Gate 1: minimum fold change
+                if not _pf_reject and _pf_r.get('fluor_data') is not None:
+                    _pf_fd = _pf_r['fluor_data']
+                    _pf_fs = _pf_r.get('fit_start_cycle')
+                    _pf_fe = _pf_r.get('fit_end_cycle')
+                    if _pf_fs is not None and _pf_fe is not None:
+                        _pf_c = cycles[:len(_pf_fd)]
+                        _pf_mask = (_pf_c >= _pf_fs) & (_pf_c <= _pf_fe)
+                        _pf_win = _pf_fd[_pf_mask]
+                        if len(_pf_win) >= 3:
+                            # Baseline = mean of first 3 cycles in fit window
+                            _pf_bl = float(np.mean(_pf_win[:3]))
+                            _pf_mx = float(np.max(_pf_win))
+                            if _pf_bl > 0:
+                                _pf_fold = _pf_mx / _pf_bl
+                                if _pf_fold < 2.0:
+                                    _pf_reject = True
+                                    _pf_reason = f'Fold change {_pf_fold:.2f}× < 2×'
+
+                # Gate 2: fit window too narrow
+                if not _pf_reject:
+                    _pf_fs2 = _pf_r.get('fit_start_cycle')
+                    _pf_fe2 = _pf_r.get('fit_end_cycle')
+                    if (_pf_fs2 is not None and _pf_fe2 is not None
+                            and _pf_fe2 - _pf_fs2 < 5):
+                        _pf_reject = True
+                        _pf_reason = f'Fit window {_pf_fe2 - _pf_fs2:.0f} cycles < 5'
+
+                # Gate 3: sigmoid shape (inflection point in fitted curve)
+                if (not _pf_reject and _pf_r.get('D0') is not None
+                        and _pf_r.get('fluor_data') is not None):
+                    try:
+                        _pf_m = MAK2Model()
+                        _pf_c_full = cycles[:len(_pf_r['fluor_data'])]
+                        _pf_pred = _pf_m.simulate_to_cycle(
+                            D0=_pf_r['D0'], k=_pf_r['k'], P0=_pf_r['P0'],
+                            cycles=_pf_c_full,
+                            F_bg_intercept=_pf_r['F_bg_intercept'],
+                            F_bg_slope=_pf_r['F_bg_slope'],
+                        )
+                        # Second derivative of fitted curve
+                        if len(_pf_pred) >= 5:
+                            _pf_d2 = np.gradient(np.gradient(_pf_pred))
+                            # Sigmoid requires sign change in 2nd derivative
+                            _pf_has_inflection = (
+                                np.any(_pf_d2 > 0) and np.any(_pf_d2 < 0)
+                            )
+                            if not _pf_has_inflection:
+                                _pf_reject = True
+                                _pf_reason = 'No inflection (monotone curve)'
+                    except Exception:
+                        pass
+
+                if _pf_reject:
                     results_list[_pf_idx]['Success'] = ''
-                    results_list[_pf_idx]['error'] = 'No amplification detected'
+                    results_list[_pf_idx]['error'] = f'No amplification detected ({_pf_reason})'
                     results_list[_pf_idx]['D0'] = None
                     results_list[_pf_idx]['k'] = None
                     results_list[_pf_idx]['P0'] = None
