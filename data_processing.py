@@ -8,6 +8,56 @@ from typing import Tuple, Optional, Dict
 
 
 
+def estimate_baseline_end(cycles, fluorescence, first_cycle_idx=2, window_size=12, n_sd=5, max_iter=3):
+    """Estimate end of pre-amplification baseline region using forward projection.
+
+    Fits a line to an early window of cycles, then scans forward to find the first
+    cycle where fluorescence exceeds the projected baseline + n_sd * SD of residuals.
+    Iterates to refine the window boundary.
+
+    Parameters
+    ----------
+    cycles : np.ndarray
+        Cycle numbers (1-indexed)
+    fluorescence : np.ndarray
+        Raw fluorescence values
+    first_cycle_idx : int
+        Index (0-based) of the first cycle to include in baseline window
+    window_size : int
+        Initial number of cycles to use for baseline fit
+    n_sd : float
+        Number of baseline SDs above projection to call as end-of-baseline
+    max_iter : int
+        Maximum iterations
+
+    Returns
+    -------
+    int
+        0-based index of the last baseline cycle (exclusive end, i.e. baseline is cycles[:result])
+    """
+    import numpy as np
+    n = len(cycles)
+    bl_start = first_cycle_idx
+    bl_end = min(bl_start + window_size, n - 1)
+    for _ in range(max_iter):
+        bl_c = cycles[bl_start:bl_end]
+        bl_f = fluorescence[bl_start:bl_end]
+        if len(bl_c) < 3:
+            break
+        coeffs = np.polyfit(bl_c, bl_f, 1)
+        residuals = bl_f - np.polyval(coeffs, bl_c)
+        sd = max(float(np.std(residuals)), 1e-10)
+        new_bl_end = bl_end
+        for i in range(bl_end, n):
+            if fluorescence[i] > np.polyval(coeffs, cycles[i]) + n_sd * sd:
+                new_bl_end = i
+                break
+        if new_bl_end == bl_end:
+            break
+        bl_end = new_bl_end
+    return bl_end  # index of last baseline cycle (exclusive)
+
+
 def export_results(
     cycles: np.ndarray,
     fluorescence_data: np.ndarray,
@@ -178,7 +228,12 @@ def detect_no_signal_samples(
                 efficiency = fit_info.get('efficiency', None)
 
                 # Check 1: Poor exponential fit R²
-                if r2_exp < min_r2:
+                # BUT: if the range is substantial (>10% of plate max),
+                # the well clearly has signal regardless of exponential
+                # fit quality.  Background-subtracted data and unusual
+                # curve shapes can cause poor exponential R² even for
+                # wells with obvious amplification.
+                if r2_exp < min_r2 and F_range_pct < 10.0:
                     obvious_no_signal[name] = {
                         'reason': f'Poor exponential fit (R²={r2_exp:.3f}, range {F_range_pct:.1f}% of max)',
                         'F_range': F_range,
@@ -199,7 +254,7 @@ def detect_no_signal_samples(
                 # Use threshold: exponential must be at least 0.05 R² better
                 r2_improvement = r2_exp - r2_linear
 
-                if r2_improvement < 0.05:  # Exponential barely better than linear
+                if r2_improvement < 0.05 and F_range_pct < 10.0:  # Exponential barely better than linear
                     obvious_no_signal[name] = {
                         'reason': f'Linear drift only (R²_exp={r2_exp:.3f} vs R²_linear={r2_linear:.3f}, Δ={r2_improvement:.3f})',
                         'F_range': F_range,

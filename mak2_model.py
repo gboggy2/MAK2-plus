@@ -248,9 +248,50 @@ def find_slope_threshold_cycle(
     return min(cutoff_idx, len(fluorescence) - 1)
 
 
+def pre_estimate_background(
+    cycles: np.ndarray,
+    fluorescence: np.ndarray,
+    bl_start_idx: int,
+    bl_end_idx: int,
+) -> tuple:
+    """
+    Estimate linear background (slope, intercept) from a known baseline region.
+
+    Fits a linear regression to fluorescence[bl_start_idx:bl_end_idx] using
+    the corresponding cycle numbers as x.  This is the same calculation the
+    instrument performs for its per-well baseline correction.
+
+    Parameters
+    ----------
+    cycles : np.ndarray
+        Full cycle array (cycle numbers, not indices).
+    fluorescence : np.ndarray
+        Full fluorescence array.
+    bl_start_idx : int
+        Start index (inclusive) of the baseline region.
+    bl_end_idx : int
+        End index (exclusive) of the baseline region.
+
+    Returns
+    -------
+    slope : float
+        RFU per cycle (or Rn per cycle after normalization).
+    intercept : float
+        Extrapolated fluorescence at cycle 0.
+    """
+    bl_cycles = cycles[bl_start_idx:bl_end_idx].astype(float)
+    bl_fluor  = fluorescence[bl_start_idx:bl_end_idx].astype(float)
+    if len(bl_cycles) < 2:
+        return 0.0, float(np.mean(fluorescence))
+    coeffs = np.polyfit(bl_cycles, bl_fluor, 1)
+    return float(coeffs[0]), float(coeffs[1])
+
+
 def estimate_D0_bounds(
     cycles: np.ndarray,
-    fluorescence: np.ndarray
+    fluorescence: np.ndarray,
+    bg_slope: float = None,
+    bg_intercept: float = None,
 ) -> tuple:
     """
     Estimate bounds on initial DNA fluorescence (D0) by fitting exponentials.
@@ -267,7 +308,13 @@ def estimate_D0_bounds(
         Cycle numbers
     fluorescence : np.ndarray
         Fluorescence measurements
-        
+    bg_slope : float, optional
+        Pre-estimated background slope (RFU/cycle) from pre_estimate_background().
+        When provided, this is used for detrending instead of fitting the first
+        10 cycles internally — more accurate for wells with known baseline regions.
+    bg_intercept : float, optional
+        Pre-estimated background intercept from pre_estimate_background().
+
     Returns
     -------
     D0_lower : float
@@ -351,35 +398,40 @@ def estimate_D0_bounds(
         # Use 5-sigma threshold (more conservative than 3-sigma)
         slope_threshold = baseline_slope_median + 5 * baseline_slope_std
         
-        # IMPROVED: For strong drifting baselines, detrend the data first
-        # Fit linear trend to early cycles and subtract it
+        # Detrend the data to find amplification onset.
+        # Use pre-estimated background when available (from metadata baseline region)
+        # — more accurate than fitting only the first 10 cycles internally.
         baseline_fluor_cycles = min(10, len(fluorescence) // 4)
-        early_cycles = cycles[:baseline_fluor_cycles]
-        early_fluor = fluorescence[:baseline_fluor_cycles]
-        
-        # Fit linear trend to early data
-        if len(early_fluor) >= 2:
-            trend_coeffs = np.polyfit(early_cycles, early_fluor, 1)
-            trend_slope = trend_coeffs[0]
-            trend_intercept = trend_coeffs[1]
-            
-            # Detrend ALL fluorescence data
+
+        if bg_slope is not None and bg_intercept is not None:
+            # Use externally supplied linear background estimate
+            trend_slope     = bg_slope
+            trend_intercept = bg_intercept
             fluorescence_detrended = fluorescence - (trend_intercept + trend_slope * cycles)
-            
-            # Calculate baseline stats from detrended data
-            baseline_fluor_values = fluorescence_detrended[:baseline_fluor_cycles]
-            baseline_fluor_median = np.median(baseline_fluor_values)
-            baseline_fluor_std = np.std(baseline_fluor_values)
-            
-            # Fluorescence must be at least 5σ above baseline (more conservative for detrended)
-            fluor_threshold = baseline_fluor_median + 5 * baseline_fluor_std
+            baseline_fluor_values  = fluorescence_detrended[:baseline_fluor_cycles]
+            baseline_fluor_median  = np.median(baseline_fluor_values)
+            baseline_fluor_std     = np.std(baseline_fluor_values)
+            fluor_threshold        = baseline_fluor_median + 5 * baseline_fluor_std
         else:
-            # Fallback: no detrending
-            baseline_fluor_values = fluorescence[:baseline_fluor_cycles]
-            baseline_fluor_median = np.median(baseline_fluor_values)
-            baseline_fluor_std = np.std(baseline_fluor_values)
-            fluor_threshold = baseline_fluor_median + 3 * baseline_fluor_std
-            fluorescence_detrended = fluorescence
+            # Fall back: fit linear trend to first ~10 cycles
+            early_cycles = cycles[:baseline_fluor_cycles]
+            early_fluor  = fluorescence[:baseline_fluor_cycles]
+            if len(early_fluor) >= 2:
+                trend_coeffs    = np.polyfit(early_cycles, early_fluor, 1)
+                trend_slope     = trend_coeffs[0]
+                trend_intercept = trend_coeffs[1]
+                fluorescence_detrended = fluorescence - (trend_intercept + trend_slope * cycles)
+                baseline_fluor_values  = fluorescence_detrended[:baseline_fluor_cycles]
+                baseline_fluor_median  = np.median(baseline_fluor_values)
+                baseline_fluor_std     = np.std(baseline_fluor_values)
+                fluor_threshold        = baseline_fluor_median + 5 * baseline_fluor_std
+            else:
+                # Fallback: no detrending
+                baseline_fluor_values  = fluorescence[:baseline_fluor_cycles]
+                baseline_fluor_median  = np.median(baseline_fluor_values)
+                baseline_fluor_std     = np.std(baseline_fluor_values)
+                fluor_threshold        = baseline_fluor_median + 3 * baseline_fluor_std
+                fluorescence_detrended = fluorescence
         
         # Require 3 consecutive windows above threshold (sustained increase)
         baseline_end_idx = None
@@ -438,6 +490,12 @@ def estimate_D0_bounds(
     F_min = fluorescence.min()
     F_max = fluorescence.max()
     F_range = F_max - F_min
+
+    # D0 upper bound must scale with the fluorescence range so that both
+    # normalized Rn data (~1–3 RFU) and raw ABI multicomponent data
+    # (~10 k – 1 M RFU) can be fitted without the initial guess immediately
+    # violating the bound and crashing scipy's curve_fit.
+    D0_bound_upper = max(10.0, F_range * 100)
     
     # Find where real signal starts (will be computed later, so estimate it here)
     min_signal_for_bg = max(0.002, F_min + 0.02 * F_range)
@@ -521,37 +579,72 @@ def estimate_D0_bounds(
         first_signal_cycle = 0
         print(f"  Warning: No cycles above threshold {min_signal_threshold:.4f}")
     
-    # Start exponential fitting from cycle 0 for all data types
-    # The model with background fitting can handle baseline cycles
-    exp_start_cycle = 0
-    
-    # Now fit exponentials: from cycle 0 through cycles into exponential phase
-    # Efficiency: up to 30% of fluorescence range
+    # ── Find the exponential region by scanning from the LAST cycle ──────
+    # The inflection (max slope) of the S-curve is the boundary between
+    # exponential growth and primer-depletion plateau.  Searching from the
+    # right avoids early-cycle noise spikes that can masquerade as growth.
     min_points = 5
-    threshold_30 = F_min + 0.30 * F_range
-    above_30 = np.where(fluorescence > threshold_30)[0]
-    
-    if len(above_30) > 0:
-        exp_end_upper = min(above_30[0], len(cycles) - 1)
+
+    if len(fluorescence) >= 5:
+        _raw_grad  = np.gradient(fluorescence)
+        _kern      = np.ones(5) / 5.0
+        _smooth_g  = np.convolve(_raw_grad, _kern, mode='same')
+        # Scan from right to find inflection peak
+        _best_val = _smooth_g[-1]
+        _best_idx = len(_smooth_g) - 1
+        _found_peak = False
+        for _j in range(len(_smooth_g) - 2, -1, -1):
+            if _smooth_g[_j] > _best_val:
+                _best_val = _smooth_g[_j]
+                _best_idx = _j
+            elif _best_val > 0 and _smooth_g[_j] < _best_val * 0.5:
+                _found_peak = True
+                break
+        inflection_idx = _best_idx if _found_peak else int(np.argmax(_smooth_g))
     else:
-        exp_end_upper = min(baseline_end_idx + 10, len(cycles) - 1)
-    
-    # Make sure we have enough range from exp_start_cycle
+        inflection_idx = len(fluorescence) - 1
+
+    print(f"  Inflection (max slope from right): cycle index {inflection_idx} "
+          f"(cycle {cycles[inflection_idx]:.0f})")
+
+    # Efficiency region: up to the inflection, starting where fluorescence
+    # first rises above the baseline noise level.  Use the baseline median
+    # + 5× baseline SD as the onset threshold so we detect real signal,
+    # not baseline drift.
+    _bl_median = np.median(fluorescence[:baseline_end_idx]) if baseline_end_idx > 0 else baseline
+    _bl_sd     = np.std(fluorescence[:baseline_end_idx]) if baseline_end_idx >= 3 else F_range * 0.01
+    onset_thresh = _bl_median + 5 * _bl_sd
+    # Search only up to the inflection
+    onset_candidates = np.where(fluorescence[:inflection_idx + 1] > onset_thresh)[0]
+    if len(onset_candidates) > 0:
+        exp_start_cycle = max(0, onset_candidates[0] - 1)
+    else:
+        # No clear onset — start a few cycles before inflection
+        exp_start_cycle = max(0, inflection_idx - min_points - 3)
+
+    # End at the inflection (or just past it — efficiency drops there)
+    exp_end_upper = inflection_idx
+
+    # Make sure we have enough points
     if exp_end_upper - exp_start_cycle < min_points:
-        exp_end_upper = min(exp_start_cycle + min_points + 3, len(cycles) - 1)
-    
+        exp_start_cycle = max(0, exp_end_upper - min_points - 3)
+
     exp_region_upper = np.arange(exp_start_cycle, exp_end_upper + 1)
-    
-    # Perfect doubling: 4 cycles BEFORE efficiency endpoint
-    # This captures the early exponential phase before efficiency < 2
-    exp_end_lower = max(exp_start_cycle + min_points, exp_end_upper - 4)
+
+    # Perfect doubling: first ~6 cycles of the exponential region
+    # (early growth before primer depletion reduces efficiency below 2)
+    exp_end_lower = min(exp_start_cycle + min_points + 1, exp_end_upper)
     exp_region_lower = np.arange(exp_start_cycle, exp_end_lower + 1)
-    
+
     # Ensure minimum points
     if len(exp_region_lower) < min_points:
-        exp_region_lower = np.arange(exp_start_cycle, min(exp_start_cycle + min_points, len(cycles)))
+        exp_region_lower = np.arange(
+            max(0, exp_end_upper - min_points),
+            min(exp_end_upper + 1, len(cycles)))
     if len(exp_region_upper) < min_points:
-        exp_region_upper = np.arange(exp_start_cycle, min(exp_start_cycle + min_points + 3, len(cycles)))
+        exp_region_upper = np.arange(
+            max(0, exp_end_upper - min_points - 3),
+            min(exp_end_upper + 1, len(cycles)))
     
     threshold = fluorescence[baseline_end_idx] if baseline_end_idx < len(fluorescence) else baseline
     
@@ -562,9 +655,10 @@ def estimate_D0_bounds(
     cycles_upper = cycles[exp_region_upper]
     fluor_upper = fluorescence[exp_region_upper]
     
-    # Shift cycles so they start at n=0 for numerical stability
-    # Always use cycles[0] as offset for consistent behavior
-    cycle_offset = cycles[0]
+    # Shift cycles so they start at n=0 for numerical stability.
+    # Use the start of the exponential region (not cycles[0]) so that
+    # 2^n / E^n don't overflow for late-amplifying wells.
+    cycle_offset = cycles[exp_region_lower[0]]
     cycles_lower_shifted = cycles_lower - cycle_offset
     cycles_upper_shifted = cycles_upper - cycle_offset
     
@@ -609,8 +703,8 @@ def estimate_D0_bounds(
                     fluor_lower,
                     p0=[D0_init, bg_int_init, bg_slope_init],
                     bounds=(
-                        [1e-15, bg_intercept_min, bg_slope_min],  # Lower D0 bound for numerical stability
-                        [10.0, bg_intercept_max, bg_slope_max]
+                        [1e-15, bg_intercept_min, bg_slope_min],
+                        [D0_bound_upper, bg_intercept_max, bg_slope_max]
                     ),
                     maxfev=5000
                 )
@@ -682,8 +776,8 @@ def estimate_D0_bounds(
                     fluor_upper,
                     p0=[D0_init, E_init, bg_int_init, bg_slope_init],
                     bounds=(
-                        [1e-15, 1.0, bg_intercept_min, bg_slope_min],  # Lower D0 bound for numerical stability
-                        [10.0, 2.0, bg_intercept_max, bg_slope_max]
+                        [1e-15, 1.0, bg_intercept_min, bg_slope_min],
+                        [D0_bound_upper, 2.0, bg_intercept_max, bg_slope_max]
                     ),
                     maxfev=5000
                 )
@@ -748,9 +842,11 @@ def estimate_D0_bounds(
         print(f"    Perfect doubling (lower): {D0_lower:.2e}")
         print(f"    Efficiency (upper): {D0_upper:.2e}")
 
-        # Add some margin (10x on each side) - allow D0 to go very low if needed
+        # Add some margin (10x on each side) - allow D0 to go very low if needed.
+        # Upper cap scales with the fluorescence range so raw ABI data (F_range ~1e5)
+        # is not arbitrarily capped at 100 RFU.
         D0_lower_bounded = D0_lower / 10
-        D0_upper_bounded = min(100.0, D0_upper * 10)  # Cap at reasonable max
+        D0_upper_bounded = min(D0_bound_upper, D0_upper * 10)
         
         print(f"  After adding margin (10x):")
         print(f"    Lower bound: {D0_lower_bounded:.2e}")
@@ -800,8 +896,8 @@ def estimate_D0_bounds(
             print(f"  Baseline ends at cycle {baseline_end_idx}")
         else:
             print(f"  Baseline end at cycle {baseline_end_idx} (fallback: no slope change detected)")
-        print(f"  30% fluorescence threshold: {threshold_30:.4f} (reached at cycle {exp_end_upper})")
-        print(f"  Perfect doubling fit: cycle {cycles_lower[0]:.0f} to {cycles_lower[-1]:.0f} (efficiency - 4), R² = {r2_lower:.4f}")
+        print(f"  Inflection at cycle index {inflection_idx} (cycle {cycles[inflection_idx]:.0f})")
+        print(f"  Perfect doubling fit: cycle {cycles_lower[0]:.0f} to {cycles_lower[-1]:.0f}, R² = {r2_lower:.4f}")
         print(f"    Fitted background: intercept={F_bg_intercept1:.4f}, slope={F_bg_slope1:.6f}")
         
         # Check if parameters hit bounds
@@ -810,7 +906,7 @@ def estimate_D0_bounds(
         if abs(F_bg_slope1 - bg_slope_min) < 0.00001 or abs(F_bg_slope1 - bg_slope_max) < 0.00001:
             print(f"    ⚠️  WARNING: Slope at bound!")
             
-        print(f"  Efficiency fit: cycle {cycles_upper[0]:.0f} to {cycles_upper[-1]:.0f} (to 30% threshold), R² = {r2_upper:.4f}, E = {efficiency:.2f}")
+        print(f"  Efficiency fit: cycle {cycles_upper[0]:.0f} to {cycles_upper[-1]:.0f} (to inflection), R² = {r2_upper:.4f}, E = {efficiency:.2f}")
         print(f"    Fitted background: intercept={F_bg_intercept2:.4f}, slope={F_bg_slope2:.6f}")
         
         # Check if parameters hit bounds

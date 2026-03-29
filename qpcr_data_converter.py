@@ -3,20 +3,24 @@ qPCR Data Converter - Handle various instrument export formats
 
 Supports multiple formats:
 - Simple format: Column 1 = cycles, other columns = samples
-- Wide format: Rows = cycles, columns = wells/samples  
+- Wide format: Rows = cycles, columns = wells/samples
 - Plate reader format: Multi-sheet or sectioned data
 - CFX format: Bio-Rad CFX Manager exports
-- QuantStudio format: Applied Biosystems exports
+- QuantStudio format: Applied Biosystems exports (Excel)
+- ABI CSV format: Applied Biosystems CSV exports with [Section] headers
+  (Multicomponent, Amplification Data)
 
 Author: Greg Boggy, PhD
 Date: January 28, 2026
 """
 
-import pandas as pd
-import numpy as np
-from typing import Dict, Tuple, List, Optional, Union
-from pathlib import Path
 import io
+import re
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union
+
+import numpy as np
+import pandas as pd
 
 
 class QPCRDataConverter:
@@ -138,7 +142,17 @@ class QPCRDataConverter:
         try:
             if isinstance(filepath, io.BytesIO):
                 # Streamlit uploaded file - try both formats
-                # First, check if it's an Excel file with multiple sheets (QuantStudio)
+                # First, check for ABI CSV format (# comments + [Section] markers)
+                try:
+                    result = self._try_abi_csv(filepath)
+                    filepath.seek(0)
+                    section_name, section_df, header_meta = result
+                    return self._load_from_abi_csv(section_name, section_df, header_meta)
+                except Exception:
+                    filepath.seek(0)
+                    pass
+
+                # Next, check if it's an Excel file with multiple sheets (QuantStudio)
                 try:
                     cycles, samples, extra_info = self._try_quantstudio_multisheet(filepath)
                     self.detected_format = 'quantstudio'
@@ -199,6 +213,12 @@ class QPCRDataConverter:
                         df = pd.read_excel(filepath, engine='xlrd')
                         
             elif str(filepath).endswith('.csv'):
+                # Try ABI CSV format first
+                try:
+                    section_name, section_df, header_meta = self._try_abi_csv(filepath)
+                    return self._load_from_abi_csv(section_name, section_df, header_meta)
+                except Exception:
+                    pass
                 df = pd.read_csv(filepath)
             else:
                 # Excel file - try multi-sheet QuantStudio first
@@ -650,6 +670,363 @@ class QPCRDataConverter:
         except Exception as e:
             raise ValueError(f"QuantStudio multi-sheet parsing failed: {str(e)}")
     
+    def _load_from_abi_csv(
+        self,
+        section_name: str,
+        section_df: pd.DataFrame,
+        header_meta: Dict[str, str]
+    ) -> Tuple[np.ndarray, Dict[str, np.ndarray], Dict]:
+        """
+        Convert a parsed ABI CSV section into the standard load_from_file() return format.
+        """
+        if section_name == 'Multicomponent':
+            cycles, samples_by_channel, dye_columns, passive_reference = \
+                self._parse_abi_multicomponent(section_df, header_meta)
+
+            # Channels available for fitting = all channels except passive reference
+            fitting_channels = [c for c in dye_columns if c != passive_reference]
+
+            self.detected_format = 'abi_multicomponent'
+            self.n_cycles = len(cycles)
+            self.n_samples = 0  # populated after channel selection
+
+            extra_info = {
+                'has_channels': True,
+                'channels': fitting_channels,
+                'passive_reference': passive_reference,
+                'all_channels': dye_columns,
+                'samples_by_channel': samples_by_channel,
+                'cycles': cycles,
+                'header_meta': header_meta,
+                'section': section_name,
+            }
+
+            metadata = {
+                'format': 'abi_multicomponent',
+                'n_samples': 0,
+                'n_cycles': self.n_cycles,
+                'sample_names': [],
+                'cycle_range': (cycles.min(), cycles.max()),
+                'extra_info': extra_info,
+                'requires_channel_selection': True,
+                'requires_target_selection': False,
+            }
+
+            return cycles, {}, metadata
+
+        else:
+            # Amplification Data or other single-channel section
+            cycles, samples = self._parse_abi_amplification(section_df, header_meta)
+
+            if self.add_offset:
+                for name in samples:
+                    samples[name] = samples[name] + self.offset_value
+
+            self.detected_format = 'abi_amplification'
+            self.n_samples = len(samples)
+            self.n_cycles = len(cycles)
+
+            metadata = {
+                'format': 'abi_amplification',
+                'n_samples': self.n_samples,
+                'n_cycles': self.n_cycles,
+                'sample_names': list(samples.keys()),
+                'cycle_range': (cycles.min(), cycles.max()),
+                'requires_channel_selection': False,
+                'requires_target_selection': False,
+            }
+
+            return cycles, samples, metadata
+
+    def _try_abi_csv(
+        self,
+        filepath: Union[str, Path, io.BytesIO]
+    ) -> Tuple[str, pd.DataFrame, Dict[str, str]]:
+        """
+        Try to parse an Applied Biosystems CSV export with #-comment headers
+        and [Section Name] markers.
+
+        Returns
+        -------
+        section_name : str
+            Name of the section used (e.g. 'Multicomponent', 'Amplification Data')
+        section_df : pd.DataFrame
+            Parsed data for that section
+        header_meta : Dict[str, str]
+            Key-value pairs from the # comment header lines
+            (e.g. {'Passive Reference': 'ROX', 'Instrument Type': '7500 Fast System'})
+
+        Raises
+        ------
+        ValueError
+            If the file does not look like an ABI CSV or contains no usable section
+        """
+        # Read raw lines
+        if isinstance(filepath, io.BytesIO):
+            filepath.seek(0)
+            raw = filepath.read().decode('utf-8', errors='replace')
+            filepath.seek(0)
+        else:
+            with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+                raw = f.read()
+
+        lines = raw.splitlines()
+
+        # Must have at least some # comment lines to be an ABI CSV
+        comment_lines = [l for l in lines if l.startswith('#')]
+        if not comment_lines:
+            raise ValueError("Not an ABI CSV: no # comment header lines found")
+
+        # Parse header metadata
+        header_meta: Dict[str, str] = {}
+        for line in comment_lines:
+            # Format: "# Key: Value"
+            content = line[1:].strip()
+            if ':' in content:
+                key, _, value = content.partition(':')
+                header_meta[key.strip()] = value.strip()
+
+        # Split non-comment lines into sections by [Section Name] markers
+        # A section marker is a line that, when stripped of quotes and whitespace,
+        # matches \[.*\]
+        sections: Dict[str, List[str]] = {}
+        current_section: Optional[str] = None
+        current_lines: List[str] = []
+
+        for line in lines:
+            if line.startswith('#') or line.strip() == '':
+                continue
+            stripped = line.strip().strip('"')
+            m = re.match(r'^\[(.+)\]$', stripped)
+            if m:
+                # Save previous section
+                if current_section is not None and current_lines:
+                    sections[current_section] = current_lines
+                current_section = m.group(1)
+                current_lines = []
+            else:
+                if current_section is not None:
+                    current_lines.append(line)
+
+        # Save last section
+        if current_section is not None and current_lines:
+            sections[current_section] = current_lines
+
+        if not sections:
+            raise ValueError("Not an ABI CSV: no [Section] markers found")
+
+        # Priority order for sections to use for fitting
+        priority = ['Multicomponent', 'Amplification Data', 'Raw Data']
+        chosen_section = None
+        for name in priority:
+            if name in sections:
+                chosen_section = name
+                break
+
+        if chosen_section is None:
+            # Fall back to whatever we found
+            chosen_section = next(iter(sections))
+
+        # Parse the chosen section as CSV
+        section_text = '\n'.join(sections[chosen_section])
+        section_df = pd.read_csv(io.StringIO(section_text))
+
+        return chosen_section, section_df, header_meta
+
+    def _parse_abi_multicomponent(
+        self,
+        section_df: pd.DataFrame,
+        header_meta: Dict[str, str]
+    ) -> Tuple[np.ndarray, Dict[str, Dict[str, np.ndarray]], List[str], Optional[str]]:
+        """
+        Parse a [Multicomponent] section DataFrame.
+
+        Returns
+        -------
+        cycles : np.ndarray
+        samples_by_channel : Dict[channel_name → Dict[well_pos → np.ndarray]]
+        dye_columns : List[str]
+            All dye channel names found (including passive reference)
+        passive_reference : str or None
+            Name of the passive reference dye (e.g. 'ROX'), or None
+        """
+        # Identify structural columns
+        non_dye = {'Well', 'Well Position', 'Stage Number', 'Step Number', 'Cycle Number',
+                   'well', 'well position', 'stage number', 'step number', 'cycle number'}
+
+        # Find the cycle column
+        cycle_col = None
+        for col in section_df.columns:
+            if col.strip().lower() in ('cycle number', 'cycle'):
+                cycle_col = col
+                break
+        if cycle_col is None:
+            raise ValueError("No 'Cycle Number' column found in [Multicomponent] section")
+
+        # Find well position column
+        well_col = None
+        for col in section_df.columns:
+            if col.strip().lower() in ('well position',):
+                well_col = col
+                break
+        if well_col is None:
+            for col in section_df.columns:
+                if col.strip().lower() == 'well':
+                    well_col = col
+                    break
+        if well_col is None:
+            raise ValueError("No 'Well Position' or 'Well' column found in [Multicomponent] section")
+
+        # Dye columns = everything else
+        dye_columns = [
+            col for col in section_df.columns
+            if col.strip().lower() not in non_dye
+        ]
+        if not dye_columns:
+            raise ValueError("No dye channel columns found in [Multicomponent] section")
+
+        # Convert to numeric
+        section_df = section_df.copy()
+        section_df[cycle_col] = pd.to_numeric(section_df[cycle_col], errors='coerce')
+        for col in dye_columns:
+            section_df[col] = pd.to_numeric(section_df[col], errors='coerce')
+        section_df = section_df.dropna(subset=[cycle_col, well_col])
+
+        # Get cycle array from first well
+        first_well = section_df[well_col].iloc[0]
+        cycles = section_df[section_df[well_col] == first_well][cycle_col].values.astype(float)
+
+        # Build samples_by_channel
+        samples_by_channel: Dict[str, Dict[str, np.ndarray]] = {}
+        for dye in dye_columns:
+            well_dict: Dict[str, np.ndarray] = {}
+            for well_pos, group in section_df.groupby(well_col):
+                group_sorted = group.sort_values(cycle_col)
+                well_dict[str(well_pos)] = group_sorted[dye].values.astype(float)
+            samples_by_channel[dye] = well_dict
+
+        # Passive reference from header
+        passive_reference = header_meta.get('Passive Reference', None)
+        if passive_reference:
+            passive_reference = passive_reference.strip()
+
+        return cycles, samples_by_channel, dye_columns, passive_reference
+
+    def _parse_abi_amplification(
+        self,
+        section_df: pd.DataFrame,
+        header_meta: Dict[str, str]
+    ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+        """
+        Parse an [Amplification Data] section DataFrame (single ΔRn channel).
+
+        Returns
+        -------
+        cycles : np.ndarray
+        samples : Dict[well_pos → np.ndarray]
+        """
+        # Find cycle column
+        cycle_col = None
+        for col in section_df.columns:
+            if col.strip().lower() in ('cycle number', 'cycle'):
+                cycle_col = col
+                break
+        if cycle_col is None:
+            raise ValueError("No cycle column found in [Amplification Data] section")
+
+        # Find well position column
+        well_col = None
+        for col in section_df.columns:
+            if col.strip().lower() in ('well position',):
+                well_col = col
+                break
+        if well_col is None:
+            for col in section_df.columns:
+                if col.strip().lower() == 'well':
+                    well_col = col
+                    break
+
+        # Find fluorescence column (ΔRn preferred over Rn)
+        fluor_col = None
+        for candidate in section_df.columns:
+            c = candidate.strip().lower()
+            if 'delta' in c and 'rn' in c:
+                fluor_col = candidate
+                break
+        if fluor_col is None:
+            for candidate in section_df.columns:
+                c = candidate.strip().lower()
+                if 'rn' in c or 'fluor' in c:
+                    fluor_col = candidate
+                    break
+        if fluor_col is None:
+            fluor_col = section_df.columns[-1]
+
+        section_df = section_df.copy()
+        section_df[cycle_col] = pd.to_numeric(section_df[cycle_col], errors='coerce')
+        section_df[fluor_col] = pd.to_numeric(section_df[fluor_col], errors='coerce')
+        section_df = section_df.dropna(subset=[cycle_col])
+
+        first_well = section_df[well_col].iloc[0]
+        cycles = section_df[section_df[well_col] == first_well][cycle_col].values.astype(float)
+
+        samples: Dict[str, np.ndarray] = {}
+        for well_pos, group in section_df.groupby(well_col):
+            group_sorted = group.sort_values(cycle_col)
+            samples[str(well_pos)] = group_sorted[fluor_col].values.astype(float)
+
+        return cycles, samples
+
+    def filter_by_channel(
+        self,
+        extra_info: Dict,
+        channel_name: str,
+        normalize_by_reference: bool = False
+    ) -> Tuple[np.ndarray, Dict[str, np.ndarray], None]:
+        """
+        Extract samples for a single dye channel from ABI Multicomponent data.
+
+        Parameters
+        ----------
+        extra_info : Dict
+            extra_info dict returned by load_from_file() when requires_channel_selection=True
+        channel_name : str
+            Dye channel to extract (e.g. 'FAM', 'JOE')
+        normalize_by_reference : bool
+            If True, divide fluorescence by the passive reference channel (e.g. ROX)
+            to correct for well-to-well volume variation
+
+        Returns
+        -------
+        cycles : np.ndarray
+        samples : Dict[str, np.ndarray]
+        None
+        """
+        if not extra_info or not extra_info.get('has_channels'):
+            raise ValueError("No channel information available in extra_info")
+
+        samples_by_channel = extra_info['samples_by_channel']
+        if channel_name not in samples_by_channel:
+            raise ValueError(f"Channel '{channel_name}' not found. Available: {list(samples_by_channel.keys())}")
+
+        cycles = extra_info['cycles']
+        well_dict = samples_by_channel[channel_name]
+
+        samples: Dict[str, np.ndarray] = {}
+        for well_pos, arr in well_dict.items():
+            fluor = arr.copy()
+            if normalize_by_reference:
+                ref = extra_info.get('passive_reference')
+                if ref and ref in samples_by_channel:
+                    ref_arr = samples_by_channel[ref].get(well_pos)
+                    if ref_arr is not None and np.all(ref_arr > 0):
+                        fluor = fluor / ref_arr
+            if self.add_offset:
+                fluor = fluor + self.offset_value
+            samples[well_pos] = fluor
+
+        return cycles, samples, None
+
     def get_sample_info(self, samples: Dict[str, np.ndarray]) -> pd.DataFrame:
         """
         Generate summary information about loaded samples.
@@ -837,6 +1214,109 @@ class QPCRDataConverter:
             filtered[name] = fluor
         
         return filtered
+
+
+def load_abi_results_csv(file) -> Dict:
+    """
+    Parse an ABI results CSV (exported from QuantStudio / StepOnePlus results table).
+
+    The file has columns:
+        Well, Sample Name, Target Name, Task, Reporter, Quencher,
+        C_ (Ct), C_ Mean, C_ SD, Quantity, ...,
+        Ct Threshold, Baseline Start, Baseline End,
+        HIGHSD, NOAMP, EXPFAIL
+
+    Returns
+    -------
+    dict with keys:
+        'well_meta'           : {f"{Reporter}_{Well}": per-well dict}
+        'sample_metadata'     : same dict — drop-in for st.session_state.sample_metadata
+        'channel_thresholds'  : {'FAM': 0.1, 'JOE': 0.04, ...}
+        'n_wells'             : int
+    """
+    if hasattr(file, 'read'):
+        content = file.read()
+        if isinstance(content, bytes):
+            content = content.decode('utf-8', errors='replace')
+        df = pd.read_csv(io.StringIO(content))
+    else:
+        df = pd.read_csv(file)
+
+    # Normalise column names (strip whitespace)
+    df.columns = [c.strip() for c in df.columns]
+
+    # The Ct column is labelled "C_" in ABI exports
+    ct_col = 'C_'
+    if ct_col not in df.columns:
+        # Fallback: accept 'CT', 'Ct', 'Cq' etc.
+        for candidate in ['CT', 'Ct', 'Cq', 'Cp']:
+            if candidate in df.columns:
+                ct_col = candidate
+                break
+
+    required = {'Well', 'Reporter'}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"ABI results CSV missing required columns: {missing}")
+
+    well_meta: Dict[str, Dict] = {}
+    channel_thresholds: Dict[str, float] = {}
+
+    for _, row in df.iterrows():
+        well = str(row.get('Well', '')).strip()
+        reporter = str(row.get('Reporter', '')).strip()
+        if not well or not reporter:
+            continue
+
+        key = f"{reporter}_{well}"
+
+        # Ct value
+        raw_ct = row.get(ct_col, '')
+        try:
+            ct_val = float(raw_ct)
+        except (ValueError, TypeError):
+            ct_val = None   # "Undetermined"
+
+        # Quantity
+        raw_qty = row.get('Quantity', '')
+        try:
+            qty_val = float(raw_qty)
+        except (ValueError, TypeError):
+            qty_val = float('nan')
+
+        # Ct threshold (per-channel, constant for all wells of same reporter)
+        raw_thresh = row.get('Ct Threshold', '')
+        try:
+            thresh_val = float(raw_thresh)
+            channel_thresholds[reporter] = thresh_val
+        except (ValueError, TypeError):
+            thresh_val = float('nan')
+
+        task = str(row.get('Task', '')).strip()
+        sample_name = str(row.get('Sample Name', '')).strip()
+        target_name = str(row.get('Target Name', '')).strip()
+
+        meta_entry = {
+            'Sample Name':    sample_name,
+            'Target Name':    target_name,
+            'Task':           task,
+            'Quantity':       qty_val,
+            'Ct_instrument':  ct_val,
+            'Ct Threshold':   thresh_val,
+            'Baseline Start': row.get('Baseline Start', np.nan),
+            'Baseline End':   row.get('Baseline End', np.nan),
+            'HIGHSD':         str(row.get('HIGHSD', 'N')).strip().upper() == 'Y',
+            'NOAMP':          str(row.get('NOAMP', 'N')).strip().upper() == 'Y',
+            'EXPFAIL':        str(row.get('EXPFAIL', 'N')).strip().upper() == 'Y',
+        }
+        well_meta[key] = meta_entry
+
+    return {
+        'well_meta':          well_meta,
+        'sample_metadata':    well_meta,   # alias — same object
+        'channel_thresholds': channel_thresholds,
+        'n_wells':            len(well_meta),
+    }
 
 
 def load_qpcr_file(

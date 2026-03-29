@@ -697,7 +697,7 @@ def build_limited_dilution_calibration(
 # ── Diagnostic Calibration Plot ──────────────────────────────────────────────
 
 
-def plot_calibration(calibration: Dict) -> go.Figure:
+def plot_calibration(calibration: Dict, channel_label: str = "") -> go.Figure:
     """
     Create diagnostic log-log scatter plot of standard curve.
 
@@ -709,6 +709,8 @@ def plot_calibration(calibration: Dict) -> go.Figure:
     ----------
     calibration : dict
         Output from build_standard_curve().
+    channel_label : str
+        Optional channel/target label to include in the title (e.g. " (FAM)").
 
     Returns
     -------
@@ -830,7 +832,7 @@ def plot_calibration(calibration: Dict) -> go.Figure:
     )
 
     fig.update_layout(
-        title='Standard Curve: D0 vs Known Copy Number',
+        title=f'Standard Curve: D0 vs Known Copy Number{channel_label}',
         xaxis_title='log\u2081\u2080(D0) from MAK2 fit',
         yaxis_title='log\u2081\u2080(Known Copy Number)',
         height=500,
@@ -844,7 +846,7 @@ def plot_calibration(calibration: Dict) -> go.Figure:
 # ── Ct Standard Curve Plot ───────────────────────────────────────────────────
 
 
-def plot_ct_calibration(ct_calibration: Dict) -> go.Figure:
+def plot_ct_calibration(ct_calibration: Dict, channel_label: str = "") -> go.Figure:
     """
     Create Ct standard curve plot: Ct (x) vs log10(Known Copies) (y).
 
@@ -962,7 +964,7 @@ def plot_ct_calibration(ct_calibration: Dict) -> go.Figure:
     )
 
     fig.update_layout(
-        title='Ct Standard Curve',
+        title=f'Ct Standard Curve{channel_label}',
         xaxis_title='Ct (threshold cycle)',
         yaxis_title='log\u2081\u2080(Known Copy Number)',
         height=500,

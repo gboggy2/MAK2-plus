@@ -70,6 +70,7 @@ class MAK2Optimizer:
         r2_threshold: float = 0.999,
         verbose: bool = False,
         fix_background: bool = True,  # Fix background with adaptive fallback
+        fixed_background_values: Optional[Dict[str, float]] = None,  # Exact bg values to fix
         disabled_tiers: Optional[Set[str]] = None  # For ablation testing
     ) -> Dict[str, float]:
         """
@@ -288,8 +289,11 @@ class MAK2Optimizer:
         
         # Handle fixed background parameters
         if fix_background:
-            # Extract background values from exponential fits
-            if self.analytical_estimates is not None:
+            if fixed_background_values is not None:
+                # Use exact values passed by caller (from linear regression)
+                fixed_F_bg_intercept = fixed_background_values['F_bg_intercept']
+                fixed_F_bg_slope = fixed_background_values['F_bg_slope']
+            elif self.analytical_estimates is not None:
                 # Use values from analytical estimation
                 fixed_F_bg_intercept = self.analytical_estimates['F_bg_intercept']
                 fixed_F_bg_slope = self.analytical_estimates['F_bg_slope']
@@ -381,6 +385,15 @@ class MAK2Optimizer:
             print(f"\n📊 EVALUATING {n_lhs_samples} LHS SAMPLES...")
             lhs_scores = []
 
+            # Use fixed background values for LHS evaluation when available,
+            # otherwise fall back to bounds midpoint
+            if hasattr(self, 'fixed_background') and self.fixed_background is not None:
+                _lhs_bg_int = self.fixed_background['F_bg_intercept']
+                _lhs_bg_slope = self.fixed_background['F_bg_slope']
+            else:
+                _lhs_bg_int = (original_bounds['F_bg_intercept'][0] + original_bounds['F_bg_intercept'][1]) / 2
+                _lhs_bg_slope = (original_bounds['F_bg_slope'][0] + original_bounds['F_bg_slope'][1]) / 2
+
             for i, (d0, k, p0) in enumerate(zip(D0_lhs, k_lhs, P0_lhs)):
                 try:
                     # Quick evaluation: compute SSR for this parameter combination
@@ -389,8 +402,8 @@ class MAK2Optimizer:
                         'D0': d0,
                         'k': k,
                         'P0': p0,
-                        'F_bg_intercept': original_bounds['F_bg_intercept'][0],  # Use lower bound
-                        'F_bg_slope': 0.0  # Start at zero
+                        'F_bg_intercept': _lhs_bg_int,
+                        'F_bg_slope': _lhs_bg_slope
                     }
 
                     # Calculate SSR for this guess
@@ -563,11 +576,13 @@ class MAK2Optimizer:
                         continue
                     
                     elif 'k at lower bound' in at_bound_info:
-                        # k hitting lower bound - decrease it
-                        old_k_min = bounds['k'][0]
-                        bounds['k'] = (old_k_min / 10, bounds['k'][1])
+                        # k hitting lower bound — do NOT widen below the
+                        # physiological minimum (0.05).  Lowering k further
+                        # leads to degenerate fits (slow exponential instead
+                        # of proper sigmoid).  Instead, just let the optimizer
+                        # continue with the current bounds.
                         if verbose:
-                            print(f"    → Decreasing k lower bound: {old_k_min:.6f} → {bounds['k'][0]:.6f}")
+                            print(f"    ⚠ k at lower bound ({bounds['k'][0]:.6f}) — keeping bound (physiological minimum)")
                         n_bounds_adjustments += 1
                         continue
                 
@@ -1182,7 +1197,7 @@ class MAK2Optimizer:
             if is_low_template:
                 # For low-template wells: k should be small (0.02-0.2)
                 # Don't increase k bounds, just reset to reasonable range
-                bounds['k'] = (0.001, 0.5)  # Keep k modest
+                bounds['k'] = (0.05, 0.5)  # Keep k modest but physiologically realistic
                 
                 # For P0: check if this is high-plateau sample
                 # If F_max > 5, keep P0 upper bound high enough
@@ -1203,7 +1218,7 @@ class MAK2Optimizer:
                 bounds['D0'] = (old_D0_bounds[0], 10**(log_D0_lower + D0_range * 0.1))
                 
                 if verbose:
-                    print(f"    - k bounds: [0.001, 0.5]")
+                    print(f"    - k bounds: [0.05, 0.5]")
                     print(f"    - P0 bounds: [0.05, 10.0] (allow small P0)")
                     print(f"    - D0 bounds (lower 10%): [{bounds['D0'][0]:.2e}, {bounds['D0'][1]:.2e}]")
             else:
@@ -1339,7 +1354,7 @@ class MAK2Optimizer:
                 print(f"   Widening bounds for better exploration...")
                 fallback_bounds = dict(bounds)
                 fallback_bounds['D0'] = (bounds['D0'][0], bounds['D0'][1] * 10)
-                fallback_bounds['k'] = (bounds['k'][0] / 10, bounds['k'][1])
+                fallback_bounds['k'] = (max(0.05, bounds['k'][0] / 10), bounds['k'][1])
                 fallback_bounds['P0'] = (bounds['P0'][0], bounds['P0'][1] * 2)
                 print(f"   D0: [{fallback_bounds['D0'][0]:.2e}, {fallback_bounds['D0'][1]:.2e}]")
                 print(f"   k: [{fallback_bounds['k'][0]:.4f}, {fallback_bounds['k'][1]:.4f}]")
@@ -1464,7 +1479,7 @@ class MAK2Optimizer:
                 # Use widened bounds for DE (or even wider)
                 de_bounds_widened = dict(bounds)
                 de_bounds_widened['D0'] = (bounds['D0'][0], bounds['D0'][1] * 20)  # 20x for DE
-                de_bounds_widened['k'] = (bounds['k'][0] / 20, bounds['k'][1])     # 20x wider
+                de_bounds_widened['k'] = (max(0.05, bounds['k'][0] / 20), bounds['k'][1])     # 20x wider but floor at 0.05
                 de_bounds_widened['P0'] = (bounds['P0'][0], bounds['P0'][1] * 3)   # 3x wider
 
                 de_params, de_r2 = self._fit_with_differential_evolution(
@@ -1846,42 +1861,52 @@ class MAK2Optimizer:
         use_fixed_bg = hasattr(self, 'fixed_background') and self.fixed_background is not None
 
         # Prepare bounds for curve_fit
+        # Reparameterize D0 → log10(D0) for better numerical conditioning.
+        # D0 can span many orders of magnitude (e.g. 1e-11 to 1e-2), and TRF
+        # struggles with Jacobians that vary by 9+ orders of magnitude in
+        # linear space.  In log space the parameter landscape is smooth and
+        # TRF converges reliably.
+        log10_D0_init = np.log10(max(p0[0], 1e-30))  # protect against 0
+        log10_D0_lo   = np.log10(max(bounds_to_use['D0'][0], 1e-30))
+        log10_D0_hi   = np.log10(max(bounds_to_use['D0'][1], 1e-30))
+
         if use_fixed_bg:
-            # Fit only D0, k, P0 (background is fixed)
+            # Fit only log10(D0), k, P0 (background is fixed)
             lower_bounds = [
-                bounds_to_use['D0'][0],
+                log10_D0_lo,
                 bounds_to_use['k'][0],
                 bounds_to_use['P0'][0]
             ]
             upper_bounds = [
-                bounds_to_use['D0'][1],
+                log10_D0_hi,
                 bounds_to_use['k'][1],
                 bounds_to_use['P0'][1]
             ]
             # Initial guess for 3 parameters
-            p0_reduced = [p0[0], p0[1], p0[2]]  # D0, k, P0
+            p0_reduced = [log10_D0_init, p0[1], p0[2]]  # log10(D0), k, P0
             fixed_bg_int = self.fixed_background['F_bg_intercept']
             fixed_bg_slope = self.fixed_background['F_bg_slope']
         else:
             # Fit all 5 parameters
             lower_bounds = [
-                bounds_to_use['D0'][0],
+                log10_D0_lo,
                 bounds_to_use['k'][0],
                 bounds_to_use['P0'][0],
                 bounds_to_use['F_bg_intercept'][0],
                 bounds_to_use['F_bg_slope'][0]
             ]
             upper_bounds = [
-                bounds_to_use['D0'][1],
+                log10_D0_hi,
                 bounds_to_use['k'][1],
                 bounds_to_use['P0'][1],
                 bounds_to_use['F_bg_intercept'][1],
                 bounds_to_use['F_bg_slope'][1]
             ]
-            p0_reduced = p0
+            p0_reduced = [log10_D0_init, p0[1], p0[2], p0[3], p0[4]]
 
         # Validate and fix bounds before fitting
-        param_names = ['D0', 'k', 'P0', 'F_bg_intercept', 'F_bg_slope'] if not use_fixed_bg else ['D0', 'k', 'P0']
+        # Note: position 0 is log10(D0) internally, but we label it 'log10_D0' for clarity
+        param_names = ['log10_D0', 'k', 'P0', 'F_bg_intercept', 'F_bg_slope'] if not use_fixed_bg else ['log10_D0', 'k', 'P0']
         for i, name in enumerate(param_names):
             if lower_bounds[i] >= upper_bounds[i]:
                 # Fix collapsed bounds by adding minimum margin
@@ -1943,11 +1968,12 @@ class MAK2Optimizer:
         sigma = 1.0 / np.sqrt(weights)
 
         # Fit using Trust Region Reflective (supports bounds, similar performance to LM)
+        # Note: first parameter is log10(D0), converted to D0 inside the lambda
         if use_fixed_bg:
-            # Fit only D0, k, P0 with fixed background
+            # Fit only log10(D0), k, P0 with fixed background
             popt_3param, _ = curve_fit(
-                lambda n, D0, k, P0: self.model.simulate_to_cycle(
-                    D0, k, P0, n, fixed_bg_int, fixed_bg_slope
+                lambda n, log_D0, k, P0: self.model.simulate_to_cycle(
+                    10**log_D0, k, P0, n, fixed_bg_int, fixed_bg_slope
                 ),
                 cycles,
                 fluorescence,
@@ -1957,13 +1983,13 @@ class MAK2Optimizer:
                 method='trf',  # Trust Region Reflective (supports bounds)
                 maxfev=10000
             )
-            # Expand to 5 parameters for consistency
-            popt = [popt_3param[0], popt_3param[1], popt_3param[2], fixed_bg_int, fixed_bg_slope]
+            # Convert log10(D0) back to D0 and expand to 5 parameters
+            popt = [10**popt_3param[0], popt_3param[1], popt_3param[2], fixed_bg_int, fixed_bg_slope]
         else:
-            # Fit all 5 parameters
-            popt, _ = curve_fit(
-                lambda n, D0, k, P0, bg_int, bg_slope: self.model.simulate_to_cycle(
-                    D0, k, P0, n, bg_int, bg_slope
+            # Fit all 5 parameters (log10(D0), k, P0, bg_int, bg_slope)
+            popt_raw, _ = curve_fit(
+                lambda n, log_D0, k, P0, bg_int, bg_slope: self.model.simulate_to_cycle(
+                    10**log_D0, k, P0, n, bg_int, bg_slope
                 ),
                 cycles,
                 fluorescence,
@@ -1973,6 +1999,8 @@ class MAK2Optimizer:
                 method='trf',  # Trust Region Reflective (supports bounds)
                 maxfev=10000
             )
+            # Convert log10(D0) back to D0
+            popt = [10**popt_raw[0], popt_raw[1], popt_raw[2], popt_raw[3], popt_raw[4]]
 
         # Calculate R² and SSR
         y_pred = self.model.simulate_to_cycle(
@@ -2241,22 +2269,40 @@ class MAK2Optimizer:
             delta_rn = fluorescence
             baseline_mean = 0.0
             baseline_sd = np.std(early_fluor) if np.std(early_fluor) > 0 else 0.01
+            baseline_slope = 0.0
+            baseline_intercept = 0.0
         else:
             # Determine baseline region
             if baseline_cycles is None:
                 baseline_cycles = (0, baseline_end)
 
             baseline_fluor = fluorescence[baseline_cycles[0]:baseline_cycles[1]]
-            baseline_mean = np.mean(baseline_fluor)
+            baseline_cycles_arr = cycles[baseline_cycles[0]:baseline_cycles[1]]
             baseline_sd = np.std(baseline_fluor)
 
-            # Baseline-correct fluorescence (Delta Rn)
-            delta_rn = fluorescence - baseline_mean
+            # Fit a linear regression to the baseline region and subtract the
+            # extrapolated line from the full curve (ΔRn = Rn - baseline_line).
+            # This matches the instrument's per-well baseline correction, which
+            # removes both the DC offset AND any fluorescence drift (slope) before
+            # applying the threshold.  A constant-mean subtraction leaves residual
+            # slope in ΔRn, causing the threshold to be crossed early in noisy or
+            # sloping-baseline wells.
+            if len(baseline_cycles_arr) >= 2:
+                coeffs = np.polyfit(baseline_cycles_arr, baseline_fluor, 1)
+            else:
+                coeffs = np.array([0.0, np.mean(baseline_fluor)])
+            baseline_slope     = coeffs[0]
+            baseline_intercept = coeffs[1]
+            linear_baseline    = np.polyval(coeffs, cycles)
+            baseline_mean      = float(np.mean(linear_baseline))
+            delta_rn           = fluorescence - linear_baseline
 
         results = {
-            'baseline_mean': baseline_mean,
-            'baseline_sd': baseline_sd,
-            'method': method
+            'baseline_mean':      baseline_mean,
+            'baseline_sd':        baseline_sd,
+            'baseline_slope':     baseline_slope,
+            'baseline_intercept': baseline_intercept,
+            'method':             method
         }
 
         if method == 'threshold':
