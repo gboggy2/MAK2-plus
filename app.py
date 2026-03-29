@@ -1573,15 +1573,21 @@ if cycles is not None and fluorescence is not None:
                     cycles_fit     = cycles[fit_start_idx:]
                     fluor_fit      = fluor_data[fit_start_idx:]
 
-                    # ── Pre-fit fold-change gate ──────────────────────────────
-                    # If the maximum fluorescence is less than 2× the baseline
-                    # level, the signal is baseline drift, not amplification.
-                    # Skip fitting entirely to avoid false positives.
-                    _bg_level_at_max = _bg_slope_est * cycles[-1] + _bg_int_est
-                    _bg_level_at_start = _bg_slope_est * cycles[fit_start_idx] + _bg_int_est
-                    _baseline_ref = max(_bg_level_at_max, _bg_level_at_start, 1e-10)
-                    _fold_change = float(np.max(fluor_data)) / _baseline_ref
-                    if _fold_change < 2.0:
+                    # ── Pre-fit signal-above-baseline gate ─────────────────────
+                    # Compute how far the signal rises above the baseline
+                    # regression line.  For raw RFU data with large offsets,
+                    # a simple F_max/F_baseline ratio doesn't work (e.g. a
+                    # signal going from 1.2M to 1.6M is only 1.3× but is
+                    # real amplification).  Instead, compare the max
+                    # *departure* from baseline to the baseline noise (SD).
+                    _bg_line = _bg_slope_est * cycles + _bg_int_est
+                    _departures = fluor_data - _bg_line
+                    _max_departure = float(np.max(_departures))
+                    _bl_sd = float(np.std(fluor_data[:max(3, fit_start_idx)])) if fit_start_idx >= 3 else float(np.std(fluor_data[:6]))
+                    _bl_sd = max(_bl_sd, 1e-10)
+                    # Signal must rise at least 5× the baseline noise
+                    _departure_ratio = _max_departure / _bl_sd
+                    if _departure_ratio < 5.0:
                         results_list.append({
                             'Sample': sample_name,
                             'D0': np.nan, 'k': np.nan, 'P0': np.nan,
@@ -1596,7 +1602,7 @@ if cycles is not None and fluorescence is not None:
                             'Success': '',
                             'FixedBG': '', 'Fallback': '', 'FallbackOK': '',
                             'bg_slope_est': bg_slope_est, 'bg_intercept_est': bg_intercept_est,
-                            'error': f'No amplification detected (fold change {_fold_change:.1f}× < 2×)',
+                            'error': f'No amplification detected (signal {_departure_ratio:.1f}× baseline SD < 5×)',
                             'fluor_data': fluor_data,
                         })
                         continue
@@ -2483,24 +2489,26 @@ if cycles is not None and fluorescence is not None:
                     _pf_reject = True
                     _pf_reason = 'R² < 0.90'
 
-                # Gate 1: minimum fold change
+                # Gate 1: signal departure from baseline (works for raw RFU
+                # and background-subtracted data alike)
                 if not _pf_reject and _pf_r.get('fluor_data') is not None:
                     _pf_fd = _pf_r['fluor_data']
                     _pf_fs = _pf_r.get('fit_start_cycle')
-                    _pf_fe = _pf_r.get('fit_end_cycle')
-                    if _pf_fs is not None and _pf_fe is not None:
+                    if _pf_fs is not None:
                         _pf_c = cycles[:len(_pf_fd)]
-                        _pf_mask = (_pf_c >= _pf_fs) & (_pf_c <= _pf_fe)
-                        _pf_win = _pf_fd[_pf_mask]
-                        if len(_pf_win) >= 3:
-                            # Baseline = mean of first 3 cycles in fit window
-                            _pf_bl = float(np.mean(_pf_win[:3]))
-                            _pf_mx = float(np.max(_pf_win))
-                            if _pf_bl > 0:
-                                _pf_fold = _pf_mx / _pf_bl
-                                if _pf_fold < 2.0:
-                                    _pf_reject = True
-                                    _pf_reason = f'Fold change {_pf_fold:.2f}× < 2×'
+                        _pf_fs_idx = int(np.searchsorted(_pf_c, _pf_fs))
+                        _pf_bl_region = _pf_fd[:max(3, _pf_fs_idx)]
+                        _pf_bl_sd = float(np.std(_pf_bl_region)) if len(_pf_bl_region) >= 3 else 1e-10
+                        _pf_bl_sd = max(_pf_bl_sd, 1e-10)
+                        # Compute departure from baseline regression
+                        _pf_bg_s = _pf_r.get('bg_slope_est', 0.0) or 0.0
+                        _pf_bg_i = _pf_r.get('bg_intercept_est', float(np.mean(_pf_bl_region))) or float(np.mean(_pf_bl_region))
+                        _pf_bg_line = _pf_bg_s * _pf_c + _pf_bg_i
+                        _pf_max_dep = float(np.max(_pf_fd - _pf_bg_line))
+                        _pf_dep_ratio = _pf_max_dep / _pf_bl_sd
+                        if _pf_dep_ratio < 5.0:
+                            _pf_reject = True
+                            _pf_reason = f'Signal {_pf_dep_ratio:.1f}× baseline SD < 5×'
 
                 # Gate 2: fit window too narrow
                 if not _pf_reject:
@@ -3752,16 +3760,18 @@ if cycles is not None and fluorescence is not None:
                             _s_bg_slope  = float(_s_bg_coeffs[0])
                             _s_bg_int    = float(_s_bg_coeffs[1])
 
-                    # ── Pre-fit fold-change gate (same as batch mode) ────
-                    _s_bg_at_max = _s_bg_slope * cycles[-1] + _s_bg_int
-                    _s_bg_at_start = _s_bg_slope * cycles[_single_start] + _s_bg_int
-                    _s_bl_ref = max(_s_bg_at_max, _s_bg_at_start, 1e-10)
-                    _s_fold = float(np.max(fluorescence)) / _s_bl_ref
-                    if _s_fold < 2.0:
+                    # ── Pre-fit signal-above-baseline gate (same as batch) ──
+                    _s_bg_line = _s_bg_slope * cycles + _s_bg_int
+                    _s_departures = fluorescence - _s_bg_line
+                    _s_max_dep = float(np.max(_s_departures))
+                    _s_bl_sd = float(np.std(fluorescence[:max(3, _single_start)])) if _single_start >= 3 else float(np.std(fluorescence[:6]))
+                    _s_bl_sd = max(_s_bl_sd, 1e-10)
+                    _s_dep_ratio = _s_max_dep / _s_bl_sd
+                    if _s_dep_ratio < 5.0:
                         sys.stdout = old_stdout
                         st.warning(
-                            f"⚠️ No amplification detected: fold change {_s_fold:.2f}× < 2×. "
-                            f"The signal does not rise sufficiently above baseline."
+                            f"⚠️ No amplification detected: signal rises only {_s_dep_ratio:.1f}× "
+                            f"baseline noise (need ≥ 5×)."
                         )
                         st.stop()
 
@@ -3781,17 +3791,18 @@ if cycles is not None and fluorescence is not None:
 
                     # ── Post-fit quality gates (same as batch mode) ──
                     _sq_warnings = []
-                    # Gate 1: minimum fold change (2×)
+                    # Gate 1: signal departure from baseline
                     _sq_fs = float(optimizer.cycles_fit[0]) if optimizer.cycles_fit is not None and len(optimizer.cycles_fit) > 0 else None
                     _sq_fe = float(optimizer.cycles_fit[-1]) if optimizer.cycles_fit is not None and len(optimizer.cycles_fit) > 0 else None
                     if _sq_fs is not None and _sq_fe is not None:
-                        _sq_mask = (cycles >= _sq_fs) & (cycles <= _sq_fe)
-                        _sq_win = fluorescence[_sq_mask]
-                        if len(_sq_win) >= 3:
-                            _sq_bl = float(np.mean(_sq_win[:3]))
-                            _sq_mx = float(np.max(_sq_win))
-                            if _sq_bl > 0 and _sq_mx / _sq_bl < 2.0:
-                                _sq_warnings.append(f"Fold change {_sq_mx/_sq_bl:.2f}× < 2×")
+                        _sq_bg_line = _s_bg_slope * cycles + _s_bg_int
+                        _sq_deps = fluorescence - _sq_bg_line
+                        _sq_max_dep = float(np.max(_sq_deps))
+                        _sq_bl_sd = float(np.std(fluorescence[:max(3, _single_start)])) if _single_start >= 3 else float(np.std(fluorescence[:6]))
+                        _sq_bl_sd = max(_sq_bl_sd, 1e-10)
+                        _sq_dep_ratio = _sq_max_dep / _sq_bl_sd
+                        if _sq_dep_ratio < 5.0:
+                            _sq_warnings.append(f"Signal {_sq_dep_ratio:.1f}× baseline SD < 5×")
                         # Gate 2: fit window width (≥ 8 cycles)
                         if _sq_fe - _sq_fs < 8:
                             _sq_warnings.append(f"Fit window {_sq_fe - _sq_fs:.0f} cycles < 8")
