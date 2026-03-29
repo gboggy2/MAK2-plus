@@ -2479,9 +2479,9 @@ if cycles is not None and fluorescence is not None:
                     _pf_fs2 = _pf_r.get('fit_start_cycle')
                     _pf_fe2 = _pf_r.get('fit_end_cycle')
                     if (_pf_fs2 is not None and _pf_fe2 is not None
-                            and _pf_fe2 - _pf_fs2 < 5):
+                            and _pf_fe2 - _pf_fs2 < 8):
                         _pf_reject = True
-                        _pf_reason = f'Fit window {_pf_fe2 - _pf_fs2:.0f} cycles < 5'
+                        _pf_reason = f'Fit window {_pf_fe2 - _pf_fs2:.0f} cycles < 8'
 
                 # Gate 3: sigmoid shape (inflection point in fitted curve)
                 if (not _pf_reject and _pf_r.get('D0') is not None
@@ -3751,9 +3751,9 @@ if cycles is not None and fluorescence is not None:
                             _sq_mx = float(np.max(_sq_win))
                             if _sq_bl > 0 and _sq_mx / _sq_bl < 2.0:
                                 _sq_warnings.append(f"Fold change {_sq_mx/_sq_bl:.2f}× < 2×")
-                        # Gate 2: fit window width (≥ 5 cycles)
-                        if _sq_fe - _sq_fs < 5:
-                            _sq_warnings.append(f"Fit window {_sq_fe - _sq_fs:.0f} cycles < 5")
+                        # Gate 2: fit window width (≥ 8 cycles)
+                        if _sq_fe - _sq_fs < 8:
+                            _sq_warnings.append(f"Fit window {_sq_fe - _sq_fs:.0f} cycles < 8")
                     # Gate 3: sigmoid shape (inflection in fitted curve)
                     try:
                         _sq_pred = optimizer.predict(cycles)
