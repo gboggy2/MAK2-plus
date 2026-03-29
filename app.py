@@ -1169,13 +1169,41 @@ if cycles is not None and fluorescence is not None:
             with st.status("🔍 Detecting samples with no signal...", expanded=True) as status:
                 st.write(f"Analyzing {len(all_samples)} samples...")
 
-                valid_samples, no_signal_samples, plate_stats = detect_no_signal_samples(
-                    cycles,
-                    all_samples,
-                    min_range_pct=2.0,  # 2% of max plate signal
-                    min_r2=0.80,        # 80% R² for borderline samples
-                    verbose=False       # Don't print to console in app
-                )
+                # Run signal detection PER CHANNEL so each channel's
+                # range threshold is relative to its own max, not the
+                # plate-wide max.  This prevents e.g. CY3 wells (lower
+                # absolute fluorescence) from being rejected because FAM
+                # has a much larger absolute range.
+                _sel_channels = st.session_state.get('selected_channels', [])
+                if _sel_channels and len(_sel_channels) > 1:
+                    valid_samples = {}
+                    no_signal_samples = {}
+                    plate_stats = {'max_range': 0}
+                    for _det_ch in _sel_channels:
+                        _det_ch_samples = {
+                            name: fluor for name, fluor in all_samples.items()
+                            if _ch(name) == _det_ch
+                        }
+                        if not _det_ch_samples:
+                            continue
+                        _v, _ns, _ps = detect_no_signal_samples(
+                            cycles, _det_ch_samples,
+                            min_range_pct=2.0, min_r2=0.80, verbose=False
+                        )
+                        valid_samples.update(_v)
+                        no_signal_samples.update(_ns)
+                        plate_stats['max_range'] = max(
+                            plate_stats['max_range'], _ps.get('max_range', 0)
+                        )
+                    st.write(
+                        f"Per-channel signal detection: "
+                        f"{', '.join(f'{ch}: {sum(1 for n in valid_samples if _ch(n)==ch)}' for ch in _sel_channels)}"
+                    )
+                else:
+                    valid_samples, no_signal_samples, plate_stats = detect_no_signal_samples(
+                        cycles, all_samples,
+                        min_range_pct=2.0, min_r2=0.80, verbose=False
+                    )
 
                 # ── Reconcile with instrument metadata (highest authority) ─────────────
                 # If the metadata CSV is loaded, use the instrument's calls to
