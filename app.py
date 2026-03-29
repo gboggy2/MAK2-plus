@@ -1178,16 +1178,14 @@ if cycles is not None and fluorescence is not None:
                 )
 
                 # ── Reconcile with instrument metadata (highest authority) ─────────────
-                # If the metadata CSV is loaded, use the instrument's NOAMP / Ct
-                # Undetermined flags as the authoritative signal/no-signal decision.
+                # If the metadata CSV is loaded, use the instrument's calls to
+                # RESCUE wells our algorithm rejected, but never to SUPPRESS wells
+                # our algorithm accepted.  The instrument's NOAMP flag can be wrong
+                # (e.g. late amplifiers with real signal), so we trust our own
+                # data-driven detection over the instrument's determination.
                 #
                 #  • A well our algorithm REJECTED but the instrument called AMPLIFIED
                 #    (has a numeric Ct and NOAMP=False) is rescued → valid_samples.
-                #    This fixes wells like JOE_A1 where a sloping baseline fools the
-                #    linear-vs-exponential R² comparison.
-                #
-                #  • A well our algorithm PASSED but the instrument called NO-AMP
-                #    (NOAMP=True or Ct=Undetermined) is flagged → no_signal_samples.
                 _smeta = st.session_state.get('sample_metadata', {})
                 if _smeta:
                     rescued, suppressed = [], []
@@ -1206,33 +1204,9 @@ if cycles is not None and fluorescence is not None:
                             valid_samples[sname] = all_samples[sname]
                             del no_signal_samples[sname]
                             rescued.append(sname)
-                    for sname, fluor in list(valid_samples.items()):
-                        wm = _smeta.get(sname, {})
-                        if 'Ct_instrument' not in wm:
-                            continue
-                        inst_ct = wm.get('Ct_instrument')
-                        inst_noamp = wm.get('NOAMP', False)
-                        inst_undetermined = (
-                            inst_ct is None
-                            or (isinstance(inst_ct, float) and np.isnan(inst_ct))
-                        )
-                        if inst_undetermined or inst_noamp:
-                            # Instrument says no-amp — suppress it
-                            F_range = float(fluor.max() - fluor.min())
-                            no_signal_samples[sname] = {
-                                'reason': 'Instrument: NOAMP / Undetermined',
-                                'F_range': F_range,
-                                'F_range_pct': (F_range / plate_stats['max_range']) * 100,
-                                'check_type': 'instrument_noamp',
-                            }
-                            del valid_samples[sname]
-                            suppressed.append(sname)
                     if rescued:
                         st.write(f"🔁 Rescued {len(rescued)} wells overridden by instrument metadata: "
                                  f"{', '.join(rescued[:5])}{'…' if len(rescued) > 5 else ''}")
-                    if suppressed:
-                        st.write(f"🚫 Suppressed {len(suppressed)} wells flagged NOAMP by instrument: "
-                                 f"{', '.join(suppressed[:5])}{'…' if len(suppressed) > 5 else ''}")
 
                 st.write(f"✅ Found {len(valid_samples)} samples with valid signal")
                 if no_signal_samples:
