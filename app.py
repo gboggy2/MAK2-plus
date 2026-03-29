@@ -1573,6 +1573,34 @@ if cycles is not None and fluorescence is not None:
                     cycles_fit     = cycles[fit_start_idx:]
                     fluor_fit      = fluor_data[fit_start_idx:]
 
+                    # ── Pre-fit fold-change gate ──────────────────────────────
+                    # If the maximum fluorescence is less than 2× the baseline
+                    # level, the signal is baseline drift, not amplification.
+                    # Skip fitting entirely to avoid false positives.
+                    _bg_level_at_max = _bg_slope_est * cycles[-1] + _bg_int_est
+                    _bg_level_at_start = _bg_slope_est * cycles[fit_start_idx] + _bg_int_est
+                    _baseline_ref = max(_bg_level_at_max, _bg_level_at_start, 1e-10)
+                    _fold_change = float(np.max(fluor_data)) / _baseline_ref
+                    if _fold_change < 2.0:
+                        results_list.append({
+                            'Sample': sample_name,
+                            'D0': np.nan, 'k': np.nan, 'P0': np.nan,
+                            'F_bg_intercept': np.nan, 'F_bg_slope': np.nan,
+                            'R2': np.nan, 'SSR': np.nan, 'RMSE': np.nan, 'NRMSE': np.nan,
+                            'Tier': None,
+                            'Ct': np.nan, 'Ct_baseline_mean': np.nan,
+                            'Ct_baseline_slope': np.nan, 'Ct_baseline_intercept': np.nan,
+                            'fit_start_cycle': np.nan, 'fit_end_cycle': np.nan,
+                            'bl_end_meta': _meta_bl_end_cycle, 'bl_end_est': _est_bl_end_cycle,
+                            'ct_rox_mean': np.nan,
+                            'Success': '',
+                            'FixedBG': '', 'Fallback': '', 'FallbackOK': '',
+                            'bg_slope_est': bg_slope_est, 'bg_intercept_est': bg_intercept_est,
+                            'error': f'No amplification detected (fold change {_fold_change:.1f}× < 2×)',
+                            'fluor_data': fluor_data,
+                        })
+                        continue
+
                     _F_range     = float(np.max(fluor_fit) - np.min(fluor_fit))
                     # Build symmetric bounds around the linear-regression values
                     # so that fix_background=True fixes them at the regression fit.
