@@ -144,6 +144,8 @@ class MAK2Optimizer:
         if disabled_tiers is None:
             disabled_tiers = set()
         self.tier_log = []
+        self._fit_deadline = time.perf_counter() + 60.0  # 60-second timeout
+        self._fit_timed_out = False
         _tier1_start = time.perf_counter()
 
         # Use analytical parameter estimation from exponential fits
@@ -463,6 +465,9 @@ class MAK2Optimizer:
         max_bounds_adjustments = 3  # Allow up to 3 adjustments
 
         for attempt in range(1, max_attempts + 1):
+            if time.perf_counter() >= self._fit_deadline:
+                self._fit_timed_out = True
+                break
             try:
                 # For attempts 2+, pass LHS samples for D0, k, and P0
                 lhs_D0 = D0_lhs[attempt - 2] if attempt > 1 and D0_lhs is not None else None
@@ -722,7 +727,9 @@ class MAK2Optimizer:
 
         # Analyze residual patterns to guide adaptive retry strategy
         # Different residual patterns indicate different problems requiring different fixes
-        if best_params is not None and best_r2 < r2_threshold and 'tier1.5' not in disabled_tiers:
+        if (best_params is not None and best_r2 < r2_threshold
+                and 'tier1.5' not in disabled_tiers
+                and time.perf_counter() < self._fit_deadline):
             _tier1_5_fired = True
             # Predict fluorescence for all fitted cycles
             predicted_F = self.model.simulate_to_cycle(
@@ -1178,7 +1185,9 @@ class MAK2Optimizer:
         ssr = best_params['ssr']
         ssr_threshold = 0.01 * (F_range ** 2)
 
-        if ssr > ssr_threshold and 'retry_attempted' not in locals() and 'tier2' not in disabled_tiers:
+        if (ssr > ssr_threshold and 'retry_attempted' not in locals()
+                and 'tier2' not in disabled_tiers
+                and time.perf_counter() < self._fit_deadline):
             _tier2_fired = True
             # Check if this is a low-template well (wide D0 bounds)
             D0_range_log = np.log10(bounds['D0'][1]) - np.log10(bounds['D0'][0])
@@ -1332,7 +1341,9 @@ class MAK2Optimizer:
 
         # ADAPTIVE BACKGROUND STRATEGY
         # If we used fixed background but R² < 0.999, retry with full 5-parameter fit
-        if used_fixed_bg and self.metrics['r_squared'] < 0.999 and 'tier2.5' not in disabled_tiers:
+        if (used_fixed_bg and self.metrics['r_squared'] < 0.999
+                and 'tier2.5' not in disabled_tiers
+                and time.perf_counter() < self._fit_deadline):
             _tier2_5_fired = True
             best_params['fallback_attempted'] = True
             # Always print fallback messages (even with verbose=False)
@@ -1467,9 +1478,14 @@ class MAK2Optimizer:
         _tier3_fired = False
         _tier3_r2_before = self.metrics['r_squared']
 
-        # TIER 3: DIFFERENTIAL EVOLUTION for extremely challenging samples
-        # If R² < 0.999, try global optimization to reach excellence threshold
-        if self.metrics['r_squared'] < 0.999 and 'tier3' not in disabled_tiers:
+        # TIER 3: DIFFERENTIAL EVOLUTION for near-miss samples
+        # Only fire when R² is close enough (≥ 0.95) that DE has a realistic
+        # chance of reaching 0.999.  Below 0.95, the curve is too far gone
+        # (likely non-amplifying or degenerate) — spending 2+ seconds on DE
+        # per well adds up fast in batch mode with no benefit.
+        if (0.95 <= self.metrics['r_squared'] < 0.999
+                and 'tier3' not in disabled_tiers
+                and time.perf_counter() < self._fit_deadline):
             _tier3_fired = True
             print(f"\n🌍 TIER 3: DIFFERENTIAL EVOLUTION")
             print(f"   Current R²={self.metrics['r_squared']:.4f} < 0.999")
@@ -1541,6 +1557,9 @@ class MAK2Optimizer:
                 'r2_after': _tier4_r2_before,
                 'improved': False,
             })
+            return self.optimal_params
+        if time.perf_counter() >= self._fit_deadline:
+            self._fit_timed_out = True
             return self.optimal_params
         try:
             overshoots, overshoot_ratio = self.check_plateau_overshoot(

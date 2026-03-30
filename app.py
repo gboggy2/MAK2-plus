@@ -1169,25 +1169,51 @@ if cycles is not None and fluorescence is not None:
             with st.status("🔍 Detecting samples with no signal...", expanded=True) as status:
                 st.write(f"Analyzing {len(all_samples)} samples...")
 
-                valid_samples, no_signal_samples, plate_stats = detect_no_signal_samples(
-                    cycles,
-                    all_samples,
-                    min_range_pct=2.0,  # 2% of max plate signal
-                    min_r2=0.80,        # 80% R² for borderline samples
-                    verbose=False       # Don't print to console in app
-                )
+                # Run signal detection PER CHANNEL so each channel's
+                # range threshold is relative to its own max, not the
+                # plate-wide max.  This prevents e.g. CY3 wells (lower
+                # absolute fluorescence) from being rejected because FAM
+                # has a much larger absolute range.
+                _sel_channels = st.session_state.get('selected_channels', [])
+                if _sel_channels and len(_sel_channels) > 1:
+                    valid_samples = {}
+                    no_signal_samples = {}
+                    plate_stats = {'max_range': 0}
+                    for _det_ch in _sel_channels:
+                        _det_ch_samples = {
+                            name: fluor for name, fluor in all_samples.items()
+                            if _ch(name) == _det_ch
+                        }
+                        if not _det_ch_samples:
+                            continue
+                        _v, _ns, _ps = detect_no_signal_samples(
+                            cycles, _det_ch_samples,
+                            min_range_pct=2.0, min_r2=0.80, verbose=False
+                        )
+                        valid_samples.update(_v)
+                        no_signal_samples.update(_ns)
+                        plate_stats['max_range'] = max(
+                            plate_stats['max_range'], _ps.get('max_range', 0)
+                        )
+                    st.write(
+                        f"Per-channel signal detection: "
+                        f"{', '.join(f'{ch}: {sum(1 for n in valid_samples if _ch(n)==ch)}' for ch in _sel_channels)}"
+                    )
+                else:
+                    valid_samples, no_signal_samples, plate_stats = detect_no_signal_samples(
+                        cycles, all_samples,
+                        min_range_pct=2.0, min_r2=0.80, verbose=False
+                    )
 
                 # ── Reconcile with instrument metadata (highest authority) ─────────────
-                # If the metadata CSV is loaded, use the instrument's NOAMP / Ct
-                # Undetermined flags as the authoritative signal/no-signal decision.
+                # If the metadata CSV is loaded, use the instrument's calls to
+                # RESCUE wells our algorithm rejected, but never to SUPPRESS wells
+                # our algorithm accepted.  The instrument's NOAMP flag can be wrong
+                # (e.g. late amplifiers with real signal), so we trust our own
+                # data-driven detection over the instrument's determination.
                 #
                 #  • A well our algorithm REJECTED but the instrument called AMPLIFIED
                 #    (has a numeric Ct and NOAMP=False) is rescued → valid_samples.
-                #    This fixes wells like JOE_A1 where a sloping baseline fools the
-                #    linear-vs-exponential R² comparison.
-                #
-                #  • A well our algorithm PASSED but the instrument called NO-AMP
-                #    (NOAMP=True or Ct=Undetermined) is flagged → no_signal_samples.
                 _smeta = st.session_state.get('sample_metadata', {})
                 if _smeta:
                     rescued, suppressed = [], []
@@ -1206,33 +1232,9 @@ if cycles is not None and fluorescence is not None:
                             valid_samples[sname] = all_samples[sname]
                             del no_signal_samples[sname]
                             rescued.append(sname)
-                    for sname, fluor in list(valid_samples.items()):
-                        wm = _smeta.get(sname, {})
-                        if 'Ct_instrument' not in wm:
-                            continue
-                        inst_ct = wm.get('Ct_instrument')
-                        inst_noamp = wm.get('NOAMP', False)
-                        inst_undetermined = (
-                            inst_ct is None
-                            or (isinstance(inst_ct, float) and np.isnan(inst_ct))
-                        )
-                        if inst_undetermined or inst_noamp:
-                            # Instrument says no-amp — suppress it
-                            F_range = float(fluor.max() - fluor.min())
-                            no_signal_samples[sname] = {
-                                'reason': 'Instrument: NOAMP / Undetermined',
-                                'F_range': F_range,
-                                'F_range_pct': (F_range / plate_stats['max_range']) * 100,
-                                'check_type': 'instrument_noamp',
-                            }
-                            del valid_samples[sname]
-                            suppressed.append(sname)
                     if rescued:
                         st.write(f"🔁 Rescued {len(rescued)} wells overridden by instrument metadata: "
                                  f"{', '.join(rescued[:5])}{'…' if len(rescued) > 5 else ''}")
-                    if suppressed:
-                        st.write(f"🚫 Suppressed {len(suppressed)} wells flagged NOAMP by instrument: "
-                                 f"{', '.join(suppressed[:5])}{'…' if len(suppressed) > 5 else ''}")
 
                 st.write(f"✅ Found {len(valid_samples)} samples with valid signal")
                 if no_signal_samples:
@@ -1385,12 +1387,15 @@ if cycles is not None and fluorescence is not None:
                             'Sample': sample_name,
                             'D0': np.nan, 'k': np.nan, 'P0': np.nan,
                             'F_bg_intercept': np.nan, 'F_bg_slope': np.nan,
-                            'R2': np.nan, 'SSR': np.nan,
+                            'R2': np.nan, 'SSR': np.nan, 'RMSE': np.nan, 'NRMSE': np.nan,
+                            'Tier': None, 'Instrument': '',
                             'Ct': np.nan, 'Ct_baseline_mean': np.nan,
                             'Ct_baseline_slope': np.nan, 'Ct_baseline_intercept': np.nan,
                             'fit_start_cycle': np.nan, 'fit_end_cycle': np.nan,
                             'bl_end_meta': np.nan, 'bl_end_est': np.nan,
                             'ct_rox_mean': np.nan,
+                            'Success': '', 'FixedBG': '', 'Fallback': '', 'FallbackOK': '',
+                            'bg_slope_est': None, 'bg_intercept_est': None,
                             'error': 'No amplification detected',
                             'fluor_data': fluor_data,
                         })
@@ -1599,6 +1604,12 @@ if cycles is not None and fluorescence is not None:
                     cycles_fit     = cycles[fit_start_idx:]
                     fluor_fit      = fluor_data[fit_start_idx:]
 
+                    # NOTE: pre-fit signal gate removed — the upstream
+                    # detect_no_signal_samples() and the per-channel 5×SD
+                    # check already filter non-amplifying wells.  A pre-fit
+                    # gate here is redundant and too aggressive for raw RFU
+                    # data where baseline SD is large due to instrument noise.
+
                     _F_range     = float(np.max(fluor_fit) - np.min(fluor_fit))
                     # Build symmetric bounds around the linear-regression values
                     # so that fix_background=True fixes them at the regression fit.
@@ -1796,6 +1807,7 @@ if cycles is not None and fluorescence is not None:
                         'RMSE': None,
                         'NRMSE': None,
                         'Tier': None,
+                        'Instrument': '',
                         'Success': f'✗ Error: {str(e)[:30]}',
                         'FixedBG': '',
                         'Fallback': '',
@@ -1804,6 +1816,10 @@ if cycles is not None and fluorescence is not None:
                         'bg_intercept_est': bg_intercept_est,
                         'bl_end_meta':  _meta_bl_end_cycle if '_meta_bl_end_cycle' in dir() else None,
                         'bl_end_est':   _est_bl_end_cycle  if '_est_bl_end_cycle'  in dir() else None,
+                        'fit_start_cycle': np.nan,
+                        'fit_end_cycle':   np.nan,
+                        'ct_rox_mean':     np.nan,
+                        'error': str(e),
                         'fluor_data': fluor_data
                     })
                 
@@ -2409,6 +2425,7 @@ if cycles is not None and fluorescence is not None:
                                 'NRMSE':                 _br['metrics']['nrmse'] * 100,
                                 'SSR':                   _br['metrics']['ssr'],
                                 'Tier':                  result.get('Tier'),
+                                'Instrument':            result.get('Instrument', ''),
                                 'Success':               ('✓ (window-retry)'
                                                           if _best_r2 >= 0.999
                                                           else ('✓ (late-amp)'
@@ -2456,14 +2473,95 @@ if cycles is not None and fluorescence is not None:
                             results_list[idx]['Success'] = '⚠️ Retry failed'
             
             # ── Post-fit non-amplification check ───────────────────────
-            # Wells with very poor R² after all retry attempts are
-            # reclassified as non-amplifying (signal indistinguishable
-            # from baseline noise).
+            # Even when the optimizer converges, the well may not show
+            # real amplification.  Three quality gates catch false
+            # positives (fitting noise/drift rather than a real sigmoid):
+            #
+            #  1. Minimum fold change: F_max / F_baseline within the fit
+            #     window must exceed 2×.  Real amplification shows ≥ 3×.
+            #  2. Fit window width: fit_end − fit_start must be ≥ 5
+            #     cycles.  A narrower window means no clear transition.
+            #  3. Sigmoid shape: the fitted curve must show a clear
+            #     inflection (second derivative sign change) within the
+            #     fit window.  A monotone curve is drift, not sigmoid.
+            #
+            # Wells failing ANY gate are reclassified as non-amplifying.
             for _pf_idx, _pf_r in enumerate(results_list):
+                if _pf_r.get('error') is not None:
+                    continue  # already flagged
                 _pf_r2 = _pf_r.get('R2')
+                _pf_reject = False
+                _pf_reason = ''
+
+                # Gate 0: very poor R² (original check)
                 if _pf_r2 is not None and _pf_r2 < 0.90:
+                    _pf_reject = True
+                    _pf_reason = 'R² < 0.90'
+
+                # Gate 1: removed — signal departure check is redundant
+                # with upstream detect_no_signal_samples() and too
+                # aggressive for raw RFU data with high baseline noise.
+
+                # Gate 2: fit window too narrow
+                if not _pf_reject:
+                    _pf_fs2 = _pf_r.get('fit_start_cycle')
+                    _pf_fe2 = _pf_r.get('fit_end_cycle')
+                    if (_pf_fs2 is not None and _pf_fe2 is not None
+                            and _pf_fe2 - _pf_fs2 < 8):
+                        _pf_reject = True
+                        _pf_reason = f'Fit window {_pf_fe2 - _pf_fs2:.0f} cycles < 8'
+
+                # Gate 3: sigmoid shape — the fitted curve within the fit
+                # window must show a clear inflection (second derivative
+                # sign change).  Only check within fit window, not the
+                # full curve, and require the curvature to be significant
+                # relative to the signal range (not just numerical noise).
+                # Skip for late amplifiers — they may only capture the
+                # exponential rise without reaching the inflection point.
+                _pf_fe_late = _pf_r.get('fit_end_cycle')
+                _pf_is_late = (
+                    _pf_fe_late is not None
+                    and not (isinstance(_pf_fe_late, float) and np.isnan(_pf_fe_late))
+                    and _pf_fe_late >= float(cycles[-1]) - 1
+                )
+                if (not _pf_reject and not _pf_is_late
+                        and _pf_r.get('D0') is not None
+                        and not (isinstance(_pf_r['D0'], float) and np.isnan(_pf_r['D0']))
+                        and _pf_r.get('fluor_data') is not None):
+                    try:
+                        _pf_fs3 = _pf_r.get('fit_start_cycle')
+                        _pf_fe3 = _pf_r.get('fit_end_cycle')
+                        if _pf_fs3 is not None and _pf_fe3 is not None:
+                            _pf_m = MAK2Model()
+                            _pf_c_full = cycles[:len(_pf_r['fluor_data'])]
+                            _pf_pred = _pf_m.simulate_to_cycle(
+                                D0=_pf_r['D0'], k=_pf_r['k'], P0=_pf_r['P0'],
+                                cycles=_pf_c_full,
+                                F_bg_intercept=_pf_r['F_bg_intercept'],
+                                F_bg_slope=_pf_r['F_bg_slope'],
+                            )
+                            # Restrict to fit window
+                            _pf_win_mask = (_pf_c_full >= _pf_fs3) & (_pf_c_full <= _pf_fe3)
+                            _pf_pred_win = _pf_pred[_pf_win_mask]
+                            if len(_pf_pred_win) >= 5:
+                                _pf_d1 = np.gradient(_pf_pred_win)
+                                _pf_d2 = np.gradient(_pf_d1)
+                                _pf_pred_range = float(np.max(_pf_pred_win) - np.min(_pf_pred_win))
+                                # Curvature must be significant (> 1% of signal range)
+                                _pf_d2_thresh = _pf_pred_range * 0.01
+                                _pf_has_inflection = (
+                                    np.any(_pf_d2 > _pf_d2_thresh)
+                                    and np.any(_pf_d2 < -_pf_d2_thresh)
+                                )
+                                if not _pf_has_inflection:
+                                    _pf_reject = True
+                                    _pf_reason = 'No inflection (monotone curve)'
+                    except Exception:
+                        pass
+
+                if _pf_reject:
                     results_list[_pf_idx]['Success'] = ''
-                    results_list[_pf_idx]['error'] = 'No amplification detected'
+                    results_list[_pf_idx]['error'] = f'No amplification detected ({_pf_reason})'
                     results_list[_pf_idx]['D0'] = None
                     results_list[_pf_idx]['k'] = None
                     results_list[_pf_idx]['P0'] = None
@@ -2476,52 +2574,11 @@ if cycles is not None and fluorescence is not None:
             display_results = [{k: v for k, v in r.items() if k not in _hidden} for r in results_list]
             results_df = pd.DataFrame(display_results)
 
-            # Add Target and Well columns for multiplexed data (target::well format)
-            all_targets = st.session_state.get('all_targets', [])
-            if all_targets and results_df['Sample'].str.contains('::').any():
-                results_df.insert(0, 'Target', results_df['Sample'].str.split('::').str[0])
-                results_df.insert(1, 'Well', results_df['Sample'].str.split('::').str[1])
-
-            # Add Channel column for multi-channel data (FAM_A1 format)
-            all_channels = st.session_state.get('selected_channels', [])
-            if all_channels and len(all_channels) > 1:
-                results_df.insert(0, 'Channel', results_df['Sample'].map(_ch))
-
-            # Annotate with sample metadata (Sample Name, Task, Known_Copies) if available
-            sample_metadata = st.session_state.get('sample_metadata')
-            if sample_metadata:
-                results_df.insert(
-                    results_df.columns.get_loc('Sample') + 1,
-                    'Sample_Name',
-                    results_df['Sample'].map(
-                        lambda w: sample_metadata.get(w, {}).get('Sample Name', '')
-                    )
-                )
-                results_df.insert(
-                    results_df.columns.get_loc('Sample_Name') + 1,
-                    'Task',
-                    results_df['Sample'].map(
-                        lambda w: sample_metadata.get(w, {}).get('Task', '')
-                    )
-                )
-                results_df['Known_Copies'] = results_df['Sample'].map(
-                    lambda w: sample_metadata.get(w, {}).get('Quantity', np.nan)
-                )
-
-                # Add instrument Ct column for comparison (from ABI results CSV)
-                if any('Ct_instrument' in sample_metadata.get(w, {})
-                       for w in results_df['Sample']):
-                    ct_inst_col = results_df['Sample'].map(
-                        lambda w: sample_metadata.get(w, {}).get('Ct_instrument', np.nan)
-                    )
-                    ct_loc = results_df.columns.get_loc('Ct') + 1
-                    results_df.insert(ct_loc, 'Ct_instrument', ct_inst_col)
-
-            # Store in session state for persistence
+            # Store core session state FIRST so results are never lost
             st.session_state['batch_results'] = results_df
             st.session_state['batch_results_list'] = results_list
             st.session_state['batch_all_samples'] = all_samples
-            st.session_state['batch_no_signal_samples'] = no_signal_samples  # Store flagged samples
+            st.session_state['batch_no_signal_samples'] = no_signal_samples
             st.session_state['batch_cycles'] = cycles
             st.session_state['batch_settings'] = {
                 'first_fit_cycle': first_fit_cycle,
@@ -2532,1064 +2589,62 @@ if cycles is not None and fluorescence is not None:
                 'custom_bounds_dict': custom_bounds_dict,
                 'global_threshold': global_threshold,
                 'global_baseline_mean': global_baseline_mean,
-                'channel_thresholds': channel_thresholds,       # per-channel thresholds
-                'channel_baseline_means': channel_baseline_means, # per-channel baselines
-            }
-        
-        # Display batch results (outside button block, always visible if results exist)
-        if 'batch_results' in st.session_state:
-            st.subheader("🔄 Batch Fitting Results")
-            results_df = st.session_state['batch_results']
-            results_list = st.session_state['batch_results_list']
-
-            # Target filter for multiplexed data
-            display_df = results_df
-            if 'Target' in results_df.columns:
-                unique_targets = results_df['Target'].unique().tolist()
-                if len(unique_targets) > 1:
-                    target_filter = st.selectbox(
-                        "Filter by target:",
-                        ["All targets"] + unique_targets,
-                        key="target_display_filter"
-                    )
-                    if target_filter != "All targets":
-                        display_df = results_df[results_df['Target'] == target_filter]
-
-            # Format numeric columns
-            format_dict = {
-                'Ct': '{:.2f}',
-                'Ct_instrument': '{:.2f}',
-                'D0': '{:.2e}',
-                'k': '{:.6f}',
-                'P0': '{:.2e}',
-                'F_bg_intercept': '{:.6f}',
-                'F_bg_slope': '{:.6f}',
-                'R2': '{:.6f}',
-                'RMSE': '{:.4f}',
-                'NRMSE': '{:.2f}',
-                'SSR': '{:.6f}',
-                'Known_Copies': '{:.2e}',
-                'Copies_D0': '{:.2e}',
-                'Copies_Ct': '{:.2e}',
+                'channel_thresholds': channel_thresholds,
+                'channel_baseline_means': channel_baseline_means,
             }
 
-            st.dataframe(display_df.style.format(format_dict, na_rep='-'), use_container_width=True)
-            
-            # Summary statistics
-            col1, col2, col3 = st.columns(3)
-            successful = results_df['Success'].str.contains('✓').sum()
-            col1.metric("Successful Fits", f"{successful}/{len(results_list)}")
-            if successful > 0:
-                col2.metric("Mean R²", f"{results_df['R2'].mean():.4f}")
-                col3.metric("Median R²", f"{results_df['R2'].median():.4f}")
-            
-            # Show no-signal samples if any
-            if 'batch_no_signal_samples' in st.session_state and st.session_state['batch_no_signal_samples']:
-                no_signal_samples = st.session_state['batch_no_signal_samples']
-                with st.expander(f"⚠️ {len(no_signal_samples)} samples skipped (no signal detected)"):
-                    no_signal_df = pd.DataFrame([
-                        {
-                            'Sample': name,
-                            'Reason': info['reason'],
-                            'Fluorescence Range': f"{info['F_range']:.4f}",
-                            '% of Max on Plate': f"{info['F_range_pct']:.1f}%"
-                        }
-                        for name, info in no_signal_samples.items()
-                    ])
-                    st.dataframe(no_signal_df, use_container_width=True)
+            # Now add display columns (if this fails, raw results still persist)
+            try:
+                # Add Target and Well columns for multiplexed data (target::well format)
+                all_targets = st.session_state.get('all_targets', [])
+                if all_targets and results_df['Sample'].str.contains('::').any():
+                    results_df.insert(0, 'Target', results_df['Sample'].str.split('::').str[0])
+                    results_df.insert(1, 'Well', results_df['Sample'].str.split('::').str[1])
 
-            # ============================================================================
-            # CALIBRATION SECTION
-            # ============================================================================
-            sample_metadata = st.session_state.get('sample_metadata')
-            manual_cf_val = st.session_state.get('manual_conversion_factor')
-            cal_method = st.session_state.get('calibration_method', 'auto')
+                # Add Channel column for multi-channel data (FAM_A1 format)
+                all_channels = st.session_state.get('selected_channels', [])
+                if all_channels and len(all_channels) > 1:
+                    results_df.insert(0, 'Channel', results_df['Sample'].map(_ch))
 
-            has_standards = (
-                cal_method == 'auto' and
-                sample_metadata is not None and
-                any(m.get('Task') == 'STANDARD' for m in sample_metadata.values())
-            )
+                # Annotate with sample metadata (Sample Name, Task, Known_Copies) if available
+                sample_metadata = st.session_state.get('sample_metadata')
+                if sample_metadata:
+                    results_df.insert(
+                        results_df.columns.get_loc('Sample') + 1,
+                        'Sample_Name',
+                        results_df['Sample'].map(
+                            lambda w: sample_metadata.get(w, {}).get('Sample Name', '')
+                        )
+                    )
+                    results_df.insert(
+                        results_df.columns.get_loc('Sample_Name') + 1,
+                        'Task',
+                        results_df['Sample'].map(
+                            lambda w: sample_metadata.get(w, {}).get('Task', '')
+                        )
+                    )
+                    results_df['Known_Copies'] = results_df['Sample'].map(
+                        lambda w: sample_metadata.get(w, {}).get('Quantity', np.nan)
+                    )
 
-            ld_wells = st.session_state.get('ld_wells', [])
-            no_signal_wells = list(st.session_state.get('batch_no_signal_samples', {}).keys())
+                    # Add instrument Ct column for comparison (from ABI results CSV)
+                    if any('Ct_instrument' in sample_metadata.get(w, {})
+                           for w in results_df['Sample']):
+                        ct_inst_col = results_df['Sample'].map(
+                            lambda w: sample_metadata.get(w, {}).get('Ct_instrument', np.nan)
+                        )
+                        ct_loc = results_df.columns.get_loc('Ct') + 1
+                        results_df.insert(ct_loc, 'Ct_instrument', ct_inst_col)
 
-            if has_standards:
-                st.markdown("---")
-                st.subheader("📐 Standard Curve Calibration")
-
-                # Determine if we need per-channel standard curves
-                _has_multi_ch = 'Channel' in results_df.columns and results_df['Channel'].nunique() > 1
-                _cal_channels = list(results_df['Channel'].unique()) if _has_multi_ch else [None]
-
-                _any_cal_succeeded = False
-                _per_ch_cals = {}  # channel → (calibration, ct_calibration)
-
-                for _cal_ch in _cal_channels:
-                    # Filter results and metadata to this channel
-                    if _cal_ch is not None:
-                        _ch_mask = results_df['Channel'] == _cal_ch
-                        _ch_df = results_df[_ch_mask].copy()
-                        # Filter sample_metadata to keys starting with this channel
-                        _ch_meta = {k: v for k, v in (sample_metadata or {}).items()
-                                    if k.startswith(f"{_cal_ch}_")}
-                    else:
-                        _ch_df = results_df
-                        _ch_meta = sample_metadata
-
-                    calibration = build_standard_curve(_ch_df, _ch_meta)
-                    ct_calibration = build_ct_standard_curve(_ch_df, _ch_meta)
-                    _per_ch_cals[_cal_ch] = (calibration, ct_calibration)
-
-                    if calibration is None and ct_calibration is None:
-                        continue
-                    _any_cal_succeeded = True
-
-                    _ch_label = f" ({_cal_ch})" if _cal_ch else ""
-
-                    # Determine side-by-side layout
-                    both_succeeded = calibration is not None and ct_calibration is not None
-                    if both_succeeded:
-                        col_d0, col_ct = st.columns(2)
-                    else:
-                        col_d0 = st.container() if calibration is not None else None
-                        col_ct = st.container() if ct_calibration is not None else None
-
-                    # ── D0 Calibration (left column) ──────────────────────
-                    if calibration is not None and col_d0 is not None:
-                        with col_d0:
-                            st.markdown(f"#### D0-Based Standard Curve{_ch_label}")
-                            m1, m2 = st.columns(2)
-                            m1.metric("Slope", f"{calibration['slope']:.4f}")
-                            m2.metric("R\u00b2", f"{calibration['r_squared']:.6f}")
-
-                            st.markdown(
-                                f"**log\u2081\u2080(copies) = {calibration['slope']:.4f} "
-                                f"\u00d7 log\u2081\u2080(D0) + {calibration['intercept']:.4f}**"
-                            )
-                            st.caption(
-                                f"Standards: {calibration['n_standards']} wells, "
-                                f"{calibration['n_concentrations']} levels"
-                            )
-                            cf_spread = calibration.get('cf_spread', np.nan)
-                            if not np.isnan(cf_spread):
-                                st.caption(
-                                    f"Median CF = {calibration['median_cf']:.2e} "
-                                    f"(spread: {cf_spread:.2f}\u00d7 across levels)"
-                                )
-                            if not np.isnan(calibration['pooled_replicate_cv']):
-                                st.caption(
-                                    f"Replicate pooled CV = {calibration['pooled_replicate_cv']:.1f}%"
-                                )
-
-                            for w in calibration.get('warnings', []):
-                                st.warning(w)
-
-                            fig_cal = plot_calibration(calibration, channel_label=_ch_label)
-                            st.plotly_chart(fig_cal, use_container_width=True)
-
-                    # ── Ct Calibration (right column) ─────────────────────
-                    if ct_calibration is not None and col_ct is not None:
-                        with col_ct:
-                            st.markdown(f"#### Ct-Based Standard Curve{_ch_label}")
-                            m1, m2 = st.columns(2)
-                            m1.metric("Efficiency", f"{ct_calibration['efficiency']*100:.1f}%")
-                            m2.metric("R\u00b2", f"{ct_calibration['r_squared']:.4f}")
-
-                            st.markdown(
-                                f"**log\u2081\u2080(copies) = {ct_calibration['slope']:.4f} \u00d7 Ct "
-                                f"+ {ct_calibration['intercept']:.4f}**"
-                            )
-                            st.caption(
-                                f"Standards: {ct_calibration['n_standards']} wells, "
-                                f"{ct_calibration['n_concentrations']} levels"
-                            )
-                            if not np.isnan(ct_calibration['pooled_replicate_cv']):
-                                st.caption(
-                                    f"Replicate pooled Ct CV = {ct_calibration['pooled_replicate_cv']:.1f}%"
-                                )
-
-                            for w in ct_calibration.get('warnings', []):
-                                st.warning(w)
-
-                            fig_ct = plot_ct_calibration(ct_calibration, channel_label=_ch_label)
-                            st.plotly_chart(fig_ct, use_container_width=True)
-
-                    # ── Per-level replicate variance ───────────────────────
-                    with st.expander(f"📊 Replicate variance by concentration level{_ch_label}"):
-                        var_data = []
-                        if calibration is not None:
-                            for copies_val, var_info in sorted(
-                                calibration['replicate_variance'].items(), reverse=True
-                            ):
-                                row = {
-                                    'Known Copies': f"{copies_val:.2e}",
-                                    'N Replicates': var_info['n_replicates'],
-                                    'Mean D0': f"{var_info['mean_D0']:.4e}",
-                                    'SD D0': f"{var_info['sd_D0']:.4e}" if not np.isnan(var_info['sd_D0']) else '-',
-                                    'D0 CV%': f"{var_info['cv_D0_pct']:.1f}" if not np.isnan(var_info['cv_D0_pct']) else '-',
-                                }
-                                if ct_calibration is not None:
-                                    ct_var = ct_calibration['replicate_variance'].get(copies_val)
-                                    if ct_var:
-                                        row['Mean Ct'] = f"{ct_var['mean_Ct']:.2f}"
-                                        row['SD Ct'] = f"{ct_var['sd_Ct']:.3f}" if not np.isnan(ct_var['sd_Ct']) else '-'
-                                        row['Ct CV%'] = f"{ct_var['cv_Ct_pct']:.2f}" if not np.isnan(ct_var['cv_Ct_pct']) else '-'
-                                var_data.append(row)
-                        st.dataframe(pd.DataFrame(var_data), use_container_width=True)
-
-                    # ── Apply calibration for this channel ─────────────────
-                    if _cal_ch is not None:
-                        _ch_mask = results_df['Channel'] == _cal_ch
-                        if calibration is not None:
-                            cal_subset = apply_calibration(results_df[_ch_mask].copy(), calibration=calibration)
-                            results_df.loc[_ch_mask, 'Copies_D0'] = cal_subset['Copies_D0']
-                        if ct_calibration is not None:
-                            ct_subset = apply_ct_calibration(results_df[_ch_mask].copy(), ct_calibration)
-                            results_df.loc[_ch_mask, 'Copies_Ct'] = ct_subset['Copies_Ct']
-                    else:
-                        # Single-channel or Target-based handling
-                        if 'Target' in results_df.columns:
-                            std_targets = set()
-                            for key, meta in (sample_metadata or {}).items():
-                                if meta.get('Task') == 'STANDARD':
-                                    std_targets.add(meta.get('_target', ''))
-                            if std_targets and len(std_targets) == 1:
-                                cal_target = list(std_targets)[0]
-                                mask = results_df['Target'] == cal_target
-                                if calibration is not None:
-                                    cal_subset = apply_calibration(results_df[mask].copy(), calibration=calibration)
-                                    results_df.loc[mask, 'Copies_D0'] = cal_subset['Copies_D0']
-                                if ct_calibration is not None:
-                                    ct_subset = apply_ct_calibration(results_df[mask].copy(), ct_calibration)
-                                    results_df.loc[mask, 'Copies_Ct'] = ct_subset['Copies_Ct']
-                                other_targets = [t for t in results_df['Target'].unique() if t != cal_target]
-                                if other_targets:
-                                    st.info(f"ℹ️ Other targets ({', '.join(other_targets)}) do not have standards — no copy numbers assigned.")
-                            else:
-                                if calibration is not None:
-                                    results_df = apply_calibration(results_df, calibration=calibration)
-                                if ct_calibration is not None:
-                                    results_df = apply_ct_calibration(results_df, ct_calibration)
-                        else:
-                            if calibration is not None:
-                                results_df = apply_calibration(results_df, calibration=calibration)
-                            if ct_calibration is not None:
-                                results_df = apply_ct_calibration(results_df, ct_calibration)
-
-                if not _any_cal_succeeded:
-                    st.warning("Could not build standard curve (need ≥ 2 concentration levels with successful fits)")
-                    if manual_cf_val and manual_cf_val > 0:
-                        results_df = apply_calibration(results_df, manual_cf=manual_cf_val)
-                        st.info(f"Using manual conversion factor: {manual_cf_val:.2e} copies/D0")
-
+                # Update session state with enriched DataFrame
                 st.session_state['batch_results'] = results_df
-
-            elif cal_method == 'limited_dilution' and len(ld_wells) >= 3:
-                st.markdown("---")
-                st.subheader("📐 Limited Dilution Calibration")
-
-                ld_calibration = build_limited_dilution_calibration(
-                    results_df=results_df,
-                    ld_wells=ld_wells,
-                    no_signal_wells=no_signal_wells,
-                )
-
-                if ld_calibration is None or 'conversion_factor' not in ld_calibration:
-                    st.error("Limited dilution calibration failed.")
-                    if ld_calibration and ld_calibration.get('warnings'):
-                        for w in ld_calibration['warnings']:
-                            st.warning(w)
-                else:
-                    # Display metrics
-                    col1, col2, col3, col4 = st.columns(4)
-                    col1.metric("\u03bb (copies/well)", f"{ld_calibration['lambda_hat']:.3f}")
-                    col2.metric("Conversion Factor", f"{ld_calibration['conversion_factor']:.2e}")
-                    col3.metric("Positive Wells",
-                                f"{ld_calibration['n_positive']}/{ld_calibration['n_total']}")
-                    col4.metric("D0 (1 copy)", f"{ld_calibration['d0_single_copy']:.3e}")
-
-                    # CF with CI
-                    if not np.isnan(ld_calibration['cf_ci_lower']):
-                        st.markdown(
-                            f"**Conversion Factor:** {ld_calibration['conversion_factor']:.2e} copies/D0 "
-                            f"(95% CI: {ld_calibration['cf_ci_lower']:.2e} \u2013 "
-                            f"{ld_calibration['cf_ci_upper']:.2e})"
-                        )
-                    else:
-                        st.markdown(
-                            f"**Conversion Factor:** {ld_calibration['conversion_factor']:.2e} copies/D0"
-                        )
-
-                    st.markdown(
-                        f"**Poisson rate (\u03bb):** {ld_calibration['lambda_hat']:.3f} copies/well "
-                        f"(SE: {ld_calibration['lambda_se']:.3f})"
-                    )
-                    st.markdown(
-                        f"**Expected copies per positive well:** "
-                        f"{ld_calibration['expected_copies_per_positive']:.3f}"
-                    )
-
-                    # Warnings
-                    for w in ld_calibration.get('warnings', []):
-                        st.warning(w)
-
-                    # Diagnostic plots
-                    fig_ld = plot_limited_dilution_diagnostics(ld_calibration)
-                    st.plotly_chart(fig_ld, use_container_width=True)
-
-                    # Positive well D0 details
-                    with st.expander("🔬 Positive well D0 details"):
-                        pos_wells_list = ld_calibration['positive_wells']
-                        pos_details = results_df[
-                            results_df['Sample'].isin(pos_wells_list)
-                        ][['Sample', 'D0', 'R2']].copy()
-                        pos_details['Est. Copies'] = (
-                            pos_details['D0'] * ld_calibration['conversion_factor']
-                        )
-                        st.dataframe(pos_details, use_container_width=True)
-
-                        st.markdown(
-                            f"**D0 statistics:** mean = {ld_calibration['mean_d0_positive']:.3e}, "
-                            f"median = {ld_calibration['median_d0_positive']:.3e}"
-                        )
-                        if not np.isnan(ld_calibration['cv_d0_positive']):
-                            st.markdown(
-                                f"**CV:** {ld_calibration['cv_d0_positive']:.1f}%"
-                            )
-
-                    # Apply calibration — feed CF into apply_calibration via manual_cf
-                    results_df = apply_calibration(
-                        results_df, manual_cf=ld_calibration['conversion_factor']
-                    )
-                    st.session_state['batch_results'] = results_df
-                    st.success("✅ Copies_D0 column added from limited dilution calibration")
-
-            elif cal_method == 'manual_cf' and manual_cf_val and manual_cf_val > 0:
-                # Manual CF provided
-                st.markdown("---")
-                st.subheader("📐 Copy Number Conversion (Manual)")
-                results_df = apply_calibration(results_df, manual_cf=manual_cf_val)
-                st.session_state['batch_results'] = results_df
-                st.info(f"Applied manual conversion factor: {manual_cf_val:.2e} copies/D0")
-
-            elif cal_method == 'auto' and manual_cf_val and manual_cf_val > 0:
-                # Auto mode but no standards found — use fallback manual CF
-                st.markdown("---")
-                st.subheader("📐 Copy Number Conversion (Manual Fallback)")
-                results_df = apply_calibration(results_df, manual_cf=manual_cf_val)
-                st.session_state['batch_results'] = results_df
-                st.info(f"No standards detected. Applied fallback manual CF: {manual_cf_val:.2e} copies/D0")
-
-            # Export button (after calibration so Copies column is included)
-            csv = results_df.to_csv(index=False)
-            st.download_button(
-                "📥 Download All Results (CSV)",
-                csv,
-                "batch_fit_results.csv",
-                "text/csv",
-                key="batch_download"
-            )
-
-            # ============================================================================
-            # REPLICATE ANALYSIS SECTION
-            # ============================================================================
-            if st.session_state.get('replicate_analysis_enabled', False):
-                st.markdown("---")
-                st.subheader("📊 Replicate Analysis")
-
-                # Get grouping pattern from session state
-                pattern = st.session_state.get('grouping_pattern', 'dot')
-
-                # Parse sample groups — use Sample Name from metadata when available
-                sample_metadata_for_groups = st.session_state.get('sample_metadata')
-                has_multi_targets = 'Target' in results_df.columns and results_df['Target'].nunique() > 1
-                if sample_metadata_for_groups and pattern == 'sample_name':
-                    # Group by Sample Name from instrument metadata
-                    name_groups = {}
-                    for key, meta in sample_metadata_for_groups.items():
-                        sname = meta.get('Sample Name')
-                        if sname and str(sname) != 'nan' and str(sname).strip():
-                            sname = str(sname).strip()
-                            # For multi-target, prefix group name with target
-                            if has_multi_targets and meta.get('_target'):
-                                group_label = f"{meta['_target']} — {sname}"
-                            else:
-                                group_label = sname
-                            if key in results_df['Sample'].values:
-                                if group_label not in name_groups:
-                                    name_groups[group_label] = []
-                                name_groups[group_label].append(key)
-                    # Keep only groups with > 1 replicate
-                    sample_groups = {k: v for k, v in name_groups.items() if len(v) > 1}
-                    if sample_groups:
-                        st.info("Grouping by Sample Name from instrument metadata")
-                    else:
-                        # Fall back to pattern-based grouping
-                        sample_groups = parse_sample_groups(
-                            results_df['Sample'].tolist(), pattern='dot'
-                        )
-                elif pattern == 'manual':
-                    # Use manually defined groups from session state
-                    sample_groups = {}
-                    manual_groups_text = st.session_state.get('manual_groups_text', '')
-                    if manual_groups_text.strip():
-                        for line in manual_groups_text.strip().split('\n'):
-                            if ':' in line:
-                                group_name, samples_str = line.split(':', 1)
-                                group_name = group_name.strip()
-                                samples = [s.strip() for s in samples_str.split(',')]
-                                # Validate that samples exist in results
-                                valid_samples = [s for s in samples if s in results_df['Sample'].tolist()]
-                                if valid_samples:
-                                    sample_groups[group_name] = valid_samples
-                else:
-                    sample_groups = parse_sample_groups(
-                        results_df['Sample'].tolist(),
-                        pattern=pattern
-                    )
-
-                if len(sample_groups) == 0:
-                    st.warning("⚠️ No replicate groups found with the selected pattern")
-                else:
-                    # Add Group column to results
-                    results_with_groups = results_df.copy()
-                    group_mapping = {}
-                    for group, samples in sample_groups.items():
-                        for sample in samples:
-                            group_mapping[sample] = group
-
-                    results_with_groups['Group'] = results_with_groups['Sample'].map(
-                        lambda x: group_mapping.get(x, x)
-                    )
-
-                    # Filter to only samples that are in groups
-                    results_with_groups = results_with_groups[
-                        results_with_groups['Group'] != results_with_groups['Sample']
-                    ]
-
-                    if len(results_with_groups) == 0:
-                        st.warning("⚠️ No samples matched the grouping pattern")
-                    else:
-                        st.success(f"✅ Analyzed {len(sample_groups)} replicate groups ({len(results_with_groups)} samples total)")
-
-                        # Determine which metrics to track (only include columns that exist)
-                        rep_metrics = []
-                        for m in ['Ct', 'D0']:
-                            if m in results_with_groups.columns:
-                                rep_metrics.append(m)
-                        if 'Copies_D0' in results_with_groups.columns and results_with_groups['Copies_D0'].notna().any():
-                            rep_metrics.append('Copies_D0')
-                        if 'Copies_Ct' in results_with_groups.columns and results_with_groups['Copies_Ct'].notna().any():
-                            rep_metrics.append('Copies_Ct')
-
-                        # Calculate replicate statistics
-                        replicate_stats = calculate_replicate_stats(
-                            results_with_groups,
-                            group_column='Group',
-                            metrics=rep_metrics
-                        )
-
-                        # Precision comparison (use default efficiency unless dilution series provides better estimate)
-                        # This will be updated if dilution series is analyzed
-                        precision_comparison = compare_precision(replicate_stats, efficiency=0.95)
-
-                        # Display tabs for different analyses
-                        tab1, tab2, tab3, tab4 = st.tabs([
-                            "📈 Replicate Statistics",
-                            "🔬 Replicate Visualization",
-                            "🎯 Precision Comparison",
-                            "📉 Dilution Series"
-                        ])
-
-                        with tab1:
-                            st.markdown("**Replicate Statistics (Mean ± SD)**")
-                            st.markdown("*Coefficient of Variation (CV%) = (SD / Mean) × 100*")
-
-                            # Format for display (convert None to NaN for proper na_rep display)
-                            display_stats = replicate_stats.fillna(value=np.nan).copy()
-
-                            # Add Wells column so user can identify which wells belong to each group
-                            def _get_well_ids(group_name):
-                                keys = sample_groups.get(group_name, [])
-                                # Extract well ID: "Target::Well" -> "Well", or just use key as-is
-                                wells = [k.split('::')[-1] if '::' in k else k for k in keys]
-                                return ', '.join(sorted(wells))
-
-                            display_stats.insert(
-                                1, 'Wells',
-                                display_stats['Group'].apply(_get_well_ids)
-                            )
-
-                            format_stats_dict = {
-                                'Ct_Mean': '{:.2f}',
-                                'Ct_SD': '{:.3f}',
-                                'Ct_CV': '{:.2f}%',
-                                'Ct_Min': '{:.2f}',
-                                'Ct_Max': '{:.2f}',
-                                'D0_Mean': '{:.2e}',
-                                'D0_SD': '{:.2e}',
-                                'D0_CV': '{:.2f}%',
-                                'D0_Min': '{:.2e}',
-                                'D0_Max': '{:.2e}',
-                                'Copies_D0_Mean': '{:.2e}',
-                                'Copies_D0_SD': '{:.2e}',
-                                'Copies_D0_CV': '{:.2f}%',
-                                'Copies_D0_Min': '{:.2e}',
-                                'Copies_D0_Max': '{:.2e}',
-                                'Copies_Ct_Mean': '{:.2e}',
-                                'Copies_Ct_SD': '{:.2e}',
-                                'Copies_Ct_CV': '{:.2f}%',
-                                'Copies_Ct_Min': '{:.2e}',
-                                'Copies_Ct_Max': '{:.2e}',
-                            }
-
-                            st.dataframe(
-                                display_stats.style.format(format_stats_dict, na_rep='-'),
-                                use_container_width=True
-                            )
-
-                            # Download button for stats
-                            stats_csv = replicate_stats.to_csv(index=False)
-                            st.download_button(
-                                "📥 Download Replicate Statistics (CSV)",
-                                stats_csv,
-                                "replicate_statistics.csv",
-                                "text/csv",
-                                key="replicate_stats_download"
-                            )
-
-                        with tab2:
-                            st.markdown("### Replicate Overlay")
-                            st.markdown("Select a replicate group to overlay all replicates on one plot.")
-
-                            group_names = sorted(sample_groups.keys())
-                            selected_group = st.selectbox(
-                                "Select replicate group:",
-                                group_names,
-                                key="replicate_group_selector"
-                            )
-
-                            if selected_group:
-                                group_wells = sample_groups[selected_group]
-
-                                # Plot overlay
-                                batch_cycles = st.session_state.get('batch_cycles')
-                                batch_all_samples = st.session_state.get('batch_all_samples', {})
-                                batch_results_list = st.session_state.get('batch_results_list', [])
-
-                                if batch_cycles is not None and batch_all_samples:
-                                    fig_overlay = plot_replicate_overlay(
-                                        cycles=batch_cycles,
-                                        all_samples=batch_all_samples,
-                                        results_list=batch_results_list,
-                                        group_wells=group_wells,
-                                        group_name=selected_group
-                                    )
-                                    st.plotly_chart(fig_overlay, use_container_width=True)
-
-                                    # Parameter summary table (mean +/- SE)
-                                    st.markdown("**Parameter Summary (Mean ± SE)**")
-                                    param_summary = calculate_replicate_param_summary(
-                                        results_df, group_wells
-                                    )
-                                    # Format for display
-                                    def format_mean_se(row):
-                                        mean = row['Mean']
-                                        se = row['SE']
-                                        n = int(row['N'])
-                                        if pd.isna(mean):
-                                            return '-'
-                                        if pd.isna(se):
-                                            return f'{mean:.4e} (n={n})'
-                                        return f'{mean:.4e} ± {se:.4e} (n={n})'
-
-                                    summary_display = param_summary.apply(format_mean_se, axis=1)
-                                    summary_display.name = 'Mean ± SE (n)'
-                                    st.dataframe(summary_display.to_frame(), use_container_width=True)
-                                else:
-                                    st.warning("Batch fitting data not available for visualization.")
-
-                        with tab3:
-                            st.markdown("**Precision Comparison: Ct vs D0**")
-                            st.markdown("*Lower CV% = Better precision*")
-
-                            # Show which efficiency is being used
-                            if st.session_state.get('analyze_as_dilution', False) and len(sample_groups) >= 3:
-                                st.info("ℹ️ **Note:** Ct values are logarithmic, so Ct CV% is converted to concentration CV% using efficiency from dilution series.")
-                            else:
-                                st.info("ℹ️ **Note:** Ct values are logarithmic, so Ct CV% is converted to concentration CV% assuming 95% efficiency. Enable dilution series analysis for actual efficiency.")
-
-                            # Add color highlighting for better method
-                            def highlight_better_precision(row):
-                                if pd.isna(row['Ct_Conc_CV']) or pd.isna(row['D0_CV']):
-                                    return [''] * len(row)
-
-                                colors = [''] * len(row)
-                                ct_conc_cv_idx = precision_comparison.columns.get_loc('Ct_Conc_CV')
-                                d0_cv_idx = precision_comparison.columns.get_loc('D0_CV')
-
-                                if row['Better_Precision'] == 'Ct':
-                                    colors[ct_conc_cv_idx] = 'background-color: lightgreen'
-                                else:
-                                    colors[d0_cv_idx] = 'background-color: lightgreen'
-
-                                return colors
-
-                            format_precision_dict = {
-                                'Ct_Mean': '{:.2f}',
-                                'Ct_SD': '{:.3f}',
-                                'Ct_CV': '{:.2f}%',
-                                'Ct_Conc_CV': '{:.2f}%',
-                                'D0_Mean': '{:.2e}',
-                                'D0_CV': '{:.2f}%',
-                                'CV_Difference': '{:.2f}%'
-                            }
-
-                            st.dataframe(
-                                precision_comparison.style.format(format_precision_dict, na_rep='-').apply(
-                                    highlight_better_precision, axis=1
-                                ),
-                                use_container_width=True
-                            )
-
-                            # Summary statistics
-                            ct_wins = (precision_comparison['Better_Precision'] == 'Ct').sum()
-                            d0_wins = (precision_comparison['Better_Precision'] == 'D0').sum()
-
-                            col1, col2, col3 = st.columns(3)
-                            col1.metric("Ct Better", f"{ct_wins}/{len(precision_comparison)}")
-                            col2.metric("D0 Better", f"{d0_wins}/{len(precision_comparison)}")
-                            avg_ct_conc_cv = precision_comparison['Ct_Conc_CV'].mean()
-                            avg_d0_cv = precision_comparison['D0_CV'].mean()
-                            col3.metric("Avg CV Diff", f"{abs(avg_ct_conc_cv - avg_d0_cv):.2f}%")
-
-                            st.markdown("---")
-                            st.markdown("**Interpretation:**")
-                            if d0_wins > ct_wins:
-                                st.success(f"✅ **D0 quantification** shows better precision in {d0_wins}/{len(precision_comparison)} groups")
-                            elif ct_wins > d0_wins:
-                                st.info(f"ℹ️ **Ct method** shows better precision in {ct_wins}/{len(precision_comparison)} groups")
-                            else:
-                                st.info("ℹ️ Both methods show similar precision across groups")
-
-                            # Download button
-                            precision_csv = precision_comparison.to_csv(index=False)
-                            st.download_button(
-                                "📥 Download Precision Comparison (CSV)",
-                                precision_csv,
-                                "precision_comparison.csv",
-                                "text/csv",
-                                key="precision_comparison_download"
-                            )
-
-                        with tab4:
-                            # Check if dilution series analysis is enabled
-                            if st.session_state.get('analyze_as_dilution', False):
-                                st.markdown("**Dilution Series Analysis**")
-
-                                if len(sample_groups) < 3:
-                                    st.warning("⚠️ Need at least 3 dilution levels for analysis")
-                                else:
-                                    # Get dilution factor from session state
-                                    dilution_factor = st.session_state.get('dilution_factor', 2)
-                                    custom_dilution_factors = st.session_state.get('custom_dilution_factors', None)
-                                    groups_to_exclude = st.session_state.get('exclude_from_dilution', [])
-
-                                    # Filter out excluded groups before analysis
-                                    if groups_to_exclude:
-                                        results_filtered = results_with_groups[
-                                            ~results_with_groups['Group'].isin(groups_to_exclude)
-                                        ].copy()
-                                        st.info(f"📝 Excluding {len(groups_to_exclude)} group(s) from dilution analysis: {', '.join(groups_to_exclude)}")
-                                    else:
-                                        results_filtered = results_with_groups
-
-                                    # Run dilution series analysis
-                                    dilution_analysis = analyze_dilution_series(
-                                        results_filtered,
-                                        dilution_factors=custom_dilution_factors,  # Use custom if provided, else auto-generate
-                                        dilution_factor=dilution_factor if custom_dilution_factors is None else 2,
-                                        group_column='Group'
-                                    )
-
-                                    if 'error' in dilution_analysis:
-                                        st.error(dilution_analysis['error'])
-                                    else:
-                                        # Use efficiency from dilution series to recalculate precision comparison
-                                        ct_efficiency = dilution_analysis['ct_analysis']['efficiency'] / 100  # Convert % to fraction
-                                        precision_comparison = compare_precision(replicate_stats, efficiency=ct_efficiency)
-
-                                        # Display results
-                                        col1, col2 = st.columns(2)
-
-                                        with col1:
-                                            st.markdown("**Ct Analysis**")
-                                            ct_analysis = dilution_analysis['ct_analysis']
-                                            st.metric("R²", f"{ct_analysis['r2']:.4f}")
-                                            st.metric("Efficiency", f"{ct_analysis['efficiency']:.1f}%")
-                                            st.metric("Slope", f"{ct_analysis['slope']:.4f}")
-
-                                        with col2:
-                                            st.markdown("**D0 Analysis**")
-                                            d0_analysis = dilution_analysis['d0_analysis']
-                                            st.metric("R²", f"{d0_analysis['r2']:.4f}")
-                                            st.metric("Slope", f"{d0_analysis['slope']:.4f}")
-                                            st.caption(f"Expected: {d0_analysis['expected_slope']:.4f}")
-
-                                        # Plot comparison
-                                        st.markdown("---")
-                                        st.markdown("**Linearity Comparison**")
-
-                                        # Debug: Show error bar values
-                                        with st.expander("🔍 Debug: Error Bar Values"):
-                                            data_debug = dilution_analysis['data']
-                                            st.write("**Ct Standard Deviations:**")
-                                            st.write(data_debug[['Group', 'Ct_Mean', 'Ct_SD']].to_string())
-                                            st.write("\n**D0 Standard Deviations:**")
-                                            st.write(data_debug[['Group', 'D0_Mean', 'D0_SD']].to_string())
-
-                                        dilution_plot = plot_dilution_series_comparison(dilution_analysis)
-                                        st.plotly_chart(dilution_plot, use_container_width=True)
-
-                                        # Summary
-                                        comparison = dilution_analysis['comparison']
-                                        if comparison['better_linearity'] == 'D0':
-                                            st.success(f"✅ **D0 shows better linearity** (R² = {comparison['d0_r2']:.4f} vs {comparison['ct_r2']:.4f})")
-                                        else:
-                                            st.info(f"ℹ️ **Ct shows better linearity** (R² = {comparison['ct_r2']:.4f} vs {comparison['d0_r2']:.4f})")
-                            else:
-                                st.info("💡 Enable 'Analyze as dilution series' in the sidebar to see linearity analysis")
-
-        # Batch visualization section (outside button block, always visible if results exist)
-        if 'batch_results_list' in st.session_state and 'batch_all_samples' in st.session_state:
-            st.markdown("---")
-            st.subheader("📊 Visualize Individual Fits")
-            
-            results_list = st.session_state['batch_results_list']
-            all_samples = st.session_state['batch_all_samples']
-            cycles = st.session_state['batch_cycles']
-            batch_settings = st.session_state['batch_settings']
-            sample_metadata = st.session_state.get('sample_metadata')
-
-            # Sample selector
-            sample_names = [r['Sample'] for r in results_list]
-            selected_sample = st.selectbox(
-                "Select sample to visualize:",
-                sample_names,
-                key="batch_viz_selector"
-            )
-            
-            # Find the selected sample's index
-            selected_idx = sample_names.index(selected_sample)
-            selected_result = results_list[selected_idx]
-            
-            # Check if fit was successful
-            _success_val = selected_result.get('Success', '')
-            if (_success_val and
-                (str(_success_val).startswith('✓') or
-                 _success_val == '⚠️ k@bound' or
-                 _success_val == '⚠️ R² below target' or
-                 _success_val == '⚠️ Degenerate k')):
-                # Get the corresponding fluorescence data
-                sample_fluor = all_samples[selected_sample]
-                
-                # Use the stored parameters from batch fit to generate prediction
-                model_viz = MAK2Model()
-                
-                # Generate curve using stored parameters (use actual cycle array)
-                try:
-                    F_pred = model_viz.simulate_to_cycle(
-                        D0=selected_result['D0'],
-                        k=selected_result['k'],
-                        P0=selected_result['P0'],
-                        cycles=cycles,
-                        F_bg_intercept=selected_result['F_bg_intercept'],
-                        F_bg_slope=selected_result['F_bg_slope']
-                    )
-
-                    # Cycle-by-cycle amplification efficiency
-                    _, D_batch_eff, _ = model_viz.simulate_cycles(
-                        D0=selected_result['D0'],
-                        k=selected_result['k'],
-                        P0=selected_result['P0'],
-                        n_cycles=len(cycles),
-                        F_bg_intercept=selected_result['F_bg_intercept'],
-                        F_bg_slope=selected_result['F_bg_slope']
-                    )
-                    eff_batch = calculate_amplification_efficiency(D_batch_eff)
-
-                    # 3-row stacked plot: Fit, Residuals, Efficiency (shared x-axis)
-                    fig_batch = make_subplots(
-                        rows=3, cols=1,
-                        subplot_titles=(f"MAK2 Fit: {selected_sample}", "Residuals", "Amplification Efficiency"),
-                        vertical_spacing=0.08,
-                        row_heights=[0.50, 0.22, 0.28],
-                        shared_xaxes=True,
-                    )
-
-                    # Row 1: Data and fit
-                    fig_batch.add_trace(
-                        go.Scatter(
-                            x=cycles, y=sample_fluor,
-                            mode='markers',
-                            name='Data',
-                            marker=dict(size=8, color='blue', opacity=0.6)
-                        ),
-                        row=1, col=1
-                    )
-                    # Draw fit line only within the fit window (fit_start_cycle onwards).
-                    # Extrapolating the linear background back to cycle 0 is misleading
-                    # when the pre-fit-window data followed a non-linear trajectory
-                    # (e.g. JOE thermal transient), so we clip the line at fit_start.
-                    _vis_fit_start = selected_result.get('fit_start_cycle')
-                    if _vis_fit_start is not None:
-                        _fit_mask   = cycles >= _vis_fit_start
-                        _fit_cyc_v  = cycles[_fit_mask]
-                        _fit_pred_v = F_pred[_fit_mask]
-                    else:
-                        _fit_cyc_v  = cycles
-                        _fit_pred_v = F_pred
-                    fig_batch.add_trace(
-                        go.Scatter(
-                            x=_fit_cyc_v, y=_fit_pred_v,
-                            mode='lines',
-                            name='MAK2 Fit',
-                            line=dict(color='red', width=2)
-                        ),
-                        row=1, col=1
-                    )
-
-                    # Row 2: Residuals — only within the fit window so the plot
-                    # reflects actual fit quality, not model extrapolation error.
-                    residuals = sample_fluor - F_pred
-                    _res_in_window = residuals[cycles >= _vis_fit_start] if _vis_fit_start is not None else residuals
-                    fig_batch.add_trace(
-                        go.Scatter(
-                            x=_fit_cyc_v, y=_res_in_window,
-                            mode='markers',
-                            name='Residuals',
-                            marker=dict(size=6, color='green')
-                        ),
-                        row=2, col=1
-                    )
-                    fig_batch.add_hline(y=0, line_dash="dash", line_color="gray", row=2, col=1)
-
-                    # Row 3: Efficiency
-                    fig_batch.add_trace(
-                        go.Scatter(
-                            x=np.arange(1, len(eff_batch)+1),
-                            y=eff_batch,
-                            mode='lines+markers',
-                            name='Efficiency',
-                            marker=dict(size=4),
-                            line=dict(color='orange'),
-                        ),
-                        row=3, col=1
-                    )
-
-                    # Ct threshold line on fit plot (row 1).
-                    # The threshold is ΔRn above the linear baseline, so on the raw
-                    # Rn plot it appears as a SLOPED line: threshold(c) = slope*c + intercept + ΔRn.
-                    # This matches the instrument's display and correctly shows that the
-                    # threshold rises with the background fluorescence drift.
-                    ch_thresholds_stored = batch_settings.get('channel_thresholds', {})
-                    sample_ch = _ch(selected_sample) if '_' in selected_sample or '::' in selected_sample else 'default'
-                    ct_threshold = ch_thresholds_stored.get(
-                        sample_ch, batch_settings.get('global_threshold'))
-
-                    # Per-sample linear baseline stored during Ct computation
-                    ct_bl_slope_vis     = selected_result.get('Ct_baseline_slope', 0.0)
-                    ct_bl_intercept_vis = selected_result.get('Ct_baseline_intercept', 0.0)
-                    ct_baseline_mean    = selected_result.get(
-                        'Ct_baseline_mean',
-                        batch_settings.get('channel_baseline_means', {}).get(
-                            sample_ch, batch_settings.get('global_baseline_mean', 0.0)
-                        )
-                    )
-
-                    # ── Fit window: start (orange) and end (green) vlines ────────────
-                    fit_start_vis = selected_result.get('fit_start_cycle')
-                    if fit_start_vis is not None:
-                        for row_idx in range(1, 4):
-                            fig_batch.add_vline(
-                                x=fit_start_vis,
-                                line_dash="dash",
-                                line_color="orange",
-                                row=row_idx, col=1,
-                            )
-                        fig_batch.add_annotation(
-                            x=fit_start_vis, y=1, yref="y domain",
-                            text="Fit start", showarrow=False,
-                            xanchor="left", yanchor="top",
-                            font=dict(size=11, color="orange"),
-                            row=1, col=1,
-                        )
-
-                    # Use the stored fit_end_cycle (the last cycle the optimizer
-                    # actually included) rather than recomputing find_slope_threshold_cycle
-                    # on the full array, which can give the wrong answer when the thermal
-                    # transient shifts the apparent max-slope index.
-                    final_cycle = selected_result.get('fit_end_cycle')
-                    if final_cycle is None:
-                        # Fallback for old result dicts that don't have the key
-                        from mak2_model import find_slope_threshold_cycle
-                        trunc_idx  = find_slope_threshold_cycle(
-                            sample_fluor,
-                            cycles_after_max=batch_settings.get('cycles_after_max', 3)
-                        )
-                        final_cycle = float(cycles[min(trunc_idx, len(cycles) - 1)])
-                    if final_cycle < cycles[-1]:
-                        for row_idx in range(1, 4):
-                            fig_batch.add_vline(
-                                x=final_cycle,
-                                line_dash="dash",
-                                line_color="green",
-                                row=row_idx, col=1,
-                            )
-                        fig_batch.add_annotation(
-                            x=final_cycle, y=1, yref="y domain",
-                            text="Fit end", showarrow=False,
-                            xanchor="right", yanchor="top",
-                            font=dict(size=11, color="green"),
-                            row=1, col=1,
-                        )
-
-                    # ── Ct vertical line on all rows ─────────────────────────────────
-                    ct_val = selected_result.get('Ct', np.nan)
-                    ct_is_nan = ct_val is None or (isinstance(ct_val, float) and np.isnan(ct_val))
-                    if not ct_is_nan:
-                        for row_idx in range(1, 4):
-                            fig_batch.add_vline(
-                                x=ct_val,
-                                line_dash="dot",
-                                line_color="gray",
-                                row=row_idx, col=1,
-                            )
-                        fig_batch.add_annotation(
-                            x=ct_val, y=1, yref="y domain",
-                            text="Ct", showarrow=False,
-                            xanchor="left", yanchor="top",
-                            font=dict(size=11, color="gray"),
-                            row=1, col=1,
-                        )
-                    else:
-                        # No Ct — check if instrument flagged this as Undetermined
-                        inst_status_vis = selected_result.get('Instrument', '')
-                        if inst_status_vis:
-                            fig_batch.add_annotation(
-                                x=0.5, xref="x domain",
-                                y=0.95, yref="y domain",
-                                text=f"⚠️ Instrument: {inst_status_vis}",
-                                showarrow=False,
-                                xanchor="center", yanchor="top",
-                                font=dict(size=12, color="crimson"),
-                                bgcolor="rgba(255,255,255,0.8)",
-                                row=1, col=1,
-                            )
-
-                    # ── Threshold: short segment anchored at Ct crossing ──────────────
-                    # thresh(c) = bl_slope·c + bl_intercept + ΔRn
-                    # Draw only a ±5-cycle window around Ct so the line visually
-                    # intersects the curve at exactly the fractional Ct, with the
-                    # correct slope from the linear baseline subtraction.
-                    if ct_threshold is not None and ct_threshold > 0:
-                        _abi_meta_vis   = st.session_state.get('abi_results_meta')
-                        _rox_active_vis = st.session_state.get('rox_normalized', False)
-                        inst_drn = None
-                        if _abi_meta_vis and _rox_active_vis:
-                            inst_drn = _abi_meta_vis.get('channel_thresholds', {}).get(sample_ch)
-
-                        has_linear_baseline = (
-                            abs(ct_bl_intercept_vis) > 1e-9
-                            or abs(ct_bl_slope_vis) > 1e-12
-                        )
-
-                        # Narrow x-range centred on Ct (or midpoint if no Ct)
-                        _span = 5  # half-width in cycles
-                        if not ct_is_nan:
-                            _tx_lo = max(float(cycles[0]),  ct_val - _span)
-                            _tx_hi = min(float(cycles[-1]), ct_val + _span)
-                        else:
-                            _tx_lo, _tx_hi = float(cycles[0]), float(cycles[-1])
-                        _tx = np.linspace(_tx_lo, _tx_hi, 60)
-
-                        # The Ct baseline and threshold are in Rn units when ROX was used.
-                        # Scale to raw RFU for the plot by multiplying by mean ROX.
-                        _ct_rox_mean_vis = selected_result.get('ct_rox_mean')
-
-                        if has_linear_baseline:
-                            _ty_rn = ct_bl_slope_vis * _tx + ct_bl_intercept_vis + ct_threshold
-                        else:
-                            _ty_rn = np.full_like(_tx, float(ct_baseline_mean + ct_threshold))
-
-                        if _ct_rox_mean_vis is not None and _ct_rox_mean_vis > 0:
-                            # Convert Rn threshold line back to raw RFU
-                            _ty = _ty_rn * _ct_rox_mean_vis
-                        else:
-                            _ty = _ty_rn
-
-                        if inst_drn is not None:
-                            thresh_label = f"Threshold (ΔRn = {inst_drn})"
-                        else:
-                            thresh_label = f"Threshold (ΔRn = {ct_threshold:.4f})"
-
-                        fig_batch.add_trace(
-                            go.Scatter(
-                                x=_tx,
-                                y=_ty,
-                                mode='lines',
-                                name='Threshold',
-                                line=dict(color='purple', dash='dot', width=1.5),
-                                showlegend=False,
-                            ),
-                            row=1, col=1
-                        )
-                        fig_batch.add_annotation(
-                            x=float(_tx[-1]), y=float(_ty[-1]),
-                            text=thresh_label,
-                            showarrow=False,
-                            xanchor="left", yanchor="middle",
-                            font=dict(size=10, color="purple"),
-                            row=1, col=1,
-                        )
-
-                    fig_batch.update_xaxes(title_text="Cycle", row=3, col=1)
-                    fig_batch.update_yaxes(title_text="Fluorescence", row=1, col=1)
-                    fig_batch.update_yaxes(title_text="Residual", row=2, col=1)
-                    fig_batch.update_yaxes(title_text="Efficiency", row=3, col=1)
-                    fig_batch.update_layout(height=800, showlegend=True)
-
-                    st.plotly_chart(fig_batch, use_container_width=True)
-                    
-                    # Show parameters
-                    col1, col2, col3, col4 = st.columns(4)
-                    col1.metric("D₀", f"{selected_result['D0']:.2e}")
-                    col2.metric("k", f"{selected_result['k']:.6f}")
-                    col3.metric("P₀", f"{selected_result['P0']:.2e}")
-                    col4.metric("R²", f"{selected_result['R2']:.4f}")
-
-                    # Baseline end comparison: metadata vs estimate
-                    _bl_meta_vis = selected_result.get('bl_end_meta')
-                    _bl_est_vis  = selected_result.get('bl_end_est')
-                    if _bl_meta_vis is not None or _bl_est_vis is not None:
-                        _bl_parts = []
-                        if _bl_meta_vis is not None:
-                            _bl_parts.append(f"Instrument baseline end: cycle **{_bl_meta_vis:.0f}**")
-                        if _bl_est_vis is not None:
-                            _bl_parts.append(f"Estimated baseline end: cycle **{_bl_est_vis:.0f}**")
-                        if _bl_meta_vis is not None and _bl_est_vis is not None:
-                            _bl_diff = abs(_bl_meta_vis - _bl_est_vis)
-                            _bl_icon = "✅" if _bl_diff <= 2 else ("⚠️" if _bl_diff <= 5 else "❌")
-                            _bl_parts.append(f"{_bl_icon} Δ = {_bl_diff:.0f} cycles")
-                        st.caption(" · ".join(_bl_parts))
-
-                except Exception as e:
-                    st.error(f"Could not visualize fit: {str(e)}")
-            else:
-                st.warning(f"Fitting failed for {selected_sample}. No visualization available.")
-    
-    else:
+            except Exception as _build_err:
+                import traceback as _tb
+                st.error(f"Error enriching results: {_build_err}")
+                st.code(_tb.format_exc())
+
+    # Display batch results (outside button block, always visible if results exist)
+    if not (batch_mode and all_samples) and 'batch_results' not in st.session_state:
         # Single sample mode
         if st.sidebar.button("🔬 Fit Model", type="primary"):
             with st.spinner("Fitting MAK2 model..."):
@@ -3691,6 +2746,45 @@ if cycles is not None and fluorescence is not None:
                         verbose=True  # Enable progress output
                     )
 
+                    # ── Post-fit quality gates (same as batch mode) ──
+                    _sq_warnings = []
+                    _sq_metrics = optimizer.calculate_fit_metrics()
+                    _sq_r2 = _sq_metrics.get('r_squared')
+                    _sq_fs = float(optimizer.cycles_fit[0]) if optimizer.cycles_fit is not None and len(optimizer.cycles_fit) > 0 else None
+                    _sq_fe = float(optimizer.cycles_fit[-1]) if optimizer.cycles_fit is not None and len(optimizer.cycles_fit) > 0 else None
+
+                    # Gate 0: very poor R²
+                    if _sq_r2 is not None and _sq_r2 < 0.90:
+                        _sq_warnings.append(f"R² {_sq_r2:.4f} < 0.90")
+
+                    if _sq_fs is not None and _sq_fe is not None:
+                        # Gate 2: fit window width (≥ 8 cycles)
+                        if _sq_fe - _sq_fs < 8:
+                            _sq_warnings.append(f"Fit window {_sq_fe - _sq_fs:.0f} cycles < 8")
+
+                    # Gate 3: sigmoid shape (inflection in fit window)
+                    # Skip for late amplifiers — they may only capture the
+                    # exponential rise without reaching the inflection point.
+                    _sq_is_late = (
+                        _sq_fe is not None
+                        and _sq_fe >= float(cycles[-1]) - 1
+                    )
+                    if not _sq_is_late:
+                        try:
+                            _sq_pred = optimizer.predict(cycles)
+                            if _sq_fs is not None and _sq_fe is not None and len(_sq_pred) >= 5:
+                                _sq_win_mask = (cycles >= _sq_fs) & (cycles <= _sq_fe)
+                                _sq_pred_win = _sq_pred[_sq_win_mask]
+                                if len(_sq_pred_win) >= 5:
+                                    _sq_d1 = np.gradient(_sq_pred_win)
+                                    _sq_d2 = np.gradient(_sq_d1)
+                                    _sq_pred_range = float(np.max(_sq_pred_win) - np.min(_sq_pred_win))
+                                    _sq_d2_thresh = _sq_pred_range * 0.01
+                                    if not (np.any(_sq_d2 > _sq_d2_thresh) and np.any(_sq_d2 < -_sq_d2_thresh)):
+                                        _sq_warnings.append("No inflection (monotone curve)")
+                        except Exception:
+                            pass
+
                     st.session_state['fitted_params'] = fitted_params
                     st.session_state['optimizer'] = optimizer
 
@@ -3702,6 +2796,9 @@ if cycles is not None and fluorescence is not None:
                     import hashlib
                     data_hash = hashlib.md5(f"{cycles.tobytes()}{fluorescence.tobytes()}".encode()).hexdigest()
                     st.session_state['fitted_data_hash'] = data_hash
+
+                    if _sq_warnings:
+                        st.warning(f"⚠️ Possible non-amplification: {'; '.join(_sq_warnings)}")
                     st.success("✅ Fitting complete!")
 
                 except Exception as e:
@@ -3712,563 +2809,1631 @@ if cycles is not None and fluorescence is not None:
                         st.session_state['fit_debug_output'] = debug_output
                     st.error(f"Fitting failed: {str(e)}")
                     st.stop()
-    
-    # Display fitted results if available
-    if 'fitted_params' in st.session_state:
-        fitted_params = st.session_state['fitted_params']
-        optimizer = st.session_state['optimizer']
 
-        # Show debug output if available
-        if 'fit_debug_output' in st.session_state and st.session_state['fit_debug_output']:
-            with st.expander("🐛 Debug Output (Optimization Details)", expanded=True):
-                st.code(st.session_state['fit_debug_output'], language='text')
+# ============================================================================
+# RESULTS DISPLAY — independent of file upload / cycles state
+# These blocks only need st.session_state, so they render even if
+# the file uploader loses its reference during a long computation.
+# ============================================================================
 
-        # Results tabs
-        tab1, tab2, tab3, tab4 = st.tabs(["📊 Fit Visualization", "📈 Parameters & Metrics", "🔬 Bootstrap CI", "💾 Export"])
-        
-        with tab1:
-                # Predict fitted curve
-                F_pred = optimizer.predict(cycles)
+if 'batch_results' in st.session_state:
+    st.subheader("🔄 Batch Fitting Results")
+    results_df = st.session_state['batch_results']
+    results_list = st.session_state.get('batch_results_list', [])
 
-                # Cycle-by-cycle amplification efficiency
-                _, D_eff, _ = optimizer.model.simulate_cycles(
-                    D0=fitted_params['D0'],
-                    k=fitted_params['k'],
-                    P0=fitted_params['P0'],
-                    n_cycles=len(cycles),
-                    F_bg_intercept=fitted_params['F_bg_intercept'],
-                    F_bg_slope=fitted_params['F_bg_slope']
-                )
-                eff_per_cycle = calculate_amplification_efficiency(D_eff)
-
-                # Calculate truncation point for visualization
-                from mak2_model import find_slope_threshold_cycle
-                threshold_idx = find_slope_threshold_cycle(
-                    fluorescence,
-                    cycles_after_max=cycles_after_max
-                )
-                threshold_label = f"Max slope + {cycles_after_max} cycles"
-                threshold_cycle_num = cycles[min(threshold_idx, len(cycles)-1)]
-
-                # Calculate Ct for vertical line
-                ct_threshold_single = None
-                ct_baseline_mean_single = 0.0
-                try:
-                    ct_res_single = optimizer.calculate_ct(method='threshold')
-                    ct_val_single = ct_res_single['ct']
-                    ct_threshold_single = ct_res_single.get('threshold')
-                    ct_baseline_mean_single = ct_res_single.get('baseline_mean', 0.0)
-                except Exception:
-                    ct_val_single = np.nan
-
-                # 3-row stacked plot: Fit, Residuals, Efficiency (shared x-axis)
-                fig = make_subplots(
-                    rows=3, cols=1,
-                    subplot_titles=(
-                        f"qPCR Curve Fit (Truncated at Max Slope + {cycles_after_max})",
-                        "Residuals",
-                        "Amplification Efficiency"
-                    ),
-                    vertical_spacing=0.08,
-                    row_heights=[0.50, 0.22, 0.28],
-                    shared_xaxes=True,
-                )
-
-                # Row 1: Data and fit
-                fig.add_trace(
-                    go.Scatter(
-                        x=cycles, y=fluorescence,
-                        mode='markers',
-                        name='Data',
-                        marker=dict(size=8, color='blue', opacity=0.6)
-                    ),
-                    row=1, col=1
-                )
-                fig.add_trace(
-                    go.Scatter(
-                        x=cycles, y=F_pred,
-                        mode='lines',
-                        name='MAK2 Fit',
-                        line=dict(color='red', width=2)
-                    ),
-                    row=1, col=1
-                )
-
-                # Row 2: Residuals
-                residuals = fluorescence - F_pred
-                fig.add_trace(
-                    go.Scatter(
-                        x=cycles, y=residuals,
-                        mode='markers',
-                        name='Residuals',
-                        marker=dict(size=6, color='purple')
-                    ),
-                    row=2, col=1
-                )
-                fig.add_hline(y=0, line_dash="dash", line_color="gray", row=2, col=1)
-
-                # Row 3: Efficiency
-                fig.add_trace(
-                    go.Scatter(
-                        x=np.arange(1, len(eff_per_cycle)+1),
-                        y=eff_per_cycle,
-                        mode='lines+markers',
-                        name='Efficiency',
-                        marker=dict(size=4),
-                        line=dict(color='orange'),
-                    ),
-                    row=3, col=1
-                )
-
-                # Ct threshold horizontal line on fit plot (row 1)
-                # The threshold is relative to baseline-subtracted data (delta_rn),
-                # so plot it at baseline_mean + threshold on the raw fluorescence axis
-                if ct_threshold_single is not None and ct_threshold_single > 0:
-                    threshold_plot_y = ct_threshold_single + ct_baseline_mean_single
-                    fig.add_hline(
-                        y=threshold_plot_y,
-                        line_dash="dot",
-                        line_color="purple",
-                        line_width=1,
-                        row=1, col=1,
-                    )
-                    fig.add_annotation(
-                        x=0, xref="x domain",
-                        y=threshold_plot_y,
-                        text=f"Threshold ({threshold_plot_y:.4f})",
-                        showarrow=False,
-                        xanchor="left", yanchor="bottom",
-                        font=dict(size=10, color="purple"),
-                        row=1, col=1,
-                    )
-
-                # Ct vertical line on all rows
-                if not np.isnan(ct_val_single):
-                    for row_idx in range(1, 4):
-                        fig.add_vline(
-                            x=ct_val_single,
-                            line_dash="dot",
-                            line_color="gray",
-                            row=row_idx, col=1,
-                        )
-                        if row_idx == 1:
-                            fig.add_annotation(
-                                x=ct_val_single, y=1, yref="y domain",
-                                text="Ct", showarrow=False,
-                                xanchor="left", yanchor="top",
-                                font=dict(size=11, color="gray"),
-                                row=1, col=1,
-                            )
-
-                # Final fitted cycle vertical line on all rows
-                if threshold_cycle_num < cycles[-1]:
-                    for row_idx in range(1, 4):
-                        fig.add_vline(
-                            x=threshold_cycle_num,
-                            line_dash="dash",
-                            line_color="green",
-                            row=row_idx, col=1,
-                        )
-                        if row_idx == 1:
-                            fig.add_annotation(
-                                x=threshold_cycle_num, y=1, yref="y domain",
-                                text="Final fitted cycle", showarrow=False,
-                                xanchor="right", yanchor="top",
-                                font=dict(size=11, color="green"),
-                                row=1, col=1,
-                            )
-
-                fig.update_xaxes(title_text="Cycle", row=3, col=1)
-                fig.update_yaxes(title_text="Fluorescence", row=1, col=1)
-                fig.update_yaxes(title_text="Residual", row=2, col=1)
-                fig.update_yaxes(title_text="Efficiency", row=3, col=1)
-                fig.update_layout(height=800, showlegend=True)
-
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # Comprehensive goodness-of-fit metrics (calculated on fitted data only)
-                st.subheader("Goodness of Fit Metrics")
-                st.caption("⚠️ Metrics calculated only on the fitted region (after truncation), not the full dataset")
-                
-                metrics = optimizer.calculate_fit_metrics()
-                
-                # Display main metrics in columns
-                col1, col2, col3, col4 = st.columns(4)
-                col1.metric("R²", f"{metrics['r_squared']:.6f}", 
-                           help="Coefficient of determination. Can be negative for poor nonlinear fits!")
-                col2.metric("RMSE", f"{metrics['rmse']:.4f}", 
-                           help="Root Mean Squared Error (fluorescence units)")
-                col3.metric("NRMSE", f"{metrics['nrmse']*100:.2f}%",
-                           help="Normalized RMSE (% of signal range)")
-                # Show quality indicator based on R²
-                quality = "✅ Excellent" if metrics['r_squared'] >= 0.999 else "⚠️ Check fit"
-                col4.metric("Fit Quality", quality,
-                           help="Based on R² threshold (≥0.999 = excellent)")
-                
-                # Additional metrics in expander
-                with st.expander("📊 Additional Fit Metrics"):
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.metric("MAE", f"{metrics['mae']:.4f}", 
-                                 help="Mean Absolute Error")
-                        st.metric("MAPE", f"{metrics['mape']:.2f}%",
-                                 help="Mean Absolute Percentage Error")
-                        st.metric("SSR", f"{metrics['ssr']:.6f}",
-                                 help="Sum of Squared Residuals")
-                    with col2:
-                        st.metric("AIC", f"{metrics['aic']:.2f}",
-                                 help="Akaike Information Criterion (lower is better)")
-                        st.metric("BIC", f"{metrics['bic']:.2f}",
-                                 help="Bayesian Information Criterion (lower is better)")
-                        st.metric("Reduced χ²", f"{metrics['reduced_chi_sq']:.4f}",
-                                 help="Chi-squared per degree of freedom")
-                    
-                    st.caption(f"**Data points:** {metrics['n_points']} (after truncation) | "
-                              f"**Parameters:** {metrics['n_params']} | "
-                              f"**Degrees of freedom:** {metrics['dof']}")
-            
-        with tab2:
-            st.subheader("Fitted Parameters")
-                
-            param_df = pd.DataFrame({
-                'Parameter': ['D₀ (Initial DNA)', 'k (PCR constant)', 'P₀ (Initial primer)',
-                             'F_bg (intercept)', 'F_bg_slope'],
-                'Value': [
-                    f"{fitted_params['D0']:.2e}",  # D0 in fluorescence units - scientific notation
-                    f"{fitted_params['k']:.6f}",
-                    f"{fitted_params['P0']:.4e}",
-                    f"{fitted_params['F_bg_intercept']:.6f}",
-                    f"{fitted_params['F_bg_slope']:.6f}"
-                ],
-                'Description': [
-                    'Initial template fluorescence (fluorescence units)',
-                    'Ratio of primer binding to reannealing rate',
-                    'Initial primer concentration',
-                    'Background fluorescence (constant)',
-                    'Background fluorescence (linear slope)'
-                ]
-            })
-                
-            st.dataframe(param_df, use_container_width=True)
-            
-        with tab3:
-            st.subheader("🔬 Bootstrap Confidence Intervals")
-                
-            st.markdown("""
-            **Get professional-grade uncertainty estimates for your parameters!**
-                
-            Bootstrap analysis provides 95% confidence intervals by:
-            1. Resampling residuals from your fit 1000 times
-            2. Refitting the model to each bootstrap sample
-            3. Calculating percentile-based confidence intervals
-                
-            ⏱️ **Analysis time:** 10-30 minutes  
-            📊 **Output:** Confidence intervals + distribution plots
-            """)
-                
-            # Initialize session state for bootstrap
-            if 'bootstrap_running' not in st.session_state:
-                st.session_state.bootstrap_running = False
-            if 'bootstrap_results' not in st.session_state:
-                st.session_state.bootstrap_results = None
-            if 'bootstrap_sample_name' not in st.session_state:
-                st.session_state.bootstrap_sample_name = None
-                
-            # Determine current sample name
-            if batch_mode:
-                current_sample_name = preview_sample
-            else:
-                current_sample_name = "single_sample"
-                
-            # Clear bootstrap results if sample changed
-            if st.session_state.bootstrap_sample_name != current_sample_name:
-                st.session_state.bootstrap_results = None
-                st.session_state.bootstrap_sample_name = current_sample_name
-                
-            # Email input
-            st.markdown("### Run Bootstrap Analysis")
-            if batch_mode:
-                st.info(f"📊 **Current sample:** {current_sample_name}\n\nBootstrap will run on this sample only. Change preview sample to bootstrap a different curve.")
-            else:
-                st.info("⚠️ Your browser will need to stay open during analysis (~10-30 minutes)")
-                
-            col1, col2 = st.columns([2, 1])
-            with col1:
-                n_bootstrap = st.number_input("Number of bootstrap iterations", 
-                                             min_value=100, max_value=2000, value=1000, step=100,
-                                             help="More iterations = better CI estimates but longer runtime",
-                                             key="n_bootstrap_input")
-            with col2:
-                estimated_time = n_bootstrap / 1000 * 15  # ~15 min for 1000
-                st.metric("Estimated Time", f"{estimated_time:.0f} min")
-                
-            # Show existing results first if they exist
-            if st.session_state.bootstrap_results is not None:
-                st.success("✅ Bootstrap analysis complete!")
-                # Display results here (we'll move the display code up)
-                
-            # Run button (disabled if already running or have results)
-            run_bootstrap = st.button(
-                "▶️ Run Bootstrap Analysis", 
-                type="primary", 
-                use_container_width=True,
-                disabled=st.session_state.bootstrap_running or st.session_state.bootstrap_results is not None,
-                key="run_bootstrap_btn"
+    # Target filter for multiplexed data
+    display_df = results_df
+    if 'Target' in results_df.columns:
+        unique_targets = results_df['Target'].unique().tolist()
+        if len(unique_targets) > 1:
+            target_filter = st.selectbox(
+                "Filter by target:",
+                ["All targets"] + unique_targets,
+                key="target_display_filter"
             )
+            if target_filter != "All targets":
+                display_df = results_df[results_df['Target'] == target_filter]
+
+    # Format numeric columns
+    format_dict = {
+        'Ct': '{:.2f}',
+        'Ct_instrument': '{:.2f}',
+        'D0': '{:.2e}',
+        'k': '{:.6f}',
+        'P0': '{:.2e}',
+        'F_bg_intercept': '{:.6f}',
+        'F_bg_slope': '{:.6f}',
+        'R2': '{:.6f}',
+        'RMSE': '{:.4f}',
+        'NRMSE': '{:.2f}',
+        'SSR': '{:.6f}',
+        'Known_Copies': '{:.2e}',
+        'Copies_D0': '{:.2e}',
+        'Copies_Ct': '{:.2e}',
+    }
+
+    try:
+        st.dataframe(display_df.style.format(format_dict, na_rep='-'), use_container_width=True)
+    except Exception as _disp_err:
+        st.warning(f"Display formatting error: {_disp_err}")
+        st.dataframe(display_df, use_container_width=True)
+        
+    # Summary statistics
+    col1, col2, col3 = st.columns(3)
+    successful = results_df['Success'].fillna('').str.contains('✓').sum()
+    col1.metric("Successful Fits", f"{successful}/{len(results_list)}")
+    if successful > 0:
+        _ok_r2 = results_df.loc[results_df['Success'].fillna('').str.contains('✓'), 'R2'].dropna()
+        if len(_ok_r2) > 0:
+            col2.metric("Mean R²", f"{_ok_r2.mean():.4f}")
+            col3.metric("Median R²", f"{_ok_r2.median():.4f}")
+        
+    # Show no-signal samples if any
+    if 'batch_no_signal_samples' in st.session_state and st.session_state['batch_no_signal_samples']:
+        no_signal_samples = st.session_state['batch_no_signal_samples']
+        with st.expander(f"⚠️ {len(no_signal_samples)} samples skipped (no signal detected)"):
+            no_signal_df = pd.DataFrame([
+                {
+                    'Sample': name,
+                    'Reason': info['reason'],
+                    'Fluorescence Range': f"{info['F_range']:.4f}",
+                    '% of Max on Plate': f"{info['F_range_pct']:.1f}%"
+                }
+                for name, info in no_signal_samples.items()
+            ])
+            st.dataframe(no_signal_df, use_container_width=True)
+
+    # ============================================================================
+    # CALIBRATION SECTION
+    # ============================================================================
+    sample_metadata = st.session_state.get('sample_metadata')
+    manual_cf_val = st.session_state.get('manual_conversion_factor')
+    cal_method = st.session_state.get('calibration_method', 'auto')
+
+    has_standards = (
+        cal_method == 'auto' and
+        sample_metadata is not None and
+        any(m.get('Task') == 'STANDARD' for m in sample_metadata.values())
+    )
+
+    ld_wells = st.session_state.get('ld_wells', [])
+    no_signal_wells = list(st.session_state.get('batch_no_signal_samples', {}).keys())
+
+    if has_standards:
+        st.markdown("---")
+        st.subheader("📐 Standard Curve Calibration")
+
+        # Determine if we need per-channel standard curves
+        _has_multi_ch = 'Channel' in results_df.columns and results_df['Channel'].nunique() > 1
+        _cal_channels = list(results_df['Channel'].unique()) if _has_multi_ch else [None]
+
+        _any_cal_succeeded = False
+        _per_ch_cals = {}  # channel → (calibration, ct_calibration)
+
+        for _cal_ch in _cal_channels:
+            # Filter results and metadata to this channel
+            if _cal_ch is not None:
+                _ch_mask = results_df['Channel'] == _cal_ch
+                _ch_df = results_df[_ch_mask].copy()
+                # Filter sample_metadata to keys starting with this channel
+                _ch_meta = {k: v for k, v in (sample_metadata or {}).items()
+                            if k.startswith(f"{_cal_ch}_")}
+            else:
+                _ch_df = results_df
+                _ch_meta = sample_metadata
+
+            calibration = build_standard_curve(_ch_df, _ch_meta)
+            ct_calibration = build_ct_standard_curve(_ch_df, _ch_meta)
+            _per_ch_cals[_cal_ch] = (calibration, ct_calibration)
+
+            if calibration is None and ct_calibration is None:
+                continue
+            _any_cal_succeeded = True
+
+            _ch_label = f" ({_cal_ch})" if _cal_ch else ""
+
+            # Determine side-by-side layout
+            both_succeeded = calibration is not None and ct_calibration is not None
+            if both_succeeded:
+                col_d0, col_ct = st.columns(2)
+            else:
+                col_d0 = st.container() if calibration is not None else None
+                col_ct = st.container() if ct_calibration is not None else None
+
+            # ── D0 Calibration (left column) ──────────────────────
+            if calibration is not None and col_d0 is not None:
+                with col_d0:
+                    st.markdown(f"#### D0-Based Standard Curve{_ch_label}")
+                    m1, m2 = st.columns(2)
+                    m1.metric("Slope", f"{calibration['slope']:.4f}")
+                    m2.metric("R\u00b2", f"{calibration['r_squared']:.6f}")
+
+                    st.markdown(
+                        f"**log\u2081\u2080(copies) = {calibration['slope']:.4f} "
+                        f"\u00d7 log\u2081\u2080(D0) + {calibration['intercept']:.4f}**"
+                    )
+                    st.caption(
+                        f"Standards: {calibration['n_standards']} wells, "
+                        f"{calibration['n_concentrations']} levels"
+                    )
+                    cf_spread = calibration.get('cf_spread', np.nan)
+                    if not np.isnan(cf_spread):
+                        st.caption(
+                            f"Median CF = {calibration['median_cf']:.2e} "
+                            f"(spread: {cf_spread:.2f}\u00d7 across levels)"
+                        )
+                    if not np.isnan(calibration['pooled_replicate_cv']):
+                        st.caption(
+                            f"Replicate pooled CV = {calibration['pooled_replicate_cv']:.1f}%"
+                        )
+
+                    for w in calibration.get('warnings', []):
+                        st.warning(w)
+
+                    fig_cal = plot_calibration(calibration, channel_label=_ch_label)
+                    st.plotly_chart(fig_cal, use_container_width=True)
+
+            # ── Ct Calibration (right column) ─────────────────────
+            if ct_calibration is not None and col_ct is not None:
+                with col_ct:
+                    st.markdown(f"#### Ct-Based Standard Curve{_ch_label}")
+                    m1, m2 = st.columns(2)
+                    m1.metric("Efficiency", f"{ct_calibration['efficiency']*100:.1f}%")
+                    m2.metric("R\u00b2", f"{ct_calibration['r_squared']:.4f}")
+
+                    st.markdown(
+                        f"**log\u2081\u2080(copies) = {ct_calibration['slope']:.4f} \u00d7 Ct "
+                        f"+ {ct_calibration['intercept']:.4f}**"
+                    )
+                    st.caption(
+                        f"Standards: {ct_calibration['n_standards']} wells, "
+                        f"{ct_calibration['n_concentrations']} levels"
+                    )
+                    if not np.isnan(ct_calibration['pooled_replicate_cv']):
+                        st.caption(
+                            f"Replicate pooled Ct CV = {ct_calibration['pooled_replicate_cv']:.1f}%"
+                        )
+
+                    for w in ct_calibration.get('warnings', []):
+                        st.warning(w)
+
+                    fig_ct = plot_ct_calibration(ct_calibration, channel_label=_ch_label)
+                    st.plotly_chart(fig_ct, use_container_width=True)
+
+            # ── Per-level replicate variance ───────────────────────
+            with st.expander(f"📊 Replicate variance by concentration level{_ch_label}"):
+                var_data = []
+                if calibration is not None:
+                    for copies_val, var_info in sorted(
+                        calibration['replicate_variance'].items(), reverse=True
+                    ):
+                        row = {
+                            'Known Copies': f"{copies_val:.2e}",
+                            'N Replicates': var_info['n_replicates'],
+                            'Mean D0': f"{var_info['mean_D0']:.4e}",
+                            'SD D0': f"{var_info['sd_D0']:.4e}" if not np.isnan(var_info['sd_D0']) else '-',
+                            'D0 CV%': f"{var_info['cv_D0_pct']:.1f}" if not np.isnan(var_info['cv_D0_pct']) else '-',
+                        }
+                        if ct_calibration is not None:
+                            ct_var = ct_calibration['replicate_variance'].get(copies_val)
+                            if ct_var:
+                                row['Mean Ct'] = f"{ct_var['mean_Ct']:.2f}"
+                                row['SD Ct'] = f"{ct_var['sd_Ct']:.3f}" if not np.isnan(ct_var['sd_Ct']) else '-'
+                                row['Ct CV%'] = f"{ct_var['cv_Ct_pct']:.2f}" if not np.isnan(ct_var['cv_Ct_pct']) else '-'
+                        var_data.append(row)
+                st.dataframe(pd.DataFrame(var_data), use_container_width=True)
+
+            # ── Apply calibration for this channel ─────────────────
+            if _cal_ch is not None:
+                _ch_mask = results_df['Channel'] == _cal_ch
+                if calibration is not None:
+                    cal_subset = apply_calibration(results_df[_ch_mask].copy(), calibration=calibration)
+                    results_df.loc[_ch_mask, 'Copies_D0'] = cal_subset['Copies_D0']
+                if ct_calibration is not None:
+                    ct_subset = apply_ct_calibration(results_df[_ch_mask].copy(), ct_calibration)
+                    results_df.loc[_ch_mask, 'Copies_Ct'] = ct_subset['Copies_Ct']
+            else:
+                # Single-channel or Target-based handling
+                if 'Target' in results_df.columns:
+                    std_targets = set()
+                    for key, meta in (sample_metadata or {}).items():
+                        if meta.get('Task') == 'STANDARD':
+                            std_targets.add(meta.get('_target', ''))
+                    if std_targets and len(std_targets) == 1:
+                        cal_target = list(std_targets)[0]
+                        mask = results_df['Target'] == cal_target
+                        if calibration is not None:
+                            cal_subset = apply_calibration(results_df[mask].copy(), calibration=calibration)
+                            results_df.loc[mask, 'Copies_D0'] = cal_subset['Copies_D0']
+                        if ct_calibration is not None:
+                            ct_subset = apply_ct_calibration(results_df[mask].copy(), ct_calibration)
+                            results_df.loc[mask, 'Copies_Ct'] = ct_subset['Copies_Ct']
+                        other_targets = [t for t in results_df['Target'].unique() if t != cal_target]
+                        if other_targets:
+                            st.info(f"ℹ️ Other targets ({', '.join(other_targets)}) do not have standards — no copy numbers assigned.")
+                    else:
+                        if calibration is not None:
+                            results_df = apply_calibration(results_df, calibration=calibration)
+                        if ct_calibration is not None:
+                            results_df = apply_ct_calibration(results_df, ct_calibration)
+                else:
+                    if calibration is not None:
+                        results_df = apply_calibration(results_df, calibration=calibration)
+                    if ct_calibration is not None:
+                        results_df = apply_ct_calibration(results_df, ct_calibration)
+
+        if not _any_cal_succeeded:
+            st.warning("Could not build standard curve (need ≥ 2 concentration levels with successful fits)")
+            if manual_cf_val and manual_cf_val > 0:
+                results_df = apply_calibration(results_df, manual_cf=manual_cf_val)
+                st.info(f"Using manual conversion factor: {manual_cf_val:.2e} copies/D0")
+
+        st.session_state['batch_results'] = results_df
+
+    elif cal_method == 'limited_dilution' and len(ld_wells) >= 3:
+        st.markdown("---")
+        st.subheader("📐 Limited Dilution Calibration")
+
+        ld_calibration = build_limited_dilution_calibration(
+            results_df=results_df,
+            ld_wells=ld_wells,
+            no_signal_wells=no_signal_wells,
+        )
+
+        if ld_calibration is None or 'conversion_factor' not in ld_calibration:
+            st.error("Limited dilution calibration failed.")
+            if ld_calibration and ld_calibration.get('warnings'):
+                for w in ld_calibration['warnings']:
+                    st.warning(w)
+        else:
+            # Display metrics
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("\u03bb (copies/well)", f"{ld_calibration['lambda_hat']:.3f}")
+            col2.metric("Conversion Factor", f"{ld_calibration['conversion_factor']:.2e}")
+            col3.metric("Positive Wells",
+                        f"{ld_calibration['n_positive']}/{ld_calibration['n_total']}")
+            col4.metric("D0 (1 copy)", f"{ld_calibration['d0_single_copy']:.3e}")
+
+            # CF with CI
+            if not np.isnan(ld_calibration['cf_ci_lower']):
+                st.markdown(
+                    f"**Conversion Factor:** {ld_calibration['conversion_factor']:.2e} copies/D0 "
+                    f"(95% CI: {ld_calibration['cf_ci_lower']:.2e} \u2013 "
+                    f"{ld_calibration['cf_ci_upper']:.2e})"
+                )
+            else:
+                st.markdown(
+                    f"**Conversion Factor:** {ld_calibration['conversion_factor']:.2e} copies/D0"
+                )
+
+            st.markdown(
+                f"**Poisson rate (\u03bb):** {ld_calibration['lambda_hat']:.3f} copies/well "
+                f"(SE: {ld_calibration['lambda_se']:.3f})"
+            )
+            st.markdown(
+                f"**Expected copies per positive well:** "
+                f"{ld_calibration['expected_copies_per_positive']:.3f}"
+            )
+
+            # Warnings
+            for w in ld_calibration.get('warnings', []):
+                st.warning(w)
+
+            # Diagnostic plots
+            fig_ld = plot_limited_dilution_diagnostics(ld_calibration)
+            st.plotly_chart(fig_ld, use_container_width=True)
+
+            # Positive well D0 details
+            with st.expander("🔬 Positive well D0 details"):
+                pos_wells_list = ld_calibration['positive_wells']
+                pos_details = results_df[
+                    results_df['Sample'].isin(pos_wells_list)
+                ][['Sample', 'D0', 'R2']].copy()
+                pos_details['Est. Copies'] = (
+                    pos_details['D0'] * ld_calibration['conversion_factor']
+                )
+                st.dataframe(pos_details, use_container_width=True)
+
+                st.markdown(
+                    f"**D0 statistics:** mean = {ld_calibration['mean_d0_positive']:.3e}, "
+                    f"median = {ld_calibration['median_d0_positive']:.3e}"
+                )
+                if not np.isnan(ld_calibration['cv_d0_positive']):
+                    st.markdown(
+                        f"**CV:** {ld_calibration['cv_d0_positive']:.1f}%"
+                    )
+
+            # Apply calibration — feed CF into apply_calibration via manual_cf
+            results_df = apply_calibration(
+                results_df, manual_cf=ld_calibration['conversion_factor']
+            )
+            st.session_state['batch_results'] = results_df
+            st.success("✅ Copies_D0 column added from limited dilution calibration")
+
+    elif cal_method == 'manual_cf' and manual_cf_val and manual_cf_val > 0:
+        # Manual CF provided
+        st.markdown("---")
+        st.subheader("📐 Copy Number Conversion (Manual)")
+        results_df = apply_calibration(results_df, manual_cf=manual_cf_val)
+        st.session_state['batch_results'] = results_df
+        st.info(f"Applied manual conversion factor: {manual_cf_val:.2e} copies/D0")
+
+    elif cal_method == 'auto' and manual_cf_val and manual_cf_val > 0:
+        # Auto mode but no standards found — use fallback manual CF
+        st.markdown("---")
+        st.subheader("📐 Copy Number Conversion (Manual Fallback)")
+        results_df = apply_calibration(results_df, manual_cf=manual_cf_val)
+        st.session_state['batch_results'] = results_df
+        st.info(f"No standards detected. Applied fallback manual CF: {manual_cf_val:.2e} copies/D0")
+
+    # Export button (after calibration so Copies column is included)
+    csv = results_df.to_csv(index=False)
+    st.download_button(
+        "📥 Download All Results (CSV)",
+        csv,
+        "batch_fit_results.csv",
+        "text/csv",
+        key="batch_download"
+    )
+
+    # ============================================================================
+    # REPLICATE ANALYSIS SECTION
+    # ============================================================================
+    if st.session_state.get('replicate_analysis_enabled', False):
+        st.markdown("---")
+        st.subheader("📊 Replicate Analysis")
+
+        # Get grouping pattern from session state
+        pattern = st.session_state.get('grouping_pattern', 'dot')
+
+        # Parse sample groups — use Sample Name from metadata when available
+        sample_metadata_for_groups = st.session_state.get('sample_metadata')
+        has_multi_targets = 'Target' in results_df.columns and results_df['Target'].nunique() > 1
+        if sample_metadata_for_groups and pattern == 'sample_name':
+            # Group by Sample Name from instrument metadata
+            name_groups = {}
+            for key, meta in sample_metadata_for_groups.items():
+                sname = meta.get('Sample Name')
+                if sname and str(sname) != 'nan' and str(sname).strip():
+                    sname = str(sname).strip()
+                    # For multi-target, prefix group name with target
+                    if has_multi_targets and meta.get('_target'):
+                        group_label = f"{meta['_target']} — {sname}"
+                    else:
+                        group_label = sname
+                    if key in results_df['Sample'].values:
+                        if group_label not in name_groups:
+                            name_groups[group_label] = []
+                        name_groups[group_label].append(key)
+            # Keep only groups with > 1 replicate
+            sample_groups = {k: v for k, v in name_groups.items() if len(v) > 1}
+            if sample_groups:
+                st.info("Grouping by Sample Name from instrument metadata")
+            else:
+                # Fall back to pattern-based grouping
+                sample_groups = parse_sample_groups(
+                    results_df['Sample'].tolist(), pattern='dot'
+                )
+        elif pattern == 'manual':
+            # Use manually defined groups from session state
+            sample_groups = {}
+            manual_groups_text = st.session_state.get('manual_groups_text', '')
+            if manual_groups_text.strip():
+                for line in manual_groups_text.strip().split('\n'):
+                    if ':' in line:
+                        group_name, samples_str = line.split(':', 1)
+                        group_name = group_name.strip()
+                        samples = [s.strip() for s in samples_str.split(',')]
+                        # Validate that samples exist in results
+                        valid_samples = [s for s in samples if s in results_df['Sample'].tolist()]
+                        if valid_samples:
+                            sample_groups[group_name] = valid_samples
+        else:
+            sample_groups = parse_sample_groups(
+                results_df['Sample'].tolist(),
+                pattern=pattern
+            )
+
+        if len(sample_groups) == 0:
+            st.warning("⚠️ No replicate groups found with the selected pattern")
+        else:
+            # Add Group column to results
+            results_with_groups = results_df.copy()
+            group_mapping = {}
+            for group, samples in sample_groups.items():
+                for sample in samples:
+                    group_mapping[sample] = group
+
+            results_with_groups['Group'] = results_with_groups['Sample'].map(
+                lambda x: group_mapping.get(x, x)
+            )
+
+            # Filter to only samples that are in groups
+            results_with_groups = results_with_groups[
+                results_with_groups['Group'] != results_with_groups['Sample']
+            ]
+
+            if len(results_with_groups) == 0:
+                st.warning("⚠️ No samples matched the grouping pattern")
+            else:
+                st.success(f"✅ Analyzed {len(sample_groups)} replicate groups ({len(results_with_groups)} samples total)")
+
+                # Determine which metrics to track (only include columns that exist)
+                rep_metrics = []
+                for m in ['Ct', 'D0']:
+                    if m in results_with_groups.columns:
+                        rep_metrics.append(m)
+                if 'Copies_D0' in results_with_groups.columns and results_with_groups['Copies_D0'].notna().any():
+                    rep_metrics.append('Copies_D0')
+                if 'Copies_Ct' in results_with_groups.columns and results_with_groups['Copies_Ct'].notna().any():
+                    rep_metrics.append('Copies_Ct')
+
+                # Calculate replicate statistics
+                replicate_stats = calculate_replicate_stats(
+                    results_with_groups,
+                    group_column='Group',
+                    metrics=rep_metrics
+                )
+
+                # Precision comparison (use default efficiency unless dilution series provides better estimate)
+                # This will be updated if dilution series is analyzed
+                precision_comparison = compare_precision(replicate_stats, efficiency=0.95)
+
+                # Display tabs for different analyses
+                tab1, tab2, tab3, tab4 = st.tabs([
+                    "📈 Replicate Statistics",
+                    "🔬 Replicate Visualization",
+                    "🎯 Precision Comparison",
+                    "📉 Dilution Series"
+                ])
+
+                with tab1:
+                    st.markdown("**Replicate Statistics (Mean ± SD)**")
+                    st.markdown("*Coefficient of Variation (CV%) = (SD / Mean) × 100*")
+
+                    # Format for display (convert None to NaN for proper na_rep display)
+                    display_stats = replicate_stats.fillna(value=np.nan).copy()
+
+                    # Add Wells column so user can identify which wells belong to each group
+                    def _get_well_ids(group_name):
+                        keys = sample_groups.get(group_name, [])
+                        # Extract well ID: "Target::Well" -> "Well", or just use key as-is
+                        wells = [k.split('::')[-1] if '::' in k else k for k in keys]
+                        return ', '.join(sorted(wells))
+
+                    display_stats.insert(
+                        1, 'Wells',
+                        display_stats['Group'].apply(_get_well_ids)
+                    )
+
+                    format_stats_dict = {
+                        'Ct_Mean': '{:.2f}',
+                        'Ct_SD': '{:.3f}',
+                        'Ct_CV': '{:.2f}%',
+                        'Ct_Min': '{:.2f}',
+                        'Ct_Max': '{:.2f}',
+                        'D0_Mean': '{:.2e}',
+                        'D0_SD': '{:.2e}',
+                        'D0_CV': '{:.2f}%',
+                        'D0_Min': '{:.2e}',
+                        'D0_Max': '{:.2e}',
+                        'Copies_D0_Mean': '{:.2e}',
+                        'Copies_D0_SD': '{:.2e}',
+                        'Copies_D0_CV': '{:.2f}%',
+                        'Copies_D0_Min': '{:.2e}',
+                        'Copies_D0_Max': '{:.2e}',
+                        'Copies_Ct_Mean': '{:.2e}',
+                        'Copies_Ct_SD': '{:.2e}',
+                        'Copies_Ct_CV': '{:.2f}%',
+                        'Copies_Ct_Min': '{:.2e}',
+                        'Copies_Ct_Max': '{:.2e}',
+                    }
+
+                    st.dataframe(
+                        display_stats.style.format(format_stats_dict, na_rep='-'),
+                        use_container_width=True
+                    )
+
+                    # Download button for stats
+                    stats_csv = replicate_stats.to_csv(index=False)
+                    st.download_button(
+                        "📥 Download Replicate Statistics (CSV)",
+                        stats_csv,
+                        "replicate_statistics.csv",
+                        "text/csv",
+                        key="replicate_stats_download"
+                    )
+
+                with tab2:
+                    st.markdown("### Replicate Overlay")
+                    st.markdown("Select a replicate group to overlay all replicates on one plot.")
+
+                    group_names = sorted(sample_groups.keys())
+                    selected_group = st.selectbox(
+                        "Select replicate group:",
+                        group_names,
+                        key="replicate_group_selector"
+                    )
+
+                    if selected_group:
+                        group_wells = sample_groups[selected_group]
+
+                        # Plot overlay
+                        batch_cycles = st.session_state.get('batch_cycles')
+                        batch_all_samples = st.session_state.get('batch_all_samples', {})
+                        batch_results_list = st.session_state.get('batch_results_list', [])
+
+                        if batch_cycles is not None and batch_all_samples:
+                            fig_overlay = plot_replicate_overlay(
+                                cycles=batch_cycles,
+                                all_samples=batch_all_samples,
+                                results_list=batch_results_list,
+                                group_wells=group_wells,
+                                group_name=selected_group
+                            )
+                            st.plotly_chart(fig_overlay, use_container_width=True)
+
+                            # Parameter summary table (mean +/- SE)
+                            st.markdown("**Parameter Summary (Mean ± SE)**")
+                            param_summary = calculate_replicate_param_summary(
+                                results_df, group_wells
+                            )
+                            # Format for display
+                            def format_mean_se(row):
+                                mean = row['Mean']
+                                se = row['SE']
+                                n = int(row['N'])
+                                if pd.isna(mean):
+                                    return '-'
+                                if pd.isna(se):
+                                    return f'{mean:.4e} (n={n})'
+                                return f'{mean:.4e} ± {se:.4e} (n={n})'
+
+                            summary_display = param_summary.apply(format_mean_se, axis=1)
+                            summary_display.name = 'Mean ± SE (n)'
+                            st.dataframe(summary_display.to_frame(), use_container_width=True)
+                        else:
+                            st.warning("Batch fitting data not available for visualization.")
+
+                with tab3:
+                    st.markdown("**Precision Comparison: Ct vs D0**")
+                    st.markdown("*Lower CV% = Better precision*")
+
+                    # Show which efficiency is being used
+                    if st.session_state.get('analyze_as_dilution', False) and len(sample_groups) >= 3:
+                        st.info("ℹ️ **Note:** Ct values are logarithmic, so Ct CV% is converted to concentration CV% using efficiency from dilution series.")
+                    else:
+                        st.info("ℹ️ **Note:** Ct values are logarithmic, so Ct CV% is converted to concentration CV% assuming 95% efficiency. Enable dilution series analysis for actual efficiency.")
+
+                    # Add color highlighting for better method
+                    def highlight_better_precision(row):
+                        if pd.isna(row['Ct_Conc_CV']) or pd.isna(row['D0_CV']):
+                            return [''] * len(row)
+
+                        colors = [''] * len(row)
+                        ct_conc_cv_idx = precision_comparison.columns.get_loc('Ct_Conc_CV')
+                        d0_cv_idx = precision_comparison.columns.get_loc('D0_CV')
+
+                        if row['Better_Precision'] == 'Ct':
+                            colors[ct_conc_cv_idx] = 'background-color: lightgreen'
+                        else:
+                            colors[d0_cv_idx] = 'background-color: lightgreen'
+
+                        return colors
+
+                    format_precision_dict = {
+                        'Ct_Mean': '{:.2f}',
+                        'Ct_SD': '{:.3f}',
+                        'Ct_CV': '{:.2f}%',
+                        'Ct_Conc_CV': '{:.2f}%',
+                        'D0_Mean': '{:.2e}',
+                        'D0_CV': '{:.2f}%',
+                        'CV_Difference': '{:.2f}%'
+                    }
+
+                    st.dataframe(
+                        precision_comparison.style.format(format_precision_dict, na_rep='-').apply(
+                            highlight_better_precision, axis=1
+                        ),
+                        use_container_width=True
+                    )
+
+                    # Summary statistics
+                    ct_wins = (precision_comparison['Better_Precision'] == 'Ct').sum()
+                    d0_wins = (precision_comparison['Better_Precision'] == 'D0').sum()
+
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Ct Better", f"{ct_wins}/{len(precision_comparison)}")
+                    col2.metric("D0 Better", f"{d0_wins}/{len(precision_comparison)}")
+                    avg_ct_conc_cv = precision_comparison['Ct_Conc_CV'].mean()
+                    avg_d0_cv = precision_comparison['D0_CV'].mean()
+                    col3.metric("Avg CV Diff", f"{abs(avg_ct_conc_cv - avg_d0_cv):.2f}%")
+
+                    st.markdown("---")
+                    st.markdown("**Interpretation:**")
+                    if d0_wins > ct_wins:
+                        st.success(f"✅ **D0 quantification** shows better precision in {d0_wins}/{len(precision_comparison)} groups")
+                    elif ct_wins > d0_wins:
+                        st.info(f"ℹ️ **Ct method** shows better precision in {ct_wins}/{len(precision_comparison)} groups")
+                    else:
+                        st.info("ℹ️ Both methods show similar precision across groups")
+
+                    # Download button
+                    precision_csv = precision_comparison.to_csv(index=False)
+                    st.download_button(
+                        "📥 Download Precision Comparison (CSV)",
+                        precision_csv,
+                        "precision_comparison.csv",
+                        "text/csv",
+                        key="precision_comparison_download"
+                    )
+
+                with tab4:
+                    # Check if dilution series analysis is enabled
+                    if st.session_state.get('analyze_as_dilution', False):
+                        st.markdown("**Dilution Series Analysis**")
+
+                        if len(sample_groups) < 3:
+                            st.warning("⚠️ Need at least 3 dilution levels for analysis")
+                        else:
+                            # Get dilution factor from session state
+                            dilution_factor = st.session_state.get('dilution_factor', 2)
+                            custom_dilution_factors = st.session_state.get('custom_dilution_factors', None)
+                            groups_to_exclude = st.session_state.get('exclude_from_dilution', [])
+
+                            # Filter out excluded groups before analysis
+                            if groups_to_exclude:
+                                results_filtered = results_with_groups[
+                                    ~results_with_groups['Group'].isin(groups_to_exclude)
+                                ].copy()
+                                st.info(f"📝 Excluding {len(groups_to_exclude)} group(s) from dilution analysis: {', '.join(groups_to_exclude)}")
+                            else:
+                                results_filtered = results_with_groups
+
+                            # Run dilution series analysis
+                            dilution_analysis = analyze_dilution_series(
+                                results_filtered,
+                                dilution_factors=custom_dilution_factors,  # Use custom if provided, else auto-generate
+                                dilution_factor=dilution_factor if custom_dilution_factors is None else 2,
+                                group_column='Group'
+                            )
+
+                            if 'error' in dilution_analysis:
+                                st.error(dilution_analysis['error'])
+                            else:
+                                # Use efficiency from dilution series to recalculate precision comparison
+                                ct_efficiency = dilution_analysis['ct_analysis']['efficiency'] / 100  # Convert % to fraction
+                                precision_comparison = compare_precision(replicate_stats, efficiency=ct_efficiency)
+
+                                # Display results
+                                col1, col2 = st.columns(2)
+
+                                with col1:
+                                    st.markdown("**Ct Analysis**")
+                                    ct_analysis = dilution_analysis['ct_analysis']
+                                    st.metric("R²", f"{ct_analysis['r2']:.4f}")
+                                    st.metric("Efficiency", f"{ct_analysis['efficiency']:.1f}%")
+                                    st.metric("Slope", f"{ct_analysis['slope']:.4f}")
+
+                                with col2:
+                                    st.markdown("**D0 Analysis**")
+                                    d0_analysis = dilution_analysis['d0_analysis']
+                                    st.metric("R²", f"{d0_analysis['r2']:.4f}")
+                                    st.metric("Slope", f"{d0_analysis['slope']:.4f}")
+                                    st.caption(f"Expected: {d0_analysis['expected_slope']:.4f}")
+
+                                # Plot comparison
+                                st.markdown("---")
+                                st.markdown("**Linearity Comparison**")
+
+                                # Debug: Show error bar values
+                                with st.expander("🔍 Debug: Error Bar Values"):
+                                    data_debug = dilution_analysis['data']
+                                    st.write("**Ct Standard Deviations:**")
+                                    st.write(data_debug[['Group', 'Ct_Mean', 'Ct_SD']].to_string())
+                                    st.write("\n**D0 Standard Deviations:**")
+                                    st.write(data_debug[['Group', 'D0_Mean', 'D0_SD']].to_string())
+
+                                dilution_plot = plot_dilution_series_comparison(dilution_analysis)
+                                st.plotly_chart(dilution_plot, use_container_width=True)
+
+                                # Summary
+                                comparison = dilution_analysis['comparison']
+                                if comparison['better_linearity'] == 'D0':
+                                    st.success(f"✅ **D0 shows better linearity** (R² = {comparison['d0_r2']:.4f} vs {comparison['ct_r2']:.4f})")
+                                else:
+                                    st.info(f"ℹ️ **Ct shows better linearity** (R² = {comparison['ct_r2']:.4f} vs {comparison['d0_r2']:.4f})")
+                    else:
+                        st.info("💡 Enable 'Analyze as dilution series' in the sidebar to see linearity analysis")
+
+# Batch visualization section (outside button block, always visible if results exist)
+if 'batch_results_list' in st.session_state and 'batch_all_samples' in st.session_state:
+    st.markdown("---")
+    st.subheader("📊 Visualize Individual Fits")
+        
+    results_list = st.session_state['batch_results_list']
+    all_samples = st.session_state['batch_all_samples']
+    cycles = st.session_state['batch_cycles']
+    batch_settings = st.session_state['batch_settings']
+    sample_metadata = st.session_state.get('sample_metadata')
+
+    # Sample selector
+    sample_names = [r['Sample'] for r in results_list]
+    selected_sample = st.selectbox(
+        "Select sample to visualize:",
+        sample_names,
+        key="batch_viz_selector"
+    )
+        
+    # Find the selected sample's index
+    selected_idx = sample_names.index(selected_sample)
+    selected_result = results_list[selected_idx]
+        
+    # Check if fit was successful
+    _success_val = selected_result.get('Success', '')
+    if (_success_val and
+        (str(_success_val).startswith('✓') or
+         _success_val == '⚠️ k@bound' or
+         _success_val == '⚠️ R² below target' or
+         _success_val == '⚠️ Degenerate k')):
+        # Get the corresponding fluorescence data
+        sample_fluor = all_samples[selected_sample]
+            
+        # Use the stored parameters from batch fit to generate prediction
+        model_viz = MAK2Model()
+            
+        # Generate curve using stored parameters (use actual cycle array)
+        try:
+            F_pred = model_viz.simulate_to_cycle(
+                D0=selected_result['D0'],
+                k=selected_result['k'],
+                P0=selected_result['P0'],
+                cycles=cycles,
+                F_bg_intercept=selected_result['F_bg_intercept'],
+                F_bg_slope=selected_result['F_bg_slope']
+            )
+
+            # Cycle-by-cycle amplification efficiency
+            _, D_batch_eff, _ = model_viz.simulate_cycles(
+                D0=selected_result['D0'],
+                k=selected_result['k'],
+                P0=selected_result['P0'],
+                n_cycles=len(cycles),
+                F_bg_intercept=selected_result['F_bg_intercept'],
+                F_bg_slope=selected_result['F_bg_slope']
+            )
+            eff_batch = calculate_amplification_efficiency(D_batch_eff)
+
+            # 3-row stacked plot: Fit, Residuals, Efficiency (shared x-axis)
+            fig_batch = make_subplots(
+                rows=3, cols=1,
+                subplot_titles=(f"MAK2 Fit: {selected_sample}", "Residuals", "Amplification Efficiency"),
+                vertical_spacing=0.08,
+                row_heights=[0.50, 0.22, 0.28],
+                shared_xaxes=True,
+            )
+
+            # Row 1: Data and fit
+            fig_batch.add_trace(
+                go.Scatter(
+                    x=cycles, y=sample_fluor,
+                    mode='markers',
+                    name='Data',
+                    marker=dict(size=8, color='blue', opacity=0.6)
+                ),
+                row=1, col=1
+            )
+            # Draw fit line only within the fit window (fit_start_cycle onwards).
+            # Extrapolating the linear background back to cycle 0 is misleading
+            # when the pre-fit-window data followed a non-linear trajectory
+            # (e.g. JOE thermal transient), so we clip the line at fit_start.
+            _vis_fit_start = selected_result.get('fit_start_cycle')
+            if _vis_fit_start is not None:
+                _fit_mask   = cycles >= _vis_fit_start
+                _fit_cyc_v  = cycles[_fit_mask]
+                _fit_pred_v = F_pred[_fit_mask]
+            else:
+                _fit_cyc_v  = cycles
+                _fit_pred_v = F_pred
+            fig_batch.add_trace(
+                go.Scatter(
+                    x=_fit_cyc_v, y=_fit_pred_v,
+                    mode='lines',
+                    name='MAK2 Fit',
+                    line=dict(color='red', width=2)
+                ),
+                row=1, col=1
+            )
+
+            # Row 2: Residuals — only within the fit window so the plot
+            # reflects actual fit quality, not model extrapolation error.
+            residuals = sample_fluor - F_pred
+            _res_in_window = residuals[cycles >= _vis_fit_start] if _vis_fit_start is not None else residuals
+            fig_batch.add_trace(
+                go.Scatter(
+                    x=_fit_cyc_v, y=_res_in_window,
+                    mode='markers',
+                    name='Residuals',
+                    marker=dict(size=6, color='green')
+                ),
+                row=2, col=1
+            )
+            fig_batch.add_hline(y=0, line_dash="dash", line_color="gray", row=2, col=1)
+
+            # Row 3: Efficiency
+            fig_batch.add_trace(
+                go.Scatter(
+                    x=np.arange(1, len(eff_batch)+1),
+                    y=eff_batch,
+                    mode='lines+markers',
+                    name='Efficiency',
+                    marker=dict(size=4),
+                    line=dict(color='orange'),
+                ),
+                row=3, col=1
+            )
+
+            # Ct threshold line on fit plot (row 1).
+            # The threshold is ΔRn above the linear baseline, so on the raw
+            # Rn plot it appears as a SLOPED line: threshold(c) = slope*c + intercept + ΔRn.
+            # This matches the instrument's display and correctly shows that the
+            # threshold rises with the background fluorescence drift.
+            ch_thresholds_stored = batch_settings.get('channel_thresholds', {})
+            sample_ch = _ch(selected_sample) if '_' in selected_sample or '::' in selected_sample else 'default'
+            ct_threshold = ch_thresholds_stored.get(
+                sample_ch, batch_settings.get('global_threshold'))
+
+            # Per-sample linear baseline stored during Ct computation
+            ct_bl_slope_vis     = selected_result.get('Ct_baseline_slope', 0.0)
+            ct_bl_intercept_vis = selected_result.get('Ct_baseline_intercept', 0.0)
+            ct_baseline_mean    = selected_result.get(
+                'Ct_baseline_mean',
+                batch_settings.get('channel_baseline_means', {}).get(
+                    sample_ch, batch_settings.get('global_baseline_mean', 0.0)
+                )
+            )
+
+            # ── Fit window: start (orange) and end (green) vlines ────────────
+            fit_start_vis = selected_result.get('fit_start_cycle')
+            if fit_start_vis is not None:
+                for row_idx in range(1, 4):
+                    fig_batch.add_vline(
+                        x=fit_start_vis,
+                        line_dash="dash",
+                        line_color="orange",
+                        row=row_idx, col=1,
+                    )
+                fig_batch.add_annotation(
+                    x=fit_start_vis, y=1, yref="y domain",
+                    text="Fit start", showarrow=False,
+                    xanchor="left", yanchor="top",
+                    font=dict(size=11, color="orange"),
+                    row=1, col=1,
+                )
+
+            # Use the stored fit_end_cycle (the last cycle the optimizer
+            # actually included) rather than recomputing find_slope_threshold_cycle
+            # on the full array, which can give the wrong answer when the thermal
+            # transient shifts the apparent max-slope index.
+            final_cycle = selected_result.get('fit_end_cycle')
+            if final_cycle is None:
+                # Fallback for old result dicts that don't have the key
+                from mak2_model import find_slope_threshold_cycle
+                trunc_idx  = find_slope_threshold_cycle(
+                    sample_fluor,
+                    cycles_after_max=batch_settings.get('cycles_after_max', 3)
+                )
+                final_cycle = float(cycles[min(trunc_idx, len(cycles) - 1)])
+            if final_cycle < cycles[-1]:
+                for row_idx in range(1, 4):
+                    fig_batch.add_vline(
+                        x=final_cycle,
+                        line_dash="dash",
+                        line_color="green",
+                        row=row_idx, col=1,
+                    )
+                fig_batch.add_annotation(
+                    x=final_cycle, y=1, yref="y domain",
+                    text="Fit end", showarrow=False,
+                    xanchor="right", yanchor="top",
+                    font=dict(size=11, color="green"),
+                    row=1, col=1,
+                )
+
+            # ── Ct vertical line on all rows ─────────────────────────────────
+            ct_val = selected_result.get('Ct', np.nan)
+            ct_is_nan = ct_val is None or (isinstance(ct_val, float) and np.isnan(ct_val))
+            if not ct_is_nan:
+                for row_idx in range(1, 4):
+                    fig_batch.add_vline(
+                        x=ct_val,
+                        line_dash="dot",
+                        line_color="gray",
+                        row=row_idx, col=1,
+                    )
+                fig_batch.add_annotation(
+                    x=ct_val, y=1, yref="y domain",
+                    text="Ct", showarrow=False,
+                    xanchor="left", yanchor="top",
+                    font=dict(size=11, color="gray"),
+                    row=1, col=1,
+                )
+            else:
+                # No Ct — check if instrument flagged this as Undetermined
+                inst_status_vis = selected_result.get('Instrument', '')
+                if inst_status_vis:
+                    fig_batch.add_annotation(
+                        x=0.5, xref="x domain",
+                        y=0.95, yref="y domain",
+                        text=f"⚠️ Instrument: {inst_status_vis}",
+                        showarrow=False,
+                        xanchor="center", yanchor="top",
+                        font=dict(size=12, color="crimson"),
+                        bgcolor="rgba(255,255,255,0.8)",
+                        row=1, col=1,
+                    )
+
+            # ── Threshold: short segment anchored at Ct crossing ──────────────
+            # thresh(c) = bl_slope·c + bl_intercept + ΔRn
+            # Draw only a ±5-cycle window around Ct so the line visually
+            # intersects the curve at exactly the fractional Ct, with the
+            # correct slope from the linear baseline subtraction.
+            if ct_threshold is not None and ct_threshold > 0:
+                _abi_meta_vis   = st.session_state.get('abi_results_meta')
+                _rox_active_vis = st.session_state.get('rox_normalized', False)
+                inst_drn = None
+                if _abi_meta_vis and _rox_active_vis:
+                    inst_drn = _abi_meta_vis.get('channel_thresholds', {}).get(sample_ch)
+
+                has_linear_baseline = (
+                    abs(ct_bl_intercept_vis) > 1e-9
+                    or abs(ct_bl_slope_vis) > 1e-12
+                )
+
+                # Narrow x-range centred on Ct (or midpoint if no Ct)
+                _span = 5  # half-width in cycles
+                if not ct_is_nan:
+                    _tx_lo = max(float(cycles[0]),  ct_val - _span)
+                    _tx_hi = min(float(cycles[-1]), ct_val + _span)
+                else:
+                    _tx_lo, _tx_hi = float(cycles[0]), float(cycles[-1])
+                _tx = np.linspace(_tx_lo, _tx_hi, 60)
+
+                # The Ct baseline and threshold are in Rn units when ROX was used.
+                # Scale to raw RFU for the plot by multiplying by mean ROX.
+                _ct_rox_mean_vis = selected_result.get('ct_rox_mean')
+
+                if has_linear_baseline:
+                    _ty_rn = ct_bl_slope_vis * _tx + ct_bl_intercept_vis + ct_threshold
+                else:
+                    _ty_rn = np.full_like(_tx, float(ct_baseline_mean + ct_threshold))
+
+                if _ct_rox_mean_vis is not None and _ct_rox_mean_vis > 0:
+                    # Convert Rn threshold line back to raw RFU
+                    _ty = _ty_rn * _ct_rox_mean_vis
+                else:
+                    _ty = _ty_rn
+
+                if inst_drn is not None:
+                    thresh_label = f"Threshold (ΔRn = {inst_drn})"
+                else:
+                    thresh_label = f"Threshold (ΔRn = {ct_threshold:.4f})"
+
+                fig_batch.add_trace(
+                    go.Scatter(
+                        x=_tx,
+                        y=_ty,
+                        mode='lines',
+                        name='Threshold',
+                        line=dict(color='purple', dash='dot', width=1.5),
+                        showlegend=False,
+                    ),
+                    row=1, col=1
+                )
+                fig_batch.add_annotation(
+                    x=float(_tx[-1]), y=float(_ty[-1]),
+                    text=thresh_label,
+                    showarrow=False,
+                    xanchor="left", yanchor="middle",
+                    font=dict(size=10, color="purple"),
+                    row=1, col=1,
+                )
+
+            fig_batch.update_xaxes(title_text="Cycle", row=3, col=1)
+            fig_batch.update_yaxes(title_text="Fluorescence", row=1, col=1)
+            fig_batch.update_yaxes(title_text="Residual", row=2, col=1)
+            fig_batch.update_yaxes(title_text="Efficiency", row=3, col=1)
+            fig_batch.update_layout(height=800, showlegend=True)
+
+            st.plotly_chart(fig_batch, use_container_width=True)
                 
-            if run_bootstrap:
-                # Create progress placeholder
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                    
-                try:
-                    status_text.text("Starting bootstrap analysis...")
-                        
-                    # Run bootstrap with progress updates
-                    import time
-                    start_time = time.time()
-                        
-                    # We'll run in smaller chunks to update progress
-                    status_text.text(f"Running {n_bootstrap} bootstrap iterations...")
-                    progress_bar.progress(0.1)
-                        
-                    # Get the fitted region (what was actually used in the fit)
-                    cycles_fit = optimizer.cycles_fit
-                    fluorescence_fit = optimizer.fluorescence_fit
-                        
-                    # Ensure arrays
-                    cycles_fit = np.asarray(cycles_fit)
-                    fluorescence_fit = np.asarray(fluorescence_fit)
-                        
-                    # Get predicted values on fitted region (use all params including background)
-                    F_pred_fit = optimizer.predict(cycles_fit, fitted_params)
-                        
-                    bootstrap_results = bootstrap_parameter_uncertainty(
-                        cycles=cycles_fit,  # Use fitted cycles, not full data
-                        fluorescence=fluorescence_fit,  # Use fitted fluorescence
-                        original_params=fitted_params,  # Pass ALL params including background
-                        original_fit=F_pred_fit,  # Prediction on fitted region
-                        n_bootstrap=n_bootstrap,
-                        confidence_level=0.95,
-                        random_seed=None,
-                        show_progress=False  # We'll use streamlit progress bar
+            # Show parameters
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("D₀", f"{selected_result['D0']:.2e}")
+            col2.metric("k", f"{selected_result['k']:.6f}")
+            col3.metric("P₀", f"{selected_result['P0']:.2e}")
+            col4.metric("R²", f"{selected_result['R2']:.4f}")
+
+            # Baseline end comparison: metadata vs estimate
+            _bl_meta_vis = selected_result.get('bl_end_meta')
+            _bl_est_vis  = selected_result.get('bl_end_est')
+            if _bl_meta_vis is not None or _bl_est_vis is not None:
+                _bl_parts = []
+                if _bl_meta_vis is not None:
+                    _bl_parts.append(f"Instrument baseline end: cycle **{_bl_meta_vis:.0f}**")
+                if _bl_est_vis is not None:
+                    _bl_parts.append(f"Estimated baseline end: cycle **{_bl_est_vis:.0f}**")
+                if _bl_meta_vis is not None and _bl_est_vis is not None:
+                    _bl_diff = abs(_bl_meta_vis - _bl_est_vis)
+                    _bl_icon = "✅" if _bl_diff <= 2 else ("⚠️" if _bl_diff <= 5 else "❌")
+                    _bl_parts.append(f"{_bl_icon} Δ = {_bl_diff:.0f} cycles")
+                st.caption(" · ".join(_bl_parts))
+
+        except Exception as e:
+            st.error(f"Could not visualize fit: {str(e)}")
+    else:
+        st.warning(f"Fitting failed for {selected_sample}. No visualization available.")
+    
+
+
+if 'fitted_params' in st.session_state:
+    fitted_params = st.session_state['fitted_params']
+    optimizer = st.session_state['optimizer']
+
+    # Show debug output if available
+    if 'fit_debug_output' in st.session_state and st.session_state['fit_debug_output']:
+        with st.expander("🐛 Debug Output (Optimization Details)", expanded=True):
+            st.code(st.session_state['fit_debug_output'], language='text')
+
+    # Results tabs
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 Fit Visualization", "📈 Parameters & Metrics", "🔬 Bootstrap CI", "💾 Export"])
+        
+    with tab1:
+            # Predict fitted curve
+            F_pred = optimizer.predict(cycles)
+
+            # Cycle-by-cycle amplification efficiency
+            _, D_eff, _ = optimizer.model.simulate_cycles(
+                D0=fitted_params['D0'],
+                k=fitted_params['k'],
+                P0=fitted_params['P0'],
+                n_cycles=len(cycles),
+                F_bg_intercept=fitted_params['F_bg_intercept'],
+                F_bg_slope=fitted_params['F_bg_slope']
+            )
+            eff_per_cycle = calculate_amplification_efficiency(D_eff)
+
+            # Calculate truncation point for visualization
+            from mak2_model import find_slope_threshold_cycle
+            threshold_idx = find_slope_threshold_cycle(
+                fluorescence,
+                cycles_after_max=cycles_after_max
+            )
+            threshold_label = f"Max slope + {cycles_after_max} cycles"
+            threshold_cycle_num = cycles[min(threshold_idx, len(cycles)-1)]
+
+            # Calculate Ct for vertical line
+            ct_threshold_single = None
+            ct_baseline_mean_single = 0.0
+            try:
+                ct_res_single = optimizer.calculate_ct(method='threshold')
+                ct_val_single = ct_res_single['ct']
+                ct_threshold_single = ct_res_single.get('threshold')
+                ct_baseline_mean_single = ct_res_single.get('baseline_mean', 0.0)
+            except Exception:
+                ct_val_single = np.nan
+
+            # 3-row stacked plot: Fit, Residuals, Efficiency (shared x-axis)
+            fig = make_subplots(
+                rows=3, cols=1,
+                subplot_titles=(
+                    f"qPCR Curve Fit (Truncated at Max Slope + {cycles_after_max})",
+                    "Residuals",
+                    "Amplification Efficiency"
+                ),
+                vertical_spacing=0.08,
+                row_heights=[0.50, 0.22, 0.28],
+                shared_xaxes=True,
+            )
+
+            # Row 1: Data and fit
+            fig.add_trace(
+                go.Scatter(
+                    x=cycles, y=fluorescence,
+                    mode='markers',
+                    name='Data',
+                    marker=dict(size=8, color='blue', opacity=0.6)
+                ),
+                row=1, col=1
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=cycles, y=F_pred,
+                    mode='lines',
+                    name='MAK2 Fit',
+                    line=dict(color='red', width=2)
+                ),
+                row=1, col=1
+            )
+
+            # Row 2: Residuals
+            residuals = fluorescence - F_pred
+            fig.add_trace(
+                go.Scatter(
+                    x=cycles, y=residuals,
+                    mode='markers',
+                    name='Residuals',
+                    marker=dict(size=6, color='purple')
+                ),
+                row=2, col=1
+            )
+            fig.add_hline(y=0, line_dash="dash", line_color="gray", row=2, col=1)
+
+            # Row 3: Efficiency
+            fig.add_trace(
+                go.Scatter(
+                    x=np.arange(1, len(eff_per_cycle)+1),
+                    y=eff_per_cycle,
+                    mode='lines+markers',
+                    name='Efficiency',
+                    marker=dict(size=4),
+                    line=dict(color='orange'),
+                ),
+                row=3, col=1
+            )
+
+            # Ct threshold horizontal line on fit plot (row 1)
+            # The threshold is relative to baseline-subtracted data (delta_rn),
+            # so plot it at baseline_mean + threshold on the raw fluorescence axis
+            if ct_threshold_single is not None and ct_threshold_single > 0:
+                threshold_plot_y = ct_threshold_single + ct_baseline_mean_single
+                fig.add_hline(
+                    y=threshold_plot_y,
+                    line_dash="dot",
+                    line_color="purple",
+                    line_width=1,
+                    row=1, col=1,
+                )
+                fig.add_annotation(
+                    x=0, xref="x domain",
+                    y=threshold_plot_y,
+                    text=f"Threshold ({threshold_plot_y:.4f})",
+                    showarrow=False,
+                    xanchor="left", yanchor="bottom",
+                    font=dict(size=10, color="purple"),
+                    row=1, col=1,
+                )
+
+            # Ct vertical line on all rows
+            if not np.isnan(ct_val_single):
+                for row_idx in range(1, 4):
+                    fig.add_vline(
+                        x=ct_val_single,
+                        line_dash="dot",
+                        line_color="gray",
+                        row=row_idx, col=1,
                     )
-                        
-                    elapsed_time = time.time() - start_time
-                        
-                    # Store results in session state
-                    st.session_state.bootstrap_results = bootstrap_results
-                        
-                    progress_bar.progress(1.0)
-                    status_text.text(f"✅ Complete! ({elapsed_time/60:.1f} minutes)")
-                        
-                    # Store success flag to prevent re-running bootstrap
-                    st.session_state.bootstrap_just_completed = True
-                        
-                    st.success(f"🎉 Bootstrap complete! {bootstrap_results.n_successful}/{bootstrap_results.n_bootstrap} successful fits")
-                    st.rerun()  # Rerun to display results
-                        
-                except Exception as e:
-                    st.error(f"❌ Bootstrap failed: {str(e)}")
-                    import traceback
-                    st.code(traceback.format_exc())
+                    if row_idx == 1:
+                        fig.add_annotation(
+                            x=ct_val_single, y=1, yref="y domain",
+                            text="Ct", showarrow=False,
+                            xanchor="left", yanchor="top",
+                            font=dict(size=11, color="gray"),
+                            row=1, col=1,
+                        )
+
+            # Final fitted cycle vertical line on all rows
+            if threshold_cycle_num < cycles[-1]:
+                for row_idx in range(1, 4):
+                    fig.add_vline(
+                        x=threshold_cycle_num,
+                        line_dash="dash",
+                        line_color="green",
+                        row=row_idx, col=1,
+                    )
+                    if row_idx == 1:
+                        fig.add_annotation(
+                            x=threshold_cycle_num, y=1, yref="y domain",
+                            text="Final fitted cycle", showarrow=False,
+                            xanchor="right", yanchor="top",
+                            font=dict(size=11, color="green"),
+                            row=1, col=1,
+                        )
+
+            fig.update_xaxes(title_text="Cycle", row=3, col=1)
+            fig.update_yaxes(title_text="Fluorescence", row=1, col=1)
+            fig.update_yaxes(title_text="Residual", row=2, col=1)
+            fig.update_yaxes(title_text="Efficiency", row=3, col=1)
+            fig.update_layout(height=800, showlegend=True)
+
+            st.plotly_chart(fig, use_container_width=True)
                 
-            # Display results if available
-            if st.session_state.bootstrap_results is not None:
-                results = st.session_state.bootstrap_results
-                    
-                st.markdown("---")
-                st.markdown("## 📊 Bootstrap Results")
-                    
-                # Show diagnostics FIRST
-                with st.expander("🔍 Bootstrap Diagnostics", expanded=True):
-                    D0_samples = results.D0_samples
-                    k_samples = results.k_samples
-                    P0_samples = results.P0_samples
-                        
-                    diag_col1, diag_col2 = st.columns(2)
-                    with diag_col1:
-                        st.write("**Sample Statistics:**")
-                        st.write(f"- D₀: min={D0_samples.min():.2e}, max={D0_samples.max():.2e}, std={np.std(D0_samples):.2e}")
-                        st.write(f"- k: min={k_samples.min():.4f}, max={k_samples.max():.4f}, std={np.std(k_samples):.4f}")
-                        st.write(f"- P₀: min={P0_samples.min():.2e}, max={P0_samples.max():.2e}, std={np.std(P0_samples):.2e}")
-                        
-                    with diag_col2:
-                        st.write("**Variation Check:**")
-                        st.write(f"- Unique D₀ values: {len(np.unique(D0_samples))}/{len(D0_samples)}")
-                        st.write(f"- Unique k values: {len(np.unique(k_samples))}/{len(k_samples)}")
-                        st.write(f"- Unique P₀ values: {len(np.unique(P0_samples))}/{len(P0_samples)}")
-                            
-                        if len(np.unique(D0_samples)) < 10:
-                            st.warning("⚠️ Very few unique D₀ values - bootstrap may not be working correctly!")
-                        if len(np.unique(k_samples)) < 10:
-                            st.warning("⚠️ Very few unique k values - bootstrap may not be working correctly!")
-                        
-                    st.write("**Original Fit (for comparison):**")
-                    st.write(f"- D₀={results.D0_point:.2e}, k={results.k_point:.4f}, P₀={results.P0_point:.2e}")
-                    
-                # Display confidence intervals in columns
-                st.markdown("### Parameter Estimates with 95% Confidence Intervals")
-                col1, col2, col3 = st.columns(3)
-                    
-                with col1:
-                    st.metric(
-                        "D₀ (Initial DNA)",
-                        f"{results.D0_point:.2e}",
-                        help="Point estimate from original fit"
-                    )
-                    st.caption(f"**95% CI:** [{results.D0_ci[0]:.2e}, {results.D0_ci[1]:.2e}]")
-                    st.caption(f"**Std:** {np.std(results.D0_samples):.2e}")
-                    
-                with col2:
-                    st.metric(
-                        "k (PCR constant)",
-                        f"{results.k_point:.4f}",
-                        help="Point estimate from original fit"
-                    )
-                    st.caption(f"**95% CI:** [{results.k_ci[0]:.4f}, {results.k_ci[1]:.4f}]")
-                    st.caption(f"**Std:** {np.std(results.k_samples):.4f}")
-                    
-                with col3:
-                    st.metric(
-                        "P₀ (Initial primer)",
-                        f"{results.P0_point:.2e}",
-                        help="Point estimate from original fit"
-                    )
-                    st.caption(f"**95% CI:** [{results.P0_ci[0]:.2e}, {results.P0_ci[1]:.2e}]")
-                    st.caption(f"**Std:** {np.std(results.P0_samples):.2e}")
-                    
-                # Efficiency
-                st.markdown("### Amplification Efficiency")
+            # Comprehensive goodness-of-fit metrics (calculated on fitted data only)
+            st.subheader("Goodness of Fit Metrics")
+            st.caption("⚠️ Metrics calculated only on the fitted region (after truncation), not the full dataset")
+                
+            metrics = optimizer.calculate_fit_metrics()
+                
+            # Display main metrics in columns
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("R²", f"{metrics['r_squared']:.6f}", 
+                       help="Coefficient of determination. Can be negative for poor nonlinear fits!")
+            col2.metric("RMSE", f"{metrics['rmse']:.4f}", 
+                       help="Root Mean Squared Error (fluorescence units)")
+            col3.metric("NRMSE", f"{metrics['nrmse']*100:.2f}%",
+                       help="Normalized RMSE (% of signal range)")
+            # Show quality indicator based on R²
+            quality = "✅ Excellent" if metrics['r_squared'] >= 0.999 else "⚠️ Check fit"
+            col4.metric("Fit Quality", quality,
+                       help="Based on R² threshold (≥0.999 = excellent)")
+                
+            # Additional metrics in expander
+            with st.expander("📊 Additional Fit Metrics"):
                 col1, col2 = st.columns(2)
                 with col1:
-                    st.metric(
-                        "Efficiency (E)",
-                        f"{results.efficiency_point:.4f}",
-                        help="E = 1 + k*P₀"
-                    )
+                    st.metric("MAE", f"{metrics['mae']:.4f}", 
+                             help="Mean Absolute Error")
+                    st.metric("MAPE", f"{metrics['mape']:.2f}%",
+                             help="Mean Absolute Percentage Error")
+                    st.metric("SSR", f"{metrics['ssr']:.6f}",
+                             help="Sum of Squared Residuals")
                 with col2:
-                    st.caption(f"**95% CI:** [{results.efficiency_ci[0]:.4f}, {results.efficiency_ci[1]:.4f}]")
+                    st.metric("AIC", f"{metrics['aic']:.2f}",
+                             help="Akaike Information Criterion (lower is better)")
+                    st.metric("BIC", f"{metrics['bic']:.2f}",
+                             help="Bayesian Information Criterion (lower is better)")
+                    st.metric("Reduced χ²", f"{metrics['reduced_chi_sq']:.4f}",
+                             help="Chi-squared per degree of freedom")
                     
-                # Distribution plots
-                st.markdown("### Parameter Distributions")
-                    
-                try:
-                    # Create figure using bootstrap analyzer
-                    analyzer = BootstrapAnalyzer(
-                        model=MAK2Model(),
-                        optimizer=MAK2Optimizer(MAK2Model())
-                    )
-                    fig = analyzer.plot_bootstrap_distributions(results, figsize=(15, 5))
-                    st.pyplot(fig)
-                except Exception as e:
-                    st.warning(f"Could not create distribution plots: {e}")
-                    import traceback
-                    with st.expander("🔍 Error Details"):
-                        st.code(traceback.format_exc())
-                    
-                # Summary table
-                with st.expander("📊 Detailed Bootstrap Summary"):
-                    summary = results.summary_dict()
-                        
-                    summary_df = pd.DataFrame({
-                        'Parameter': ['D₀', 'k', 'P₀', 'Efficiency'],
-                        'Estimate': [
-                            f"{summary['D0']['estimate']:.2e}",
-                            f"{summary['k']['estimate']:.4f}",
-                            f"{summary['P0']['estimate']:.2e}",
-                            f"{summary['efficiency']['estimate']:.4f}"
-                        ],
-                        'CI Lower': [
-                            f"{summary['D0']['ci_lower']:.2e}",
-                            f"{summary['k']['ci_lower']:.4f}",
-                            f"{summary['P0']['ci_lower']:.2e}",
-                            f"{summary['efficiency']['ci_lower']:.4f}"
-                        ],
-                        'CI Upper': [
-                            f"{summary['D0']['ci_upper']:.2e}",
-                            f"{summary['k']['ci_upper']:.4f}",
-                            f"{summary['P0']['ci_upper']:.2e}",
-                            f"{summary['efficiency']['ci_upper']:.4f}"
-                        ],
-                        'Std Dev': [
-                            f"{summary['D0']['std']:.2e}",
-                            f"{summary['k']['std']:.4f}",
-                            f"{summary['P0']['std']:.2e}",
-                            'N/A'
-                        ]
-                    })
-                        
-                    st.dataframe(summary_df, use_container_width=True)
-                        
-                    st.caption(f"**Metadata:** {summary['metadata']['n_successful']}/{summary['metadata']['n_bootstrap']} "
-                              f"successful fits ({summary['metadata']['success_rate']:.1%}) | "
-                              f"Runtime: {summary['metadata']['runtime_seconds']/60:.1f} minutes | "
-                              f"Confidence level: {summary['metadata']['confidence_level']:.0%}")
-                    
-                # Download bootstrap results
-                st.markdown("### Download Bootstrap Results")
-                    
-                # Create CSV with bootstrap samples
-                bootstrap_df = pd.DataFrame({
-                    'iteration': range(len(results.D0_samples)),
-                    'D0': results.D0_samples,
-                    'k': results.k_samples,
-                    'P0': results.P0_samples
-                })
-                    
-                csv_bootstrap = bootstrap_df.to_csv(index=False)
-                st.download_button(
-                    label="📥 Download Bootstrap Samples (CSV)",
-                    data=csv_bootstrap,
-                    file_name="bootstrap_samples.csv",
-                    mime="text/csv"
-                )
-                    
-                # Clear button
-                if st.button("🗑️ Clear Bootstrap Results", key="clear_bootstrap_btn"):
-                    st.session_state.bootstrap_results = None
-                    st.rerun()
+                st.caption(f"**Data points:** {metrics['n_points']} (after truncation) | "
+                          f"**Parameters:** {metrics['n_params']} | "
+                          f"**Degrees of freedom:** {metrics['dof']}")
             
-        with tab4:
-            st.subheader("Export Results")
+    with tab2:
+        st.subheader("Fitted Parameters")
                 
-            # Prepare export data
-            export_df = pd.DataFrame({
-                'Cycle': cycles,
-                'Fluorescence_Data': fluorescence,
-                'Fluorescence_Fit': F_pred,
-                'Residual': residuals
+        param_df = pd.DataFrame({
+            'Parameter': ['D₀ (Initial DNA)', 'k (PCR constant)', 'P₀ (Initial primer)',
+                         'F_bg (intercept)', 'F_bg_slope'],
+            'Value': [
+                f"{fitted_params['D0']:.2e}",  # D0 in fluorescence units - scientific notation
+                f"{fitted_params['k']:.6f}",
+                f"{fitted_params['P0']:.4e}",
+                f"{fitted_params['F_bg_intercept']:.6f}",
+                f"{fitted_params['F_bg_slope']:.6f}"
+            ],
+            'Description': [
+                'Initial template fluorescence (fluorescence units)',
+                'Ratio of primer binding to reannealing rate',
+                'Initial primer concentration',
+                'Background fluorescence (constant)',
+                'Background fluorescence (linear slope)'
+            ]
+        })
+                
+        st.dataframe(param_df, use_container_width=True)
+            
+    with tab3:
+        st.subheader("🔬 Bootstrap Confidence Intervals")
+                
+        st.markdown("""
+        **Get professional-grade uncertainty estimates for your parameters!**
+                
+        Bootstrap analysis provides 95% confidence intervals by:
+        1. Resampling residuals from your fit 1000 times
+        2. Refitting the model to each bootstrap sample
+        3. Calculating percentile-based confidence intervals
+                
+        ⏱️ **Analysis time:** 10-30 minutes  
+        📊 **Output:** Confidence intervals + distribution plots
+        """)
+                
+        # Initialize session state for bootstrap
+        if 'bootstrap_running' not in st.session_state:
+            st.session_state.bootstrap_running = False
+        if 'bootstrap_results' not in st.session_state:
+            st.session_state.bootstrap_results = None
+        if 'bootstrap_sample_name' not in st.session_state:
+            st.session_state.bootstrap_sample_name = None
+                
+        # Determine current sample name
+        if batch_mode:
+            current_sample_name = preview_sample
+        else:
+            current_sample_name = "single_sample"
+                
+        # Clear bootstrap results if sample changed
+        if st.session_state.bootstrap_sample_name != current_sample_name:
+            st.session_state.bootstrap_results = None
+            st.session_state.bootstrap_sample_name = current_sample_name
+                
+        # Email input
+        st.markdown("### Run Bootstrap Analysis")
+        if batch_mode:
+            st.info(f"📊 **Current sample:** {current_sample_name}\n\nBootstrap will run on this sample only. Change preview sample to bootstrap a different curve.")
+        else:
+            st.info("⚠️ Your browser will need to stay open during analysis (~10-30 minutes)")
+                
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            n_bootstrap = st.number_input("Number of bootstrap iterations", 
+                                         min_value=100, max_value=2000, value=1000, step=100,
+                                         help="More iterations = better CI estimates but longer runtime",
+                                         key="n_bootstrap_input")
+        with col2:
+            estimated_time = n_bootstrap / 1000 * 15  # ~15 min for 1000
+            st.metric("Estimated Time", f"{estimated_time:.0f} min")
+                
+        # Show existing results first if they exist
+        if st.session_state.bootstrap_results is not None:
+            st.success("✅ Bootstrap analysis complete!")
+            # Display results here (we'll move the display code up)
+                
+        # Run button (disabled if already running or have results)
+        run_bootstrap = st.button(
+            "▶️ Run Bootstrap Analysis", 
+            type="primary", 
+            use_container_width=True,
+            disabled=st.session_state.bootstrap_running or st.session_state.bootstrap_results is not None,
+            key="run_bootstrap_btn"
+        )
+                
+        if run_bootstrap:
+            # Create progress placeholder
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+                    
+            try:
+                status_text.text("Starting bootstrap analysis...")
+                        
+                # Run bootstrap with progress updates
+                import time
+                start_time = time.time()
+                        
+                # We'll run in smaller chunks to update progress
+                status_text.text(f"Running {n_bootstrap} bootstrap iterations...")
+                progress_bar.progress(0.1)
+                        
+                # Get the fitted region (what was actually used in the fit)
+                cycles_fit = optimizer.cycles_fit
+                fluorescence_fit = optimizer.fluorescence_fit
+                        
+                # Ensure arrays
+                cycles_fit = np.asarray(cycles_fit)
+                fluorescence_fit = np.asarray(fluorescence_fit)
+                        
+                # Get predicted values on fitted region (use all params including background)
+                F_pred_fit = optimizer.predict(cycles_fit, fitted_params)
+                        
+                bootstrap_results = bootstrap_parameter_uncertainty(
+                    cycles=cycles_fit,  # Use fitted cycles, not full data
+                    fluorescence=fluorescence_fit,  # Use fitted fluorescence
+                    original_params=fitted_params,  # Pass ALL params including background
+                    original_fit=F_pred_fit,  # Prediction on fitted region
+                    n_bootstrap=n_bootstrap,
+                    confidence_level=0.95,
+                    random_seed=None,
+                    show_progress=False  # We'll use streamlit progress bar
+                )
+                        
+                elapsed_time = time.time() - start_time
+                        
+                # Store results in session state
+                st.session_state.bootstrap_results = bootstrap_results
+                        
+                progress_bar.progress(1.0)
+                status_text.text(f"✅ Complete! ({elapsed_time/60:.1f} minutes)")
+                        
+                # Store success flag to prevent re-running bootstrap
+                st.session_state.bootstrap_just_completed = True
+                        
+                st.success(f"🎉 Bootstrap complete! {bootstrap_results.n_successful}/{bootstrap_results.n_bootstrap} successful fits")
+                st.rerun()  # Rerun to display results
+                        
+            except Exception as e:
+                st.error(f"❌ Bootstrap failed: {str(e)}")
+                import traceback
+                st.code(traceback.format_exc())
+                
+        # Display results if available
+        if st.session_state.bootstrap_results is not None:
+            results = st.session_state.bootstrap_results
+                    
+            st.markdown("---")
+            st.markdown("## 📊 Bootstrap Results")
+                    
+            # Show diagnostics FIRST
+            with st.expander("🔍 Bootstrap Diagnostics", expanded=True):
+                D0_samples = results.D0_samples
+                k_samples = results.k_samples
+                P0_samples = results.P0_samples
+                        
+                diag_col1, diag_col2 = st.columns(2)
+                with diag_col1:
+                    st.write("**Sample Statistics:**")
+                    st.write(f"- D₀: min={D0_samples.min():.2e}, max={D0_samples.max():.2e}, std={np.std(D0_samples):.2e}")
+                    st.write(f"- k: min={k_samples.min():.4f}, max={k_samples.max():.4f}, std={np.std(k_samples):.4f}")
+                    st.write(f"- P₀: min={P0_samples.min():.2e}, max={P0_samples.max():.2e}, std={np.std(P0_samples):.2e}")
+                        
+                with diag_col2:
+                    st.write("**Variation Check:**")
+                    st.write(f"- Unique D₀ values: {len(np.unique(D0_samples))}/{len(D0_samples)}")
+                    st.write(f"- Unique k values: {len(np.unique(k_samples))}/{len(k_samples)}")
+                    st.write(f"- Unique P₀ values: {len(np.unique(P0_samples))}/{len(P0_samples)}")
+                            
+                    if len(np.unique(D0_samples)) < 10:
+                        st.warning("⚠️ Very few unique D₀ values - bootstrap may not be working correctly!")
+                    if len(np.unique(k_samples)) < 10:
+                        st.warning("⚠️ Very few unique k values - bootstrap may not be working correctly!")
+                        
+                st.write("**Original Fit (for comparison):**")
+                st.write(f"- D₀={results.D0_point:.2e}, k={results.k_point:.4f}, P₀={results.P0_point:.2e}")
+                    
+            # Display confidence intervals in columns
+            st.markdown("### Parameter Estimates with 95% Confidence Intervals")
+            col1, col2, col3 = st.columns(3)
+                    
+            with col1:
+                st.metric(
+                    "D₀ (Initial DNA)",
+                    f"{results.D0_point:.2e}",
+                    help="Point estimate from original fit"
+                )
+                st.caption(f"**95% CI:** [{results.D0_ci[0]:.2e}, {results.D0_ci[1]:.2e}]")
+                st.caption(f"**Std:** {np.std(results.D0_samples):.2e}")
+                    
+            with col2:
+                st.metric(
+                    "k (PCR constant)",
+                    f"{results.k_point:.4f}",
+                    help="Point estimate from original fit"
+                )
+                st.caption(f"**95% CI:** [{results.k_ci[0]:.4f}, {results.k_ci[1]:.4f}]")
+                st.caption(f"**Std:** {np.std(results.k_samples):.4f}")
+                    
+            with col3:
+                st.metric(
+                    "P₀ (Initial primer)",
+                    f"{results.P0_point:.2e}",
+                    help="Point estimate from original fit"
+                )
+                st.caption(f"**95% CI:** [{results.P0_ci[0]:.2e}, {results.P0_ci[1]:.2e}]")
+                st.caption(f"**Std:** {np.std(results.P0_samples):.2e}")
+                    
+            # Efficiency
+            st.markdown("### Amplification Efficiency")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric(
+                    "Efficiency (E)",
+                    f"{results.efficiency_point:.4f}",
+                    help="E = 1 + k*P₀"
+                )
+            with col2:
+                st.caption(f"**95% CI:** [{results.efficiency_ci[0]:.4f}, {results.efficiency_ci[1]:.4f}]")
+                    
+            # Distribution plots
+            st.markdown("### Parameter Distributions")
+                    
+            try:
+                # Create figure using bootstrap analyzer
+                analyzer = BootstrapAnalyzer(
+                    model=MAK2Model(),
+                    optimizer=MAK2Optimizer(MAK2Model())
+                )
+                fig = analyzer.plot_bootstrap_distributions(results, figsize=(15, 5))
+                st.pyplot(fig)
+            except Exception as e:
+                st.warning(f"Could not create distribution plots: {e}")
+                import traceback
+                with st.expander("🔍 Error Details"):
+                    st.code(traceback.format_exc())
+                    
+            # Summary table
+            with st.expander("📊 Detailed Bootstrap Summary"):
+                summary = results.summary_dict()
+                        
+                summary_df = pd.DataFrame({
+                    'Parameter': ['D₀', 'k', 'P₀', 'Efficiency'],
+                    'Estimate': [
+                        f"{summary['D0']['estimate']:.2e}",
+                        f"{summary['k']['estimate']:.4f}",
+                        f"{summary['P0']['estimate']:.2e}",
+                        f"{summary['efficiency']['estimate']:.4f}"
+                    ],
+                    'CI Lower': [
+                        f"{summary['D0']['ci_lower']:.2e}",
+                        f"{summary['k']['ci_lower']:.4f}",
+                        f"{summary['P0']['ci_lower']:.2e}",
+                        f"{summary['efficiency']['ci_lower']:.4f}"
+                    ],
+                    'CI Upper': [
+                        f"{summary['D0']['ci_upper']:.2e}",
+                        f"{summary['k']['ci_upper']:.4f}",
+                        f"{summary['P0']['ci_upper']:.2e}",
+                        f"{summary['efficiency']['ci_upper']:.4f}"
+                    ],
+                    'Std Dev': [
+                        f"{summary['D0']['std']:.2e}",
+                        f"{summary['k']['std']:.4f}",
+                        f"{summary['P0']['std']:.2e}",
+                        'N/A'
+                    ]
+                })
+                        
+                st.dataframe(summary_df, use_container_width=True)
+                        
+                st.caption(f"**Metadata:** {summary['metadata']['n_successful']}/{summary['metadata']['n_bootstrap']} "
+                          f"successful fits ({summary['metadata']['success_rate']:.1%}) | "
+                          f"Runtime: {summary['metadata']['runtime_seconds']/60:.1f} minutes | "
+                          f"Confidence level: {summary['metadata']['confidence_level']:.0%}")
+                    
+            # Download bootstrap results
+            st.markdown("### Download Bootstrap Results")
+                    
+            # Create CSV with bootstrap samples
+            bootstrap_df = pd.DataFrame({
+                'iteration': range(len(results.D0_samples)),
+                'D0': results.D0_samples,
+                'k': results.k_samples,
+                'P0': results.P0_samples
             })
-                
-            # CSV download
-            csv = export_df.to_csv(index=False)
+                    
+            csv_bootstrap = bootstrap_df.to_csv(index=False)
             st.download_button(
-                label="📥 Download Results (CSV)",
-                data=csv,
-                file_name="mak2_results.csv",
+                label="📥 Download Bootstrap Samples (CSV)",
+                data=csv_bootstrap,
+                file_name="bootstrap_samples.csv",
                 mime="text/csv"
             )
+                    
+            # Clear button
+            if st.button("🗑️ Clear Bootstrap Results", key="clear_bootstrap_btn"):
+                st.session_state.bootstrap_results = None
+                st.rerun()
+            
+    with tab4:
+        st.subheader("Export Results")
                 
-            # Parameter summary
-            st.subheader("Parameter Summary (for copying)")
-            summary_text = f"""
-    MAK2 Fitting Results
-    ====================
-    D₀ (Initial DNA): {fitted_params['D0']:.4e}
-    k (PCR constant): {fitted_params['k']:.6f}
-    P₀ (Initial primer): {fitted_params['P0']:.4e}
-    F_bg_intercept: {fitted_params['F_bg_intercept']:.6f}
-    F_bg_slope: {fitted_params['F_bg_slope']:.6f}
+        # Prepare export data
+        export_df = pd.DataFrame({
+            'Cycle': cycles,
+            'Fluorescence_Data': fluorescence,
+            'Fluorescence_Fit': F_pred,
+            'Residual': residuals
+        })
+                
+        # CSV download
+        csv = export_df.to_csv(index=False)
+        st.download_button(
+            label="📥 Download Results (CSV)",
+            data=csv,
+            file_name="mak2_results.csv",
+            mime="text/csv"
+        )
+                
+        # Parameter summary
+        st.subheader("Parameter Summary (for copying)")
+        summary_text = f"""
+MAK2 Fitting Results
+====================
+D₀ (Initial DNA): {fitted_params['D0']:.4e}
+k (PCR constant): {fitted_params['k']:.6f}
+P₀ (Initial primer): {fitted_params['P0']:.4e}
+F_bg_intercept: {fitted_params['F_bg_intercept']:.6f}
+F_bg_slope: {fitted_params['F_bg_slope']:.6f}
     
-    Goodness of Fit (on fitted region):
-    R² = {optimizer.calculate_fit_metrics()['r_squared']:.6f}
-    RMSE = {optimizer.calculate_fit_metrics()['rmse']:.4f}
-    NRMSE = {optimizer.calculate_fit_metrics()['nrmse']*100:.2f}%
-    """
-            st.text_area("Summary", summary_text, height=250)
+Goodness of Fit (on fitted region):
+R² = {optimizer.calculate_fit_metrics()['r_squared']:.6f}
+RMSE = {optimizer.calculate_fit_metrics()['rmse']:.4f}
+NRMSE = {optimizer.calculate_fit_metrics()['nrmse']*100:.2f}%
+"""
+        st.text_area("Summary", summary_text, height=250)
 
-else:
+
+if ('batch_results' not in st.session_state
+        and 'fitted_params' not in st.session_state
+        and (cycles is None or fluorescence is None)):
     st.info("👈 Please load data using the sidebar")
     
     # Show instructions

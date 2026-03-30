@@ -894,15 +894,24 @@ class QPCRDataConverter:
 
         # Get cycle array from first well
         first_well = section_df[well_col].iloc[0]
-        cycles = section_df[section_df[well_col] == first_well][cycle_col].values.astype(float)
+        raw_cycles = section_df[section_df[well_col] == first_well][cycle_col].values.astype(float)
 
-        # Build samples_by_channel
+        # Some instruments append post-amplification reads (e.g. melt curve)
+        # at the same cycle number.  Keep only the first occurrence of each
+        # cycle to get the amplification-phase data.
+        _, unique_idx = np.unique(raw_cycles, return_index=True)
+        unique_idx.sort()  # preserve original order
+        cycles = raw_cycles[unique_idx]
+        n_keep = len(unique_idx)
+
+        # Build samples_by_channel, truncating to amplification cycles only
         samples_by_channel: Dict[str, Dict[str, np.ndarray]] = {}
         for dye in dye_columns:
             well_dict: Dict[str, np.ndarray] = {}
             for well_pos, group in section_df.groupby(well_col):
                 group_sorted = group.sort_values(cycle_col)
-                well_dict[str(well_pos)] = group_sorted[dye].values.astype(float)
+                arr = group_sorted[dye].values.astype(float)
+                well_dict[str(well_pos)] = arr[unique_idx] if len(arr) > n_keep else arr
             samples_by_channel[dye] = well_dict
 
         # Passive reference from header
