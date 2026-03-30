@@ -142,9 +142,22 @@ def _restore_results_from_cache():
 
 # On app startup: if session state has no batch results, try to restore
 # from cache.  This covers websocket drops during long computations.
-if 'batch_results' not in st.session_state:
+_cache_has_memory = 'payload' in _results_store
+_cache_has_disk = os.path.exists(_results_cache_path())
+_session_has_results = 'batch_results' in st.session_state
+
+if not _session_has_results:
     if _restore_results_from_cache():
         st.toast("Restored previous batch results", icon="✅")
+        _session_has_results = True
+
+# Diagnostic sidebar — always visible so we can debug persistence
+with st.sidebar.expander("🔧 Cache diagnostics", expanded=False):
+    st.caption(
+        f"Session has results: **{_session_has_results}**\n\n"
+        f"Memory cache: **{'yes' if _cache_has_memory else 'no'}**\n\n"
+        f"Disk cache: **{'yes' if _cache_has_disk else 'no'}**"
+    )
 
 # ============================================================================
 # EXCEL EXPORT
