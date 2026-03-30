@@ -145,6 +145,29 @@ if 'batch_results' not in st.session_state:
         st.toast("Restored previous batch results", icon="✅")
 
 # ============================================================================
+# EXCEL EXPORT
+# ============================================================================
+
+def _build_excel_download(results_df, replicate_stats=None, precision_comparison=None):
+    """Build a multi-sheet Excel file with all available results.
+
+    Sheets:
+      - Batch Results: main fitted parameters + metadata
+      - Replicate Statistics: mean/SD/CV per group (if available)
+      - Precision Comparison: Ct vs D0 precision (if available)
+    """
+    import io
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+        results_df.to_excel(writer, sheet_name='Batch Results', index=False)
+        if replicate_stats is not None and len(replicate_stats) > 0:
+            replicate_stats.to_excel(writer, sheet_name='Replicate Statistics', index=False)
+        if precision_comparison is not None and len(precision_comparison) > 0:
+            precision_comparison.to_excel(writer, sheet_name='Precision Comparison', index=False)
+    buf.seek(0)
+    return buf.getvalue()
+
+# ============================================================================
 # HELPERS
 # ============================================================================
 
@@ -3279,14 +3302,14 @@ if 'batch_results' in st.session_state:
         st.session_state['batch_results'] = results_df
         st.info(f"No standards detected. Applied fallback manual CF: {manual_cf_val:.2e} copies/D0")
 
-    # Export button (after calibration so Copies column is included)
+    # CSV export (always available immediately)
     csv = results_df.to_csv(index=False)
     st.download_button(
-        "📥 Download All Results (CSV)",
+        "📥 Download Results (.csv)",
         csv,
         "batch_fit_results.csv",
         "text/csv",
-        key="batch_download"
+        key="batch_download_csv"
     )
 
     # ============================================================================
@@ -3391,6 +3414,10 @@ if 'batch_results' in st.session_state:
                 # Precision comparison (use default efficiency unless dilution series provides better estimate)
                 # This will be updated if dilution series is analyzed
                 precision_comparison = compare_precision(replicate_stats, efficiency=0.95)
+
+                # Store for Excel export
+                st.session_state['_replicate_stats_df'] = replicate_stats
+                st.session_state['_precision_comparison_df'] = precision_comparison
 
                 # Display tabs for different analyses
                 tab1, tab2, tab3, tab4 = st.tabs([
@@ -3617,6 +3644,8 @@ if 'batch_results' in st.session_state:
                                 # Use efficiency from dilution series to recalculate precision comparison
                                 ct_efficiency = dilution_analysis['ct_analysis']['efficiency'] / 100  # Convert % to fraction
                                 precision_comparison = compare_precision(replicate_stats, efficiency=ct_efficiency)
+                                # Update stored copies for Excel export
+                                st.session_state['_precision_comparison_df'] = precision_comparison
 
                                 # Display results
                                 col1, col2 = st.columns(2)
@@ -3658,6 +3687,30 @@ if 'batch_results' in st.session_state:
                                     st.info(f"ℹ️ **Ct shows better linearity** (R² = {comparison['ct_r2']:.4f} vs {comparison['d0_r2']:.4f})")
                     else:
                         st.info("💡 Enable 'Analyze as dilution series' in the sidebar to see linearity analysis")
+
+# ============================================================================
+# EXCEL DOWNLOAD (after replicate analysis so all sheets are populated)
+# ============================================================================
+if 'batch_results' in st.session_state:
+    _xl_results_df = st.session_state['batch_results']
+    _xl_rep_stats = st.session_state.get('_replicate_stats_df')
+    _xl_prec_comp = st.session_state.get('_precision_comparison_df')
+    _xl_bytes = _build_excel_download(_xl_results_df, _xl_rep_stats, _xl_prec_comp)
+    _xl_n = 1 + (1 if _xl_rep_stats is not None else 0) + (1 if _xl_prec_comp is not None else 0)
+    _xl_sheet_names = ["Batch Results"]
+    if _xl_rep_stats is not None:
+        _xl_sheet_names.append("Replicate Statistics")
+    if _xl_prec_comp is not None:
+        _xl_sheet_names.append("Precision Comparison")
+    st.markdown("---")
+    st.download_button(
+        f"📥 Download Complete Results (.xlsx — {', '.join(_xl_sheet_names)})",
+        _xl_bytes,
+        "batch_fit_results.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="batch_download_xlsx",
+        type="primary",
+    )
 
 # Batch visualization section (outside button block, always visible if results exist)
 if 'batch_results_list' in st.session_state and 'batch_all_samples' in st.session_state:
