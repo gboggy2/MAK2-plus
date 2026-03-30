@@ -2562,10 +2562,13 @@ if cycles is not None and fluorescence is not None:
                 _pf_reject = False
                 _pf_reason = ''
 
-                # Gate 0: very poor R² (original check)
-                if _pf_r2 is not None and _pf_r2 < 0.90:
+                # Gate 0: poor R² — a MAK2 sigmoid+linear-background model
+                # can fit monotonic drift/noise to R²≈0.98, so the threshold
+                # must be well above that.  All legitimate amplifications on
+                # real qPCR data give R² ≥ 0.996; 0.99 provides margin.
+                if _pf_r2 is not None and _pf_r2 < 0.99:
                     _pf_reject = True
-                    _pf_reason = 'R² < 0.90'
+                    _pf_reason = f'R\u00b2 = {_pf_r2:.4f} < 0.99'
 
                 # Gate 1: removed — signal departure check is redundant
                 # with upstream detect_no_signal_samples() and too
@@ -2832,9 +2835,9 @@ if cycles is not None and fluorescence is not None:
                     _sq_fs = float(optimizer.cycles_fit[0]) if optimizer.cycles_fit is not None and len(optimizer.cycles_fit) > 0 else None
                     _sq_fe = float(optimizer.cycles_fit[-1]) if optimizer.cycles_fit is not None and len(optimizer.cycles_fit) > 0 else None
 
-                    # Gate 0: very poor R²
-                    if _sq_r2 is not None and _sq_r2 < 0.90:
-                        _sq_warnings.append(f"R² {_sq_r2:.4f} < 0.90")
+                    # Gate 0: poor R² (drift/noise can fit to ~0.98)
+                    if _sq_r2 is not None and _sq_r2 < 0.99:
+                        _sq_warnings.append(f"R\u00b2 {_sq_r2:.4f} < 0.99")
 
                     if _sq_fs is not None and _sq_fe is not None:
                         # Gate 2: fit window width (≥ 8 cycles)
