@@ -78,28 +78,30 @@ def _results_cache_path():
 
 def _save_results_to_disk(results_df, results_list, all_samples, no_signal_samples, cycles, settings):
     """Persist batch results to both in-memory store and disk."""
-    # Strip fluor_data from results_list (large, reconstructable)
-    slim_list = []
-    for r in results_list:
-        slim = {k: v for k, v in r.items() if k != 'fluor_data'}
-        slim_list.append(slim)
-    payload = {
-        'results_df': results_df,
-        'results_list': slim_list,
-        'all_samples': {k: v.tolist() if hasattr(v, 'tolist') else v for k, v in all_samples.items()},
-        'no_signal_samples': no_signal_samples,
-        'cycles': cycles.tolist() if hasattr(cycles, 'tolist') else cycles,
-        'settings': settings,
-    }
-    # Layer 1: in-process store (most reliable)
-    _results_store['payload'] = payload
-
-    # Layer 2: pickle to disk (backup)
     try:
-        with open(_results_cache_path(), 'wb') as f:
-            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+        slim_list = []
+        for r in results_list:
+            slim = {k: v for k, v in r.items() if k != 'fluor_data'}
+            slim_list.append(slim)
+        payload = {
+            'results_df': results_df,
+            'results_list': slim_list,
+            'all_samples': {k: v.tolist() if hasattr(v, 'tolist') else v for k, v in all_samples.items()},
+            'no_signal_samples': no_signal_samples,
+            'cycles': cycles.tolist() if hasattr(cycles, 'tolist') else cycles,
+            'settings': settings,
+        }
+        # Layer 1: in-process store (most reliable)
+        _results_store['payload'] = payload
+
+        # Layer 2: pickle to disk (backup)
+        try:
+            with open(_results_cache_path(), 'wb') as f:
+                pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception as e:
+            st.toast(f"Warning: disk cache save failed: {e}", icon="⚠️")
     except Exception as e:
-        st.toast(f"Warning: disk cache save failed: {e}", icon="⚠️")
+        st.toast(f"Warning: result cache save failed: {e}", icon="⚠️")
 
 def _restore_results_from_cache():
     """Try to restore batch results from in-memory store or disk."""
@@ -1275,6 +1277,7 @@ if cycles is not None and fluorescence is not None:
     if batch_mode and all_samples:
         # Batch mode - fit all samples
         if st.sidebar.button("🔬 Batch Fit All Samples", type="primary"):
+          try:
             # Clear any previous manual fit results
             if 'fitted_params' in st.session_state:
                 del st.session_state['fitted_params']
@@ -2775,6 +2778,11 @@ if cycles is not None and fluorescence is not None:
             except Exception as _build_err:
                 import traceback as _tb
                 st.error(f"Error enriching results: {_build_err}")
+
+          except Exception as _batch_fatal:
+            import traceback as _tb_fatal
+            st.error(f"❌ Batch fitting crashed: {_batch_fatal}")
+            st.code(_tb_fatal.format_exc())
 
 
     # Display batch results (outside button block, always visible if results exist)
