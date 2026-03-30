@@ -3790,27 +3790,42 @@ if cycles is not None and fluorescence is not None:
 
                     # ── Post-fit quality gates (same as batch mode) ──
                     _sq_warnings = []
+                    _sq_metrics = optimizer.calculate_fit_metrics()
+                    _sq_r2 = _sq_metrics.get('r_squared')
                     _sq_fs = float(optimizer.cycles_fit[0]) if optimizer.cycles_fit is not None and len(optimizer.cycles_fit) > 0 else None
                     _sq_fe = float(optimizer.cycles_fit[-1]) if optimizer.cycles_fit is not None and len(optimizer.cycles_fit) > 0 else None
+
+                    # Gate 0: very poor R²
+                    if _sq_r2 is not None and _sq_r2 < 0.90:
+                        _sq_warnings.append(f"R² {_sq_r2:.4f} < 0.90")
+
                     if _sq_fs is not None and _sq_fe is not None:
                         # Gate 2: fit window width (≥ 8 cycles)
                         if _sq_fe - _sq_fs < 8:
                             _sq_warnings.append(f"Fit window {_sq_fe - _sq_fs:.0f} cycles < 8")
+
                     # Gate 3: sigmoid shape (inflection in fit window)
-                    try:
-                        _sq_pred = optimizer.predict(cycles)
-                        if _sq_fs is not None and _sq_fe is not None and len(_sq_pred) >= 5:
-                            _sq_win_mask = (cycles >= _sq_fs) & (cycles <= _sq_fe)
-                            _sq_pred_win = _sq_pred[_sq_win_mask]
-                            if len(_sq_pred_win) >= 5:
-                                _sq_d1 = np.gradient(_sq_pred_win)
-                                _sq_d2 = np.gradient(_sq_d1)
-                                _sq_pred_range = float(np.max(_sq_pred_win) - np.min(_sq_pred_win))
-                                _sq_d2_thresh = _sq_pred_range * 0.01
-                                if not (np.any(_sq_d2 > _sq_d2_thresh) and np.any(_sq_d2 < -_sq_d2_thresh)):
-                                    _sq_warnings.append("No inflection (monotone curve)")
-                    except Exception:
-                        pass
+                    # Skip for late amplifiers — they may only capture the
+                    # exponential rise without reaching the inflection point.
+                    _sq_is_late = (
+                        _sq_fe is not None
+                        and _sq_fe >= float(cycles[-1]) - 1
+                    )
+                    if not _sq_is_late:
+                        try:
+                            _sq_pred = optimizer.predict(cycles)
+                            if _sq_fs is not None and _sq_fe is not None and len(_sq_pred) >= 5:
+                                _sq_win_mask = (cycles >= _sq_fs) & (cycles <= _sq_fe)
+                                _sq_pred_win = _sq_pred[_sq_win_mask]
+                                if len(_sq_pred_win) >= 5:
+                                    _sq_d1 = np.gradient(_sq_pred_win)
+                                    _sq_d2 = np.gradient(_sq_d1)
+                                    _sq_pred_range = float(np.max(_sq_pred_win) - np.min(_sq_pred_win))
+                                    _sq_d2_thresh = _sq_pred_range * 0.01
+                                    if not (np.any(_sq_d2 > _sq_d2_thresh) and np.any(_sq_d2 < -_sq_d2_thresh)):
+                                        _sq_warnings.append("No inflection (monotone curve)")
+                        except Exception:
+                            pass
 
                     st.session_state['fitted_params'] = fitted_params
                     st.session_state['optimizer'] = optimizer
