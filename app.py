@@ -2695,7 +2695,6 @@ if cycles is not None and fluorescence is not None:
 
             status_text.text("✅ Batch fitting complete!")
             st.toast("Fitting complete — results saved!", icon="✅")
-            st.session_state['_auto_download_pending'] = True
 
             # Create results dataframe (remove fluor_data before display)
             _hidden = {'fluor_data', 'bg_slope_est', 'bg_intercept_est'}
@@ -2777,26 +2776,6 @@ if cycles is not None and fluorescence is not None:
                 import traceback as _tb
                 st.error(f"Error enriching results: {_build_err}")
 
-            # Auto-download Excel file immediately after fitting
-            if st.session_state.pop('_auto_download_pending', False):
-                import base64 as _b64
-                _auto_xlsx = _build_excel_download(results_df)
-                _auto_b64 = _b64.b64encode(_auto_xlsx).decode()
-                _auto_ts = pd.Timestamp.now().strftime('%Y-%m-%dT%H-%M')
-                _auto_fname = f'batch_fit_results_{_auto_ts}.xlsx'
-                import streamlit.components.v1 as _components
-                _components.html(
-                    f'''<script>
-                    const a = document.createElement('a');
-                    a.href = 'data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{_auto_b64}';
-                    a.download = '{_auto_fname}';
-                    document.body.appendChild(a);
-                    a.click();
-                    document.body.removeChild(a);
-                    </script>''',
-                    height=0,
-                )
-                st.code(_tb.format_exc())
 
     # Display batch results (outside button block, always visible if results exist)
     if not (batch_mode and all_samples) and 'batch_results' not in st.session_state:
