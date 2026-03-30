@@ -2956,24 +2956,37 @@ if cycles is not None and fluorescence is not None:
 if 'batch_results' in st.session_state:
     st.subheader("🔄 Batch Fitting Results")
 
-    # Prominent Excel download at top of results
-    _xl_results_top = st.session_state['batch_results']
-    _xl_rep_top = st.session_state.get('_replicate_stats_df')
-    _xl_prec_top = st.session_state.get('_precision_comparison_df')
-    _xl_bytes_top = _build_excel_download(_xl_results_top, _xl_rep_top, _xl_prec_top)
-    _xl_sheets_top = ["Batch Results"]
-    if _xl_rep_top is not None:
-        _xl_sheets_top.append("Replicate Statistics")
-    if _xl_prec_top is not None:
-        _xl_sheets_top.append("Precision Comparison")
-    st.download_button(
-        f"📥 Download Complete Results (.xlsx — {', '.join(_xl_sheets_top)})",
-        _xl_bytes_top,
-        "batch_fit_results.xlsx",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="batch_download_xlsx_top",
-        type="primary",
-    )
+    # Prominent download buttons at top of results
+    try:
+        _xl_results_top = st.session_state['batch_results']
+        _xl_rep_top = st.session_state.get('_replicate_stats_df')
+        _xl_prec_top = st.session_state.get('_precision_comparison_df')
+        _xl_bytes_top = _build_excel_download(_xl_results_top, _xl_rep_top, _xl_prec_top)
+        _xl_sheets_top = ["Batch Results"]
+        if _xl_rep_top is not None:
+            _xl_sheets_top.append("Replicate Statistics")
+        if _xl_prec_top is not None:
+            _xl_sheets_top.append("Precision Comparison")
+        st.download_button(
+            f"📥 Download Complete Results (.xlsx — {', '.join(_xl_sheets_top)})",
+            _xl_bytes_top,
+            "batch_fit_results.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="batch_download_xlsx_top",
+            type="primary",
+        )
+    except Exception as _xl_err:
+        # Fallback to CSV if Excel generation fails
+        st.warning(f"Excel export unavailable ({_xl_err}). Use CSV instead.")
+        csv = st.session_state['batch_results'].to_csv(index=False)
+        st.download_button(
+            "📥 Download Results (.csv)",
+            csv,
+            "batch_fit_results.csv",
+            "text/csv",
+            key="batch_download_csv_fallback",
+            type="primary",
+        )
 
     results_df = st.session_state['batch_results']
     results_list = st.session_state.get('batch_results_list', [])
