@@ -2515,7 +2515,16 @@ if cycles is not None and fluorescence is not None:
                 # sign change).  Only check within fit window, not the
                 # full curve, and require the curvature to be significant
                 # relative to the signal range (not just numerical noise).
-                if (not _pf_reject and _pf_r.get('D0') is not None
+                # Skip for late amplifiers — they may only capture the
+                # exponential rise without reaching the inflection point.
+                _pf_fe_late = _pf_r.get('fit_end_cycle')
+                _pf_is_late = (
+                    _pf_fe_late is not None
+                    and not (isinstance(_pf_fe_late, float) and np.isnan(_pf_fe_late))
+                    and _pf_fe_late >= float(cycles[-1]) - 1
+                )
+                if (not _pf_reject and not _pf_is_late
+                        and _pf_r.get('D0') is not None
                         and not (isinstance(_pf_r['D0'], float) and np.isnan(_pf_r['D0']))
                         and _pf_r.get('fluor_data') is not None):
                     try:
