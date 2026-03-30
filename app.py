@@ -1604,38 +1604,11 @@ if cycles is not None and fluorescence is not None:
                     cycles_fit     = cycles[fit_start_idx:]
                     fluor_fit      = fluor_data[fit_start_idx:]
 
-                    # ── Pre-fit signal-above-baseline gate ─────────────────────
-                    # Compute how far the signal rises above the baseline
-                    # regression line.  For raw RFU data with large offsets,
-                    # a simple F_max/F_baseline ratio doesn't work (e.g. a
-                    # signal going from 1.2M to 1.6M is only 1.3× but is
-                    # real amplification).  Instead, compare the max
-                    # *departure* from baseline to the baseline noise (SD).
-                    _bg_line = _bg_slope_est * cycles + _bg_int_est
-                    _departures = fluor_data - _bg_line
-                    _max_departure = float(np.max(_departures))
-                    _bl_sd = float(np.std(fluor_data[:max(3, fit_start_idx)])) if fit_start_idx >= 3 else float(np.std(fluor_data[:6]))
-                    _bl_sd = max(_bl_sd, 1e-10)
-                    # Signal must rise at least 5× the baseline noise
-                    _departure_ratio = _max_departure / _bl_sd
-                    if _departure_ratio < 5.0:
-                        results_list.append({
-                            'Sample': sample_name,
-                            'D0': np.nan, 'k': np.nan, 'P0': np.nan,
-                            'F_bg_intercept': np.nan, 'F_bg_slope': np.nan,
-                            'R2': np.nan, 'SSR': np.nan, 'RMSE': np.nan, 'NRMSE': np.nan,
-                            'Tier': None, 'Instrument': '',
-                            'Ct': np.nan, 'Ct_baseline_mean': np.nan,
-                            'Ct_baseline_slope': np.nan, 'Ct_baseline_intercept': np.nan,
-                            'fit_start_cycle': np.nan, 'fit_end_cycle': np.nan,
-                            'bl_end_meta': _meta_bl_end_cycle, 'bl_end_est': _est_bl_end_cycle,
-                            'ct_rox_mean': np.nan,
-                            'Success': '', 'FixedBG': '', 'Fallback': '', 'FallbackOK': '',
-                            'bg_slope_est': bg_slope_est, 'bg_intercept_est': bg_intercept_est,
-                            'error': f'No amplification detected (signal {_departure_ratio:.1f}× baseline SD < 5×)',
-                            'fluor_data': fluor_data,
-                        })
-                        continue
+                    # NOTE: pre-fit signal gate removed — the upstream
+                    # detect_no_signal_samples() and the per-channel 5×SD
+                    # check already filter non-amplifying wells.  A pre-fit
+                    # gate here is redundant and too aggressive for raw RFU
+                    # data where baseline SD is large due to instrument noise.
 
                     _F_range     = float(np.max(fluor_fit) - np.min(fluor_fit))
                     # Build symmetric bounds around the linear-regression values
@@ -2524,26 +2497,9 @@ if cycles is not None and fluorescence is not None:
                     _pf_reject = True
                     _pf_reason = 'R² < 0.90'
 
-                # Gate 1: signal departure from baseline (works for raw RFU
-                # and background-subtracted data alike)
-                if not _pf_reject and _pf_r.get('fluor_data') is not None:
-                    _pf_fd = _pf_r['fluor_data']
-                    _pf_fs = _pf_r.get('fit_start_cycle')
-                    if _pf_fs is not None:
-                        _pf_c = cycles[:len(_pf_fd)]
-                        _pf_fs_idx = int(np.searchsorted(_pf_c, _pf_fs))
-                        _pf_bl_region = _pf_fd[:max(3, _pf_fs_idx)]
-                        _pf_bl_sd = float(np.std(_pf_bl_region)) if len(_pf_bl_region) >= 3 else 1e-10
-                        _pf_bl_sd = max(_pf_bl_sd, 1e-10)
-                        # Compute departure from baseline regression
-                        _pf_bg_s = _pf_r.get('bg_slope_est', 0.0) or 0.0
-                        _pf_bg_i = _pf_r.get('bg_intercept_est', float(np.mean(_pf_bl_region))) or float(np.mean(_pf_bl_region))
-                        _pf_bg_line = _pf_bg_s * _pf_c + _pf_bg_i
-                        _pf_max_dep = float(np.max(_pf_fd - _pf_bg_line))
-                        _pf_dep_ratio = _pf_max_dep / _pf_bl_sd
-                        if _pf_dep_ratio < 5.0:
-                            _pf_reject = True
-                            _pf_reason = f'Signal {_pf_dep_ratio:.1f}× baseline SD < 5×'
+                # Gate 1: removed — signal departure check is redundant
+                # with upstream detect_no_signal_samples() and too
+                # aggressive for raw RFU data with high baseline noise.
 
                 # Gate 2: fit window too narrow
                 if not _pf_reject:
@@ -2554,28 +2510,42 @@ if cycles is not None and fluorescence is not None:
                         _pf_reject = True
                         _pf_reason = f'Fit window {_pf_fe2 - _pf_fs2:.0f} cycles < 8'
 
-                # Gate 3: sigmoid shape (inflection point in fitted curve)
+                # Gate 3: sigmoid shape — the fitted curve within the fit
+                # window must show a clear inflection (second derivative
+                # sign change).  Only check within fit window, not the
+                # full curve, and require the curvature to be significant
+                # relative to the signal range (not just numerical noise).
                 if (not _pf_reject and _pf_r.get('D0') is not None
+                        and not (isinstance(_pf_r['D0'], float) and np.isnan(_pf_r['D0']))
                         and _pf_r.get('fluor_data') is not None):
                     try:
-                        _pf_m = MAK2Model()
-                        _pf_c_full = cycles[:len(_pf_r['fluor_data'])]
-                        _pf_pred = _pf_m.simulate_to_cycle(
-                            D0=_pf_r['D0'], k=_pf_r['k'], P0=_pf_r['P0'],
-                            cycles=_pf_c_full,
-                            F_bg_intercept=_pf_r['F_bg_intercept'],
-                            F_bg_slope=_pf_r['F_bg_slope'],
-                        )
-                        # Second derivative of fitted curve
-                        if len(_pf_pred) >= 5:
-                            _pf_d2 = np.gradient(np.gradient(_pf_pred))
-                            # Sigmoid requires sign change in 2nd derivative
-                            _pf_has_inflection = (
-                                np.any(_pf_d2 > 0) and np.any(_pf_d2 < 0)
+                        _pf_fs3 = _pf_r.get('fit_start_cycle')
+                        _pf_fe3 = _pf_r.get('fit_end_cycle')
+                        if _pf_fs3 is not None and _pf_fe3 is not None:
+                            _pf_m = MAK2Model()
+                            _pf_c_full = cycles[:len(_pf_r['fluor_data'])]
+                            _pf_pred = _pf_m.simulate_to_cycle(
+                                D0=_pf_r['D0'], k=_pf_r['k'], P0=_pf_r['P0'],
+                                cycles=_pf_c_full,
+                                F_bg_intercept=_pf_r['F_bg_intercept'],
+                                F_bg_slope=_pf_r['F_bg_slope'],
                             )
-                            if not _pf_has_inflection:
-                                _pf_reject = True
-                                _pf_reason = 'No inflection (monotone curve)'
+                            # Restrict to fit window
+                            _pf_win_mask = (_pf_c_full >= _pf_fs3) & (_pf_c_full <= _pf_fe3)
+                            _pf_pred_win = _pf_pred[_pf_win_mask]
+                            if len(_pf_pred_win) >= 5:
+                                _pf_d1 = np.gradient(_pf_pred_win)
+                                _pf_d2 = np.gradient(_pf_d1)
+                                _pf_pred_range = float(np.max(_pf_pred_win) - np.min(_pf_pred_win))
+                                # Curvature must be significant (> 1% of signal range)
+                                _pf_d2_thresh = _pf_pred_range * 0.01
+                                _pf_has_inflection = (
+                                    np.any(_pf_d2 > _pf_d2_thresh)
+                                    and np.any(_pf_d2 < -_pf_d2_thresh)
+                                )
+                                if not _pf_has_inflection:
+                                    _pf_reject = True
+                                    _pf_reason = 'No inflection (monotone curve)'
                     except Exception:
                         pass
 
@@ -3795,21 +3765,6 @@ if cycles is not None and fluorescence is not None:
                             _s_bg_slope  = float(_s_bg_coeffs[0])
                             _s_bg_int    = float(_s_bg_coeffs[1])
 
-                    # ── Pre-fit signal-above-baseline gate (same as batch) ──
-                    _s_bg_line = _s_bg_slope * cycles + _s_bg_int
-                    _s_departures = fluorescence - _s_bg_line
-                    _s_max_dep = float(np.max(_s_departures))
-                    _s_bl_sd = float(np.std(fluorescence[:max(3, _single_start)])) if _single_start >= 3 else float(np.std(fluorescence[:6]))
-                    _s_bl_sd = max(_s_bl_sd, 1e-10)
-                    _s_dep_ratio = _s_max_dep / _s_bl_sd
-                    if _s_dep_ratio < 5.0:
-                        sys.stdout = old_stdout
-                        st.warning(
-                            f"⚠️ No amplification detected: signal rises only {_s_dep_ratio:.1f}× "
-                            f"baseline noise (need ≥ 5×)."
-                        )
-                        st.stop()
-
                     fitted_params = optimizer.fit(
                         cycles[_single_start:],
                         fluorescence[_single_start:],
@@ -3826,28 +3781,25 @@ if cycles is not None and fluorescence is not None:
 
                     # ── Post-fit quality gates (same as batch mode) ──
                     _sq_warnings = []
-                    # Gate 1: signal departure from baseline
                     _sq_fs = float(optimizer.cycles_fit[0]) if optimizer.cycles_fit is not None and len(optimizer.cycles_fit) > 0 else None
                     _sq_fe = float(optimizer.cycles_fit[-1]) if optimizer.cycles_fit is not None and len(optimizer.cycles_fit) > 0 else None
                     if _sq_fs is not None and _sq_fe is not None:
-                        _sq_bg_line = _s_bg_slope * cycles + _s_bg_int
-                        _sq_deps = fluorescence - _sq_bg_line
-                        _sq_max_dep = float(np.max(_sq_deps))
-                        _sq_bl_sd = float(np.std(fluorescence[:max(3, _single_start)])) if _single_start >= 3 else float(np.std(fluorescence[:6]))
-                        _sq_bl_sd = max(_sq_bl_sd, 1e-10)
-                        _sq_dep_ratio = _sq_max_dep / _sq_bl_sd
-                        if _sq_dep_ratio < 5.0:
-                            _sq_warnings.append(f"Signal {_sq_dep_ratio:.1f}× baseline SD < 5×")
                         # Gate 2: fit window width (≥ 8 cycles)
                         if _sq_fe - _sq_fs < 8:
                             _sq_warnings.append(f"Fit window {_sq_fe - _sq_fs:.0f} cycles < 8")
-                    # Gate 3: sigmoid shape (inflection in fitted curve)
+                    # Gate 3: sigmoid shape (inflection in fit window)
                     try:
                         _sq_pred = optimizer.predict(cycles)
-                        if len(_sq_pred) >= 5:
-                            _sq_d2 = np.gradient(np.gradient(_sq_pred))
-                            if not (np.any(_sq_d2 > 0) and np.any(_sq_d2 < 0)):
-                                _sq_warnings.append("No inflection (monotone curve)")
+                        if _sq_fs is not None and _sq_fe is not None and len(_sq_pred) >= 5:
+                            _sq_win_mask = (cycles >= _sq_fs) & (cycles <= _sq_fe)
+                            _sq_pred_win = _sq_pred[_sq_win_mask]
+                            if len(_sq_pred_win) >= 5:
+                                _sq_d1 = np.gradient(_sq_pred_win)
+                                _sq_d2 = np.gradient(_sq_d1)
+                                _sq_pred_range = float(np.max(_sq_pred_win) - np.min(_sq_pred_win))
+                                _sq_d2_thresh = _sq_pred_range * 0.01
+                                if not (np.any(_sq_d2 > _sq_d2_thresh) and np.any(_sq_d2 < -_sq_d2_thresh)):
+                                    _sq_warnings.append("No inflection (monotone curve)")
                     except Exception:
                         pass
 
