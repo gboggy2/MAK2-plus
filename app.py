@@ -2694,6 +2694,8 @@ if cycles is not None and fluorescence is not None:
                     results_list[_pf_idx]['Ct'] = None
 
             status_text.text("✅ Batch fitting complete!")
+            st.toast("Fitting complete — results saved!", icon="✅")
+            st.session_state['_auto_download_pending'] = True
 
             # Create results dataframe (remove fluor_data before display)
             _hidden = {'fluor_data', 'bg_slope_est', 'bg_intercept_est'}
@@ -2774,6 +2776,26 @@ if cycles is not None and fluorescence is not None:
             except Exception as _build_err:
                 import traceback as _tb
                 st.error(f"Error enriching results: {_build_err}")
+
+            # Auto-download Excel file immediately after fitting
+            if st.session_state.pop('_auto_download_pending', False):
+                import base64 as _b64
+                _auto_xlsx = _build_excel_download(results_df)
+                _auto_b64 = _b64.b64encode(_auto_xlsx).decode()
+                _auto_ts = pd.Timestamp.now().strftime('%Y-%m-%dT%H-%M')
+                _auto_fname = f'batch_fit_results_{_auto_ts}.xlsx'
+                import streamlit.components.v1 as _components
+                _components.html(
+                    f'''<script>
+                    const a = document.createElement('a');
+                    a.href = 'data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{_auto_b64}';
+                    a.download = '{_auto_fname}';
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    </script>''',
+                    height=0,
+                )
                 st.code(_tb.format_exc())
 
     # Display batch results (outside button block, always visible if results exist)
@@ -2954,6 +2976,26 @@ if cycles is not None and fluorescence is not None:
 
 if 'batch_results' in st.session_state:
     st.subheader("🔄 Batch Fitting Results")
+
+    # Prominent Excel download at top of results
+    _xl_results_top = st.session_state['batch_results']
+    _xl_rep_top = st.session_state.get('_replicate_stats_df')
+    _xl_prec_top = st.session_state.get('_precision_comparison_df')
+    _xl_bytes_top = _build_excel_download(_xl_results_top, _xl_rep_top, _xl_prec_top)
+    _xl_sheets_top = ["Batch Results"]
+    if _xl_rep_top is not None:
+        _xl_sheets_top.append("Replicate Statistics")
+    if _xl_prec_top is not None:
+        _xl_sheets_top.append("Precision Comparison")
+    st.download_button(
+        f"📥 Download Complete Results (.xlsx — {', '.join(_xl_sheets_top)})",
+        _xl_bytes_top,
+        "batch_fit_results.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="batch_download_xlsx_top",
+        type="primary",
+    )
+
     results_df = st.session_state['batch_results']
     results_list = st.session_state.get('batch_results_list', [])
 
@@ -3687,30 +3729,6 @@ if 'batch_results' in st.session_state:
                                     st.info(f"ℹ️ **Ct shows better linearity** (R² = {comparison['ct_r2']:.4f} vs {comparison['d0_r2']:.4f})")
                     else:
                         st.info("💡 Enable 'Analyze as dilution series' in the sidebar to see linearity analysis")
-
-# ============================================================================
-# EXCEL DOWNLOAD (after replicate analysis so all sheets are populated)
-# ============================================================================
-if 'batch_results' in st.session_state:
-    _xl_results_df = st.session_state['batch_results']
-    _xl_rep_stats = st.session_state.get('_replicate_stats_df')
-    _xl_prec_comp = st.session_state.get('_precision_comparison_df')
-    _xl_bytes = _build_excel_download(_xl_results_df, _xl_rep_stats, _xl_prec_comp)
-    _xl_n = 1 + (1 if _xl_rep_stats is not None else 0) + (1 if _xl_prec_comp is not None else 0)
-    _xl_sheet_names = ["Batch Results"]
-    if _xl_rep_stats is not None:
-        _xl_sheet_names.append("Replicate Statistics")
-    if _xl_prec_comp is not None:
-        _xl_sheet_names.append("Precision Comparison")
-    st.markdown("---")
-    st.download_button(
-        f"📥 Download Complete Results (.xlsx — {', '.join(_xl_sheet_names)})",
-        _xl_bytes,
-        "batch_fit_results.xlsx",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="batch_download_xlsx",
-        type="primary",
-    )
 
 # Batch visualization section (outside button block, always visible if results exist)
 if 'batch_results_list' in st.session_state and 'batch_all_samples' in st.session_state:
