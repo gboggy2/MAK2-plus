@@ -2570,9 +2570,10 @@ if cycles is not None and fluorescence is not None:
             status_text.text("✅ Batch fitting complete!")
 
             # Create results dataframe (remove fluor_data before display)
-            _hidden = {'fluor_data', 'bg_slope_est', 'bg_intercept_est'}
-            display_results = [{k: v for k, v in r.items() if k not in _hidden} for r in results_list]
-            results_df = pd.DataFrame(display_results)
+            try:
+                _hidden = {'fluor_data', 'bg_slope_est', 'bg_intercept_est'}
+                display_results = [{k: v for k, v in r.items() if k not in _hidden} for r in results_list]
+                results_df = pd.DataFrame(display_results)
 
             # Add Target and Well columns for multiplexed data (target::well format)
             all_targets = st.session_state.get('all_targets', [])
@@ -2633,7 +2634,16 @@ if cycles is not None and fluorescence is not None:
                 'channel_thresholds': channel_thresholds,       # per-channel thresholds
                 'channel_baseline_means': channel_baseline_means, # per-channel baselines
             }
-        
+            except Exception as _build_err:
+                import traceback as _tb
+                st.error(f"Error building results: {_build_err}")
+                st.code(_tb.format_exc())
+                # Still store what we have so results aren't lost
+                _hidden = {'fluor_data', 'bg_slope_est', 'bg_intercept_est'}
+                _fallback = [{k: v for k, v in r.items() if k not in _hidden} for r in results_list]
+                st.session_state['batch_results'] = pd.DataFrame(_fallback)
+                st.session_state['batch_results_list'] = results_list
+
         # Display batch results (outside button block, always visible if results exist)
         if 'batch_results' in st.session_state:
             st.subheader("🔄 Batch Fitting Results")
