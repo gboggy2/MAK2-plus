@@ -2425,6 +2425,7 @@ if cycles is not None and fluorescence is not None:
                                 'NRMSE':                 _br['metrics']['nrmse'] * 100,
                                 'SSR':                   _br['metrics']['ssr'],
                                 'Tier':                  result.get('Tier'),
+                                'Instrument':            result.get('Instrument', ''),
                                 'Success':               ('✓ (window-retry)'
                                                           if _best_r2 >= 0.999
                                                           else ('✓ (late-amp)'
@@ -2674,11 +2675,13 @@ if cycles is not None and fluorescence is not None:
             
             # Summary statistics
             col1, col2, col3 = st.columns(3)
-            successful = results_df['Success'].str.contains('✓').sum()
+            successful = results_df['Success'].fillna('').str.contains('✓').sum()
             col1.metric("Successful Fits", f"{successful}/{len(results_list)}")
             if successful > 0:
-                col2.metric("Mean R²", f"{results_df['R2'].mean():.4f}")
-                col3.metric("Median R²", f"{results_df['R2'].median():.4f}")
+                _ok_r2 = results_df.loc[results_df['Success'].fillna('').str.contains('✓'), 'R2'].dropna()
+                if len(_ok_r2) > 0:
+                    col2.metric("Mean R²", f"{_ok_r2.mean():.4f}")
+                    col3.metric("Median R²", f"{_ok_r2.median():.4f}")
             
             # Show no-signal samples if any
             if 'batch_no_signal_samples' in st.session_state and st.session_state['batch_no_signal_samples']:
