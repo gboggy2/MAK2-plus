@@ -2587,13 +2587,16 @@ if cycles is not None and fluorescence is not None:
                 # relative to the signal range (not just numerical noise).
                 # Skip for late amplifiers — they may only capture the
                 # exponential rise without reaching the inflection point.
+                # Skip for high-R² fits (≥ 0.999) — the fit quality
+                # already validates the curve shape.
                 _pf_fe_late = _pf_r.get('fit_end_cycle')
                 _pf_is_late = (
                     _pf_fe_late is not None
                     and not (isinstance(_pf_fe_late, float) and np.isnan(_pf_fe_late))
                     and _pf_fe_late >= float(cycles[-1]) - 1
                 )
-                if (not _pf_reject and not _pf_is_late
+                _pf_high_r2 = (_pf_r2 is not None and _pf_r2 >= 0.999)
+                if (not _pf_reject and not _pf_is_late and not _pf_high_r2
                         and _pf_r.get('D0') is not None
                         and not (isinstance(_pf_r['D0'], float) and np.isnan(_pf_r['D0']))
                         and _pf_r.get('fluor_data') is not None):
@@ -2841,11 +2844,14 @@ if cycles is not None and fluorescence is not None:
                     # Gate 3: sigmoid shape (inflection in fit window)
                     # Skip for late amplifiers — they may only capture the
                     # exponential rise without reaching the inflection point.
+                    # Skip for high-R² fits (≥ 0.999) — fit quality validates shape.
                     _sq_is_late = (
                         _sq_fe is not None
                         and _sq_fe >= float(cycles[-1]) - 1
                     )
-                    if not _sq_is_late:
+                    _sq_r2_val = optimizer.metrics.get('r_squared', 0) if hasattr(optimizer, 'metrics') and optimizer.metrics else 0
+                    _sq_high_r2 = (_sq_r2_val >= 0.999)
+                    if not _sq_is_late and not _sq_high_r2:
                         try:
                             _sq_pred = optimizer.predict(cycles)
                             if _sq_fs is not None and _sq_fe is not None and len(_sq_pred) >= 5:
