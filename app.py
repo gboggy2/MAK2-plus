@@ -2575,65 +2575,65 @@ if cycles is not None and fluorescence is not None:
                 display_results = [{k: v for k, v in r.items() if k not in _hidden} for r in results_list]
                 results_df = pd.DataFrame(display_results)
 
-            # Add Target and Well columns for multiplexed data (target::well format)
-            all_targets = st.session_state.get('all_targets', [])
-            if all_targets and results_df['Sample'].str.contains('::').any():
-                results_df.insert(0, 'Target', results_df['Sample'].str.split('::').str[0])
-                results_df.insert(1, 'Well', results_df['Sample'].str.split('::').str[1])
+                # Add Target and Well columns for multiplexed data (target::well format)
+                all_targets = st.session_state.get('all_targets', [])
+                if all_targets and results_df['Sample'].str.contains('::').any():
+                    results_df.insert(0, 'Target', results_df['Sample'].str.split('::').str[0])
+                    results_df.insert(1, 'Well', results_df['Sample'].str.split('::').str[1])
 
-            # Add Channel column for multi-channel data (FAM_A1 format)
-            all_channels = st.session_state.get('selected_channels', [])
-            if all_channels and len(all_channels) > 1:
-                results_df.insert(0, 'Channel', results_df['Sample'].map(_ch))
+                # Add Channel column for multi-channel data (FAM_A1 format)
+                all_channels = st.session_state.get('selected_channels', [])
+                if all_channels and len(all_channels) > 1:
+                    results_df.insert(0, 'Channel', results_df['Sample'].map(_ch))
 
-            # Annotate with sample metadata (Sample Name, Task, Known_Copies) if available
-            sample_metadata = st.session_state.get('sample_metadata')
-            if sample_metadata:
-                results_df.insert(
-                    results_df.columns.get_loc('Sample') + 1,
-                    'Sample_Name',
-                    results_df['Sample'].map(
-                        lambda w: sample_metadata.get(w, {}).get('Sample Name', '')
+                # Annotate with sample metadata (Sample Name, Task, Known_Copies) if available
+                sample_metadata = st.session_state.get('sample_metadata')
+                if sample_metadata:
+                    results_df.insert(
+                        results_df.columns.get_loc('Sample') + 1,
+                        'Sample_Name',
+                        results_df['Sample'].map(
+                            lambda w: sample_metadata.get(w, {}).get('Sample Name', '')
+                        )
                     )
-                )
-                results_df.insert(
-                    results_df.columns.get_loc('Sample_Name') + 1,
-                    'Task',
-                    results_df['Sample'].map(
-                        lambda w: sample_metadata.get(w, {}).get('Task', '')
+                    results_df.insert(
+                        results_df.columns.get_loc('Sample_Name') + 1,
+                        'Task',
+                        results_df['Sample'].map(
+                            lambda w: sample_metadata.get(w, {}).get('Task', '')
+                        )
                     )
-                )
-                results_df['Known_Copies'] = results_df['Sample'].map(
-                    lambda w: sample_metadata.get(w, {}).get('Quantity', np.nan)
-                )
-
-                # Add instrument Ct column for comparison (from ABI results CSV)
-                if any('Ct_instrument' in sample_metadata.get(w, {})
-                       for w in results_df['Sample']):
-                    ct_inst_col = results_df['Sample'].map(
-                        lambda w: sample_metadata.get(w, {}).get('Ct_instrument', np.nan)
+                    results_df['Known_Copies'] = results_df['Sample'].map(
+                        lambda w: sample_metadata.get(w, {}).get('Quantity', np.nan)
                     )
-                    ct_loc = results_df.columns.get_loc('Ct') + 1
-                    results_df.insert(ct_loc, 'Ct_instrument', ct_inst_col)
 
-            # Store in session state for persistence
-            st.session_state['batch_results'] = results_df
-            st.session_state['batch_results_list'] = results_list
-            st.session_state['batch_all_samples'] = all_samples
-            st.session_state['batch_no_signal_samples'] = no_signal_samples  # Store flagged samples
-            st.session_state['batch_cycles'] = cycles
-            st.session_state['batch_settings'] = {
-                'first_fit_cycle': first_fit_cycle,
-                'cycles_before_max': cycles_before_max,
-                'cycles_after_max': cycles_after_max,
-                'auto_truncate': auto_truncate,
-                'truncate_cycle': truncate_cycle,
-                'custom_bounds_dict': custom_bounds_dict,
-                'global_threshold': global_threshold,
-                'global_baseline_mean': global_baseline_mean,
-                'channel_thresholds': channel_thresholds,       # per-channel thresholds
-                'channel_baseline_means': channel_baseline_means, # per-channel baselines
-            }
+                    # Add instrument Ct column for comparison (from ABI results CSV)
+                    if any('Ct_instrument' in sample_metadata.get(w, {})
+                           for w in results_df['Sample']):
+                        ct_inst_col = results_df['Sample'].map(
+                            lambda w: sample_metadata.get(w, {}).get('Ct_instrument', np.nan)
+                        )
+                        ct_loc = results_df.columns.get_loc('Ct') + 1
+                        results_df.insert(ct_loc, 'Ct_instrument', ct_inst_col)
+
+                # Store in session state for persistence
+                st.session_state['batch_results'] = results_df
+                st.session_state['batch_results_list'] = results_list
+                st.session_state['batch_all_samples'] = all_samples
+                st.session_state['batch_no_signal_samples'] = no_signal_samples  # Store flagged samples
+                st.session_state['batch_cycles'] = cycles
+                st.session_state['batch_settings'] = {
+                    'first_fit_cycle': first_fit_cycle,
+                    'cycles_before_max': cycles_before_max,
+                    'cycles_after_max': cycles_after_max,
+                    'auto_truncate': auto_truncate,
+                    'truncate_cycle': truncate_cycle,
+                    'custom_bounds_dict': custom_bounds_dict,
+                    'global_threshold': global_threshold,
+                    'global_baseline_mean': global_baseline_mean,
+                    'channel_thresholds': channel_thresholds,       # per-channel thresholds
+                    'channel_baseline_means': channel_baseline_means, # per-channel baselines
+                }
             except Exception as _build_err:
                 import traceback as _tb
                 st.error(f"Error building results: {_build_err}")
