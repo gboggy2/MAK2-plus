@@ -1478,9 +1478,13 @@ class MAK2Optimizer:
         _tier3_fired = False
         _tier3_r2_before = self.metrics['r_squared']
 
-        # TIER 3: DIFFERENTIAL EVOLUTION for extremely challenging samples
-        # If R² < 0.999, try global optimization to reach excellence threshold
-        if (self.metrics['r_squared'] < 0.999 and 'tier3' not in disabled_tiers
+        # TIER 3: DIFFERENTIAL EVOLUTION for near-miss samples
+        # Only fire when R² is close enough (≥ 0.95) that DE has a realistic
+        # chance of reaching 0.999.  Below 0.95, the curve is too far gone
+        # (likely non-amplifying or degenerate) — spending 2+ seconds on DE
+        # per well adds up fast in batch mode with no benefit.
+        if (0.95 <= self.metrics['r_squared'] < 0.999
+                and 'tier3' not in disabled_tiers
                 and time.perf_counter() < self._fit_deadline):
             _tier3_fired = True
             print(f"\n🌍 TIER 3: DIFFERENTIAL EVOLUTION")
