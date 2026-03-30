@@ -51,53 +51,81 @@ st.set_page_config(
 # PERSISTENT RESULTS CACHE
 # ============================================================================
 # Streamlit Cloud drops the websocket when the browser tab is backgrounded,
-# which wipes session state.  We persist batch results to a temp file so
-# they survive session resets.
+# which wipes session state.  We use TWO layers of persistence:
+#
+# 1. @st.cache_resource — in-process memory, survives websocket drops and
+#    session resets within the same Python process.  Most reliable.
+# 2. Pickle file on disk — survives app module reloads within the same
+#    container.  Backup for layer 1.
+#
+# Neither survives a full container restart on Streamlit Cloud free tier
+# (~7–15 min idle timeout).  That is a platform limitation.
 
 import tempfile, pickle, hashlib
+
+@st.cache_resource
+def _get_results_store():
+    """Singleton dict shared across all sessions in this process."""
+    return {}
+
+_results_store = _get_results_store()
 
 _RESULTS_CACHE_DIR = os.path.join(tempfile.gettempdir(), 'mak2_results')
 os.makedirs(_RESULTS_CACHE_DIR, exist_ok=True)
 
 def _results_cache_path():
-    """Return a per-session cache file path."""
-    # Use a fixed filename per Streamlit server process so all sessions
-    # from the same deployment share the cache.  On Community Cloud there
-    # is only one user at a time, so this is safe.
     return os.path.join(_RESULTS_CACHE_DIR, 'last_batch_results.pkl')
 
 def _save_results_to_disk(results_df, results_list, all_samples, no_signal_samples, cycles, settings):
-    """Persist batch results to disk so they survive session resets."""
+    """Persist batch results to both in-memory store and disk."""
+    # Strip fluor_data from results_list (large, reconstructable)
+    slim_list = []
+    for r in results_list:
+        slim = {k: v for k, v in r.items() if k != 'fluor_data'}
+        slim_list.append(slim)
+    payload = {
+        'results_df': results_df,
+        'results_list': slim_list,
+        'all_samples': {k: v.tolist() if hasattr(v, 'tolist') else v for k, v in all_samples.items()},
+        'no_signal_samples': no_signal_samples,
+        'cycles': cycles.tolist() if hasattr(cycles, 'tolist') else cycles,
+        'settings': settings,
+    }
+    # Layer 1: in-process store (most reliable)
+    _results_store['payload'] = payload
+
+    # Layer 2: pickle to disk (backup)
     try:
-        # Strip fluor_data from results_list (large, reconstructable)
-        slim_list = []
-        for r in results_list:
-            slim = {k: v for k, v in r.items() if k != 'fluor_data'}
-            slim_list.append(slim)
-        payload = {
-            'results_df': results_df,
-            'results_list': slim_list,
-            'all_samples': {k: v.tolist() if hasattr(v, 'tolist') else v for k, v in all_samples.items()},
-            'no_signal_samples': no_signal_samples,
-            'cycles': cycles.tolist() if hasattr(cycles, 'tolist') else cycles,
-            'settings': settings,
-        }
         with open(_results_cache_path(), 'wb') as f:
             pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
-    except Exception:
-        pass  # Best-effort; don't crash if save fails
+    except Exception as e:
+        st.toast(f"Warning: disk cache save failed: {e}", icon="⚠️")
 
-def _restore_results_from_disk():
-    """Reload batch results from disk if session state is empty."""
+def _restore_results_from_cache():
+    """Try to restore batch results from in-memory store or disk."""
+    payload = None
+
+    # Layer 1: in-process store
+    if 'payload' in _results_store:
+        payload = _results_store['payload']
+
+    # Layer 2: disk fallback
+    if payload is None:
+        try:
+            path = _results_cache_path()
+            if os.path.exists(path):
+                with open(path, 'rb') as f:
+                    payload = pickle.load(f)
+                # Promote to in-memory store for future restores
+                _results_store['payload'] = payload
+        except Exception:
+            pass
+
+    if payload is None:
+        return False
+
     try:
-        path = _results_cache_path()
-        if not os.path.exists(path):
-            return False
-        with open(path, 'rb') as f:
-            payload = pickle.load(f)
         st.session_state['batch_results'] = payload['results_df']
-        # Rebuild results_list with fluor_data stubs (visualization will
-        # pull from batch_all_samples instead)
         st.session_state['batch_results_list'] = payload['results_list']
         st.session_state['batch_all_samples'] = {
             k: np.array(v) for k, v in payload['all_samples'].items()
@@ -106,15 +134,15 @@ def _restore_results_from_disk():
         st.session_state['batch_cycles'] = np.array(payload['cycles'])
         st.session_state['batch_settings'] = payload['settings']
         return True
-    except Exception:
+    except Exception as e:
+        st.toast(f"Warning: result restore failed: {e}", icon="⚠️")
         return False
 
-# On app startup: if session state has no batch results but disk cache
-# exists, restore it.  This covers the case where the websocket dropped
-# during a long computation and Streamlit created a fresh session.
+# On app startup: if session state has no batch results, try to restore
+# from cache.  This covers websocket drops during long computations.
 if 'batch_results' not in st.session_state:
-    if _restore_results_from_disk():
-        st.toast("♻️ Restored previous batch results", icon="✅")
+    if _restore_results_from_cache():
+        st.toast("Restored previous batch results", icon="✅")
 
 # ============================================================================
 # HELPERS
