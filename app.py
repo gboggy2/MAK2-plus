@@ -48,6 +48,75 @@ st.set_page_config(
 )
 
 # ============================================================================
+# PERSISTENT RESULTS CACHE
+# ============================================================================
+# Streamlit Cloud drops the websocket when the browser tab is backgrounded,
+# which wipes session state.  We persist batch results to a temp file so
+# they survive session resets.
+
+import tempfile, pickle, hashlib
+
+_RESULTS_CACHE_DIR = os.path.join(tempfile.gettempdir(), 'mak2_results')
+os.makedirs(_RESULTS_CACHE_DIR, exist_ok=True)
+
+def _results_cache_path():
+    """Return a per-session cache file path."""
+    # Use a fixed filename per Streamlit server process so all sessions
+    # from the same deployment share the cache.  On Community Cloud there
+    # is only one user at a time, so this is safe.
+    return os.path.join(_RESULTS_CACHE_DIR, 'last_batch_results.pkl')
+
+def _save_results_to_disk(results_df, results_list, all_samples, no_signal_samples, cycles, settings):
+    """Persist batch results to disk so they survive session resets."""
+    try:
+        # Strip fluor_data from results_list (large, reconstructable)
+        slim_list = []
+        for r in results_list:
+            slim = {k: v for k, v in r.items() if k != 'fluor_data'}
+            slim_list.append(slim)
+        payload = {
+            'results_df': results_df,
+            'results_list': slim_list,
+            'all_samples': {k: v.tolist() if hasattr(v, 'tolist') else v for k, v in all_samples.items()},
+            'no_signal_samples': no_signal_samples,
+            'cycles': cycles.tolist() if hasattr(cycles, 'tolist') else cycles,
+            'settings': settings,
+        }
+        with open(_results_cache_path(), 'wb') as f:
+            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception:
+        pass  # Best-effort; don't crash if save fails
+
+def _restore_results_from_disk():
+    """Reload batch results from disk if session state is empty."""
+    try:
+        path = _results_cache_path()
+        if not os.path.exists(path):
+            return False
+        with open(path, 'rb') as f:
+            payload = pickle.load(f)
+        st.session_state['batch_results'] = payload['results_df']
+        # Rebuild results_list with fluor_data stubs (visualization will
+        # pull from batch_all_samples instead)
+        st.session_state['batch_results_list'] = payload['results_list']
+        st.session_state['batch_all_samples'] = {
+            k: np.array(v) for k, v in payload['all_samples'].items()
+        }
+        st.session_state['batch_no_signal_samples'] = payload['no_signal_samples']
+        st.session_state['batch_cycles'] = np.array(payload['cycles'])
+        st.session_state['batch_settings'] = payload['settings']
+        return True
+    except Exception:
+        return False
+
+# On app startup: if session state has no batch results but disk cache
+# exists, restore it.  This covers the case where the websocket dropped
+# during a long computation and Streamlit created a fresh session.
+if 'batch_results' not in st.session_state:
+    if _restore_results_from_disk():
+        st.toast("♻️ Restored previous batch results", icon="✅")
+
+# ============================================================================
 # HELPERS
 # ============================================================================
 
@@ -2592,6 +2661,13 @@ if cycles is not None and fluorescence is not None:
                 'channel_thresholds': channel_thresholds,
                 'channel_baseline_means': channel_baseline_means,
             }
+
+            # Persist to disk so results survive session resets
+            _save_results_to_disk(
+                results_df, results_list, all_samples,
+                no_signal_samples, cycles,
+                st.session_state['batch_settings'],
+            )
 
             # Now add display columns (if this fails, raw results still persist)
             try:
