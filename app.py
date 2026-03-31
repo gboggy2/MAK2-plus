@@ -2303,17 +2303,18 @@ if cycles is not None and fluorescence is not None:
                     except Exception:
                         pass
 
-            # ── Skip retries for wells Gate 0 will reject (R² < 0.99) ──
-            # These wells are fitting noise/drift; retrying wastes 15-60s
-            # each with no chance of producing a valid result.
+            # ── Skip retries for truly hopeless wells (R² < 0.90) ──
+            # Wells with R² 0.90-0.99 are worth retrying — higher-tier
+            # optimizers (T2-LHS, T3-DE) frequently push them above 0.99.
+            # Wells below 0.90 are noise/drift with no chance of recovery.
             _skip_count = 0
             for i in list(retry_indices):
                 _r2_i = results_list[i].get('R2')
-                if _r2_i is not None and _r2_i < 0.99:
+                if _r2_i is not None and _r2_i < 0.90:
                     retry_indices.discard(i)
                     _skip_count += 1
             if _skip_count > 0:
-                status_text.text(f"Skipped {_skip_count} wells below R² 0.99 threshold")
+                status_text.text(f"Skipped {_skip_count} wells below R² 0.90 threshold")
 
             retry_indices = sorted(retry_indices)
 
