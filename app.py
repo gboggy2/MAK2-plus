@@ -163,26 +163,168 @@ with st.sidebar.expander("🔧 Cache diagnostics", expanded=False):
 # EXCEL EXPORT
 # ============================================================================
 
-def _build_excel_download(results_df, extra_sheets=None):
+def _build_excel_download(results_df, extra_sheets=None, chart_sheets=None):
     """Build a multi-sheet Excel file with all available results.
 
     Args:
         results_df: Main batch results DataFrame (always included).
         extra_sheets: dict of {sheet_name: DataFrame} for additional tabs.
+        chart_sheets: dict of {sheet_name: {data: DataFrame, summary: dict,
+                      chart_type: str}} for tabs with native Excel charts.
     """
     import io
+    from openpyxl.chart import ScatterChart, Reference, Series as XlSeries
+    from openpyxl.utils import get_column_letter
+
     if extra_sheets is None:
         extra_sheets = {}
+    if chart_sheets is None:
+        chart_sheets = {}
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine='openpyxl') as writer:
         results_df.to_excel(writer, sheet_name='Batch Results', index=False)
         for sheet_name, df in extra_sheets.items():
             if df is not None and len(df) > 0:
-                # Excel sheet names max 31 chars
                 safe_name = sheet_name[:31]
                 df.to_excel(writer, sheet_name=safe_name, index=False)
+
+        # Chart sheets: data + summary stats + scatter chart
+        for sheet_name, spec in chart_sheets.items():
+            safe_name = sheet_name[:31]
+            df = spec.get('data')
+            summary = spec.get('summary', {})
+            chart_type = spec.get('chart_type', '')
+
+            if df is None or len(df) == 0:
+                continue
+
+            df.to_excel(writer, sheet_name=safe_name, index=False)
+            ws = writer.sheets[safe_name]
+            data_rows = len(df)
+
+            # Write summary stats below data
+            summary_start_row = data_rows + 3  # leave a blank row
+            row = summary_start_row
+            ws.cell(row=row, column=1, value='--- Summary ---')
+            row += 1
+            for k, v in summary.items():
+                ws.cell(row=row, column=1, value=k)
+                ws.cell(row=row, column=2, value=v)
+                row += 1
+
+            # Create scatter chart based on chart_type
+            if chart_type == 'std_curve_d0':
+                # log10(D0) vs log10(Copies) scatter
+                _add_std_curve_d0_chart(ws, df, data_rows)
+            elif chart_type == 'std_curve_ct':
+                # Ct vs log10(Copies) scatter
+                _add_std_curve_ct_chart(ws, df, data_rows)
+            elif chart_type == 'dilution_series':
+                _add_dilution_chart(ws, df, data_rows)
+
     buf.seek(0)
     return buf.getvalue()
+
+
+def _add_std_curve_d0_chart(ws, df, data_rows):
+    """Add D0 standard curve scatter chart to worksheet."""
+    from openpyxl.chart import ScatterChart, Reference, Series as XlSeries
+    from openpyxl.utils import get_column_letter
+
+    chart = ScatterChart()
+    chart.title = "D0 Standard Curve (log-log)"
+    chart.x_axis.title = "log10(D0)"
+    chart.y_axis.title = "log10(Known Copies)"
+    chart.style = 2
+    chart.width = 18
+    chart.height = 12
+
+    # Find column indices (1-based, header at row 1, data starts row 2)
+    cols = list(df.columns)
+    x_col = cols.index('log10_D0') + 1 if 'log10_D0' in cols else None
+    y_col = cols.index('log10_Copies') + 1 if 'log10_Copies' in cols else None
+
+    if x_col and y_col:
+        x_vals = Reference(ws, min_col=x_col, min_row=2, max_row=data_rows + 1)
+        y_vals = Reference(ws, min_col=y_col, min_row=2, max_row=data_rows + 1)
+        series = XlSeries(y_vals, x_vals, title="Standards")
+        series.graphicalProperties.line.noFill = True  # scatter, no line
+        # Add linear trendline with R² and equation
+        from openpyxl.chart.trendline import Trendline
+        series.trendline = Trendline(trendlineType='linear',
+                                     dispRSqr=True, dispEq=True)
+        chart.series.append(series)
+        ws.add_chart(chart, f"{get_column_letter(len(cols) + 2)}2")
+
+
+def _add_std_curve_ct_chart(ws, df, data_rows):
+    """Add Ct standard curve scatter chart to worksheet."""
+    from openpyxl.chart import ScatterChart, Reference, Series as XlSeries
+    from openpyxl.utils import get_column_letter
+
+    chart = ScatterChart()
+    chart.title = "Ct Standard Curve"
+    chart.x_axis.title = "Ct"
+    chart.y_axis.title = "log10(Known Copies)"
+    chart.style = 2
+    chart.width = 18
+    chart.height = 12
+
+    cols = list(df.columns)
+    x_col = cols.index('Ct') + 1 if 'Ct' in cols else None
+    y_col = cols.index('log10_Copies') + 1 if 'log10_Copies' in cols else None
+
+    if x_col and y_col:
+        x_vals = Reference(ws, min_col=x_col, min_row=2, max_row=data_rows + 1)
+        y_vals = Reference(ws, min_col=y_col, min_row=2, max_row=data_rows + 1)
+        series = XlSeries(y_vals, x_vals, title="Standards")
+        series.graphicalProperties.line.noFill = True
+        from openpyxl.chart.trendline import Trendline
+        series.trendline = Trendline(trendlineType='linear',
+                                     dispRSqr=True, dispEq=True)
+        chart.series.append(series)
+        ws.add_chart(chart, f"{get_column_letter(len(cols) + 2)}2")
+
+
+def _add_dilution_chart(ws, df, data_rows):
+    """Add dilution series scatter charts (Ct and D0 vs dilution)."""
+    from openpyxl.chart import ScatterChart, Reference, Series as XlSeries
+    from openpyxl.utils import get_column_letter
+
+    cols = list(df.columns)
+    dil_col = cols.index('Dilution') + 1 if 'Dilution' in cols else None
+    ct_col = cols.index('Ct_Mean') + 1 if 'Ct_Mean' in cols else None
+    d0_col = cols.index('D0_Mean') + 1 if 'D0_Mean' in cols else None
+
+    if dil_col and ct_col:
+        chart1 = ScatterChart()
+        chart1.title = "Ct vs Dilution Factor"
+        chart1.x_axis.title = "Dilution Factor"
+        chart1.y_axis.title = "Mean Ct"
+        chart1.style = 2
+        chart1.width = 16
+        chart1.height = 10
+        x_vals = Reference(ws, min_col=dil_col, min_row=2, max_row=data_rows + 1)
+        y_vals = Reference(ws, min_col=ct_col, min_row=2, max_row=data_rows + 1)
+        series = XlSeries(y_vals, x_vals, title="Ct Mean")
+        series.graphicalProperties.line.noFill = True
+        chart1.series.append(series)
+        ws.add_chart(chart1, f"{get_column_letter(len(cols) + 2)}2")
+
+    if dil_col and d0_col:
+        chart2 = ScatterChart()
+        chart2.title = "D0 vs Dilution Factor"
+        chart2.x_axis.title = "Dilution Factor"
+        chart2.y_axis.title = "Mean D0"
+        chart2.style = 2
+        chart2.width = 16
+        chart2.height = 10
+        x_vals = Reference(ws, min_col=dil_col, min_row=2, max_row=data_rows + 1)
+        y_vals = Reference(ws, min_col=d0_col, min_row=2, max_row=data_rows + 1)
+        series = XlSeries(y_vals, x_vals, title="D0 Mean")
+        series.graphicalProperties.line.noFill = True
+        chart2.series.append(series)
+        ws.add_chart(chart2, f"{get_column_letter(len(cols) + 2)}15")
 
 # ============================================================================
 # HELPERS
@@ -2996,7 +3138,7 @@ if 'batch_results' in st.session_state:
     # Prominent download buttons at top of results
     try:
         _xl_results_top = st.session_state['batch_results']
-        # Gather all available extra sheets
+        # Gather all available extra sheets (plain data tables)
         _xl_extra = {}
         _xl_keys = [
             ('_no_signal_df',            'No Signal Samples'),
@@ -3004,14 +3146,42 @@ if 'batch_results' in st.session_state:
             ('_precision_comparison_df', 'Precision Comparison'),
             ('_std_curve_variance_df',   'Std Curve Variance'),
             ('_limited_dilution_df',     'Limited Dilution'),
-            ('_dilution_series_df',      'Dilution Series'),
         ]
         for _ss_key, _sheet_name in _xl_keys:
             _df = st.session_state.get(_ss_key)
             if _df is not None and len(_df) > 0:
                 _xl_extra[_sheet_name] = _df
-        _xl_bytes_top = _build_excel_download(_xl_results_top, _xl_extra)
-        _xl_sheet_names = ["Batch Results"] + list(_xl_extra.keys())
+
+        # Gather chart sheets (data + summary + native Excel chart)
+        _xl_charts = {}
+        _d0_df = st.session_state.get('_std_curve_d0_df')
+        _d0_sum = st.session_state.get('_std_curve_d0_summary')
+        if _d0_df is not None and len(_d0_df) > 0:
+            _xl_charts['Std Curve D0'] = {
+                'data': _d0_df, 'summary': _d0_sum or {},
+                'chart_type': 'std_curve_d0',
+            }
+        _ct_df = st.session_state.get('_std_curve_ct_df')
+        _ct_sum = st.session_state.get('_std_curve_ct_summary')
+        if _ct_df is not None and len(_ct_df) > 0:
+            _xl_charts['Std Curve Ct'] = {
+                'data': _ct_df, 'summary': _ct_sum or {},
+                'chart_type': 'std_curve_ct',
+            }
+        _dil_df = st.session_state.get('_dilution_series_df')
+        _dil_sum = st.session_state.get('_dilution_series_summary')
+        if _dil_df is not None and len(_dil_df) > 0:
+            _xl_charts['Dilution Series'] = {
+                'data': _dil_df, 'summary': _dil_sum or {},
+                'chart_type': 'dilution_series',
+            }
+
+        _xl_bytes_top = _build_excel_download(
+            _xl_results_top, _xl_extra, chart_sheets=_xl_charts
+        )
+        _xl_sheet_names = (
+            ["Batch Results"] + list(_xl_extra.keys()) + list(_xl_charts.keys())
+        )
         _n_sheets = len(_xl_sheet_names)
         st.download_button(
             f"📥 Download Complete Results (.xlsx, {_n_sheets} sheet{'s' if _n_sheets > 1 else ''})",
@@ -3189,6 +3359,17 @@ if 'batch_results' in st.session_state:
                     fig_cal = plot_calibration(calibration, channel_label=_ch_label)
                     st.plotly_chart(fig_cal, use_container_width=True)
 
+                    # Store D0 standard curve data for Excel export
+                    st.session_state['_std_curve_d0_df'] = calibration['per_point_data'].copy()
+                    st.session_state['_std_curve_d0_summary'] = {
+                        'slope': calibration['slope'],
+                        'intercept': calibration['intercept'],
+                        'r_squared': calibration['r_squared'],
+                        'n_standards': calibration['n_standards'],
+                        'n_concentrations': calibration['n_concentrations'],
+                        'median_cf': calibration.get('median_cf', np.nan),
+                    }
+
             # ── Ct Calibration (right column) ─────────────────────
             if ct_calibration is not None and col_ct is not None:
                 with col_ct:
@@ -3215,6 +3396,17 @@ if 'batch_results' in st.session_state:
 
                     fig_ct = plot_ct_calibration(ct_calibration, channel_label=_ch_label)
                     st.plotly_chart(fig_ct, use_container_width=True)
+
+                    # Store Ct standard curve data for Excel export
+                    st.session_state['_std_curve_ct_df'] = ct_calibration['per_point_data'].copy()
+                    st.session_state['_std_curve_ct_summary'] = {
+                        'slope': ct_calibration['slope'],
+                        'intercept': ct_calibration['intercept'],
+                        'r_squared': ct_calibration['r_squared'],
+                        'efficiency': ct_calibration['efficiency'],
+                        'n_standards': ct_calibration['n_standards'],
+                        'n_concentrations': ct_calibration['n_concentrations'],
+                    }
 
             # ── Per-level replicate variance ───────────────────────
             with st.expander(f"📊 Replicate variance by concentration level{_ch_label}"):
@@ -3763,6 +3955,17 @@ if 'batch_results' in st.session_state:
 
                                 # Store dilution data for Excel export
                                 st.session_state['_dilution_series_df'] = dilution_analysis['data']
+                                st.session_state['_dilution_series_summary'] = {
+                                    'ct_slope': dilution_analysis['ct_analysis']['slope'],
+                                    'ct_intercept': dilution_analysis['ct_analysis']['intercept'],
+                                    'ct_r2': dilution_analysis['ct_analysis']['r2'],
+                                    'ct_efficiency': dilution_analysis['ct_analysis']['efficiency'],
+                                    'd0_slope': dilution_analysis['d0_analysis']['slope'],
+                                    'd0_intercept': dilution_analysis['d0_analysis']['intercept'],
+                                    'd0_r2': dilution_analysis['d0_analysis']['r2'],
+                                    'd0_expected_slope': dilution_analysis['d0_analysis']['expected_slope'],
+                                    'better_linearity': dilution_analysis['comparison']['better_linearity'],
+                                }
 
                                 dilution_plot = plot_dilution_series_comparison(dilution_analysis)
                                 st.plotly_chart(dilution_plot, use_container_width=True)
