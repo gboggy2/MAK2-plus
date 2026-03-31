@@ -76,6 +76,21 @@ os.makedirs(_RESULTS_CACHE_DIR, exist_ok=True)
 def _results_cache_path():
     return os.path.join(_RESULTS_CACHE_DIR, 'last_batch_results.pkl')
 
+# Standard curve session-state key prefixes (per-channel suffixed)
+_STD_CURVE_KEY_PREFIXES = (
+    '_std_curve_d0_df', '_std_curve_d0_summary',
+    '_std_curve_ct_df', '_std_curve_ct_summary',
+    '_std_curve_variance_df',
+)
+
+def _clear_std_curve_keys():
+    """Remove all per-channel standard curve session state keys."""
+    to_delete = [k for k in st.session_state
+                 if any(k.startswith(pfx) for pfx in _STD_CURVE_KEY_PREFIXES)]
+    to_delete.append('_std_curve_channels')
+    for k in to_delete:
+        st.session_state.pop(k, None)
+
 def _checkpoint_cache_path():
     return os.path.join(_RESULTS_CACHE_DIR, 'batch_checkpoint.pkl')
 
@@ -530,13 +545,12 @@ if data_source == "Example Data":
             for key in ['batch_results', 'batch_results_list', 'fitted_params',
                         'optimizer', 'bootstrap_results',
                         '_no_signal_df', '_replicate_stats_df',
-                        '_precision_comparison_df', '_std_curve_variance_df',
+                        '_precision_comparison_df',
                         '_limited_dilution_df', '_dilution_series_df',
-                        '_dilution_series_summary', '_std_curve_d0_df',
-                        '_std_curve_d0_summary', '_std_curve_ct_df',
-                        '_std_curve_ct_summary']:
+                        '_dilution_series_summary']:
                 if key in st.session_state:
                     del st.session_state[key]
+            _clear_std_curve_keys()
 
             # Store in session state immediately
             st.session_state.loaded_cycles = loaded_cycles
@@ -619,12 +633,11 @@ elif data_source == "Upload File":
                 for key in ['batch_results', 'batch_results_list', 'fitted_params',
                             'optimizer', 'bootstrap_results',
                             '_no_signal_df', '_replicate_stats_df', '_precision_comparison_df',
-                            '_std_curve_variance_df', '_limited_dilution_df',
-                            '_dilution_series_df', '_dilution_series_summary',
-                            '_std_curve_d0_df', '_std_curve_d0_summary',
-                            '_std_curve_ct_df', '_std_curve_ct_summary']:
+                            '_limited_dilution_df',
+                            '_dilution_series_df', '_dilution_series_summary']:
                     if key in st.session_state:
                         del st.session_state[key]
+                _clear_std_curve_keys()
                 n = parsed_meta['n_wells']
                 chs = ', '.join(f"{ch}={v}" for ch, v in parsed_meta['channel_thresholds'].items())
                 st.sidebar.success(f"✅ Metadata: {n} wells loaded  \nThresholds: {chs}")
@@ -653,12 +666,11 @@ elif data_source == "Upload File":
                        'abi_results_meta', 'sample_metadata', 'last_meta_file_key',
                        # Excel export data
                        '_no_signal_df', '_replicate_stats_df', '_precision_comparison_df',
-                       '_std_curve_variance_df', '_limited_dilution_df',
-                       '_dilution_series_df', '_dilution_series_summary',
-                       '_std_curve_d0_df', '_std_curve_d0_summary',
-                       '_std_curve_ct_df', '_std_curve_ct_summary']:
+                       '_limited_dilution_df',
+                       '_dilution_series_df', '_dilution_series_summary']:
                 if key in st.session_state:
                     del st.session_state[key]
+            _clear_std_curve_keys()
         
         # Process file with enhanced converter on first load
         if 'uploaded_cycles' not in st.session_state:
@@ -888,13 +900,12 @@ elif data_source == "Upload File":
                                         'upload_ready_batch',
                                         'upload_ready_single', 'upload_batch_samples',
                                         '_no_signal_df', '_replicate_stats_df',
-                                        '_precision_comparison_df', '_std_curve_variance_df',
+                                        '_precision_comparison_df',
                                         '_limited_dilution_df', '_dilution_series_df',
-                                        '_dilution_series_summary', '_std_curve_d0_df',
-                                        '_std_curve_d0_summary', '_std_curve_ct_df',
-                                        '_std_curve_ct_summary']:
+                                        '_dilution_series_summary']:
                                 if key in st.session_state:
                                     del st.session_state[key]
+                            _clear_std_curve_keys()
                             norm_word = "with" if new_rox_norm else "without"
                             st.success(f"Reloaded {norm_word} {abi_passive_ref} normalization")
                             st.rerun()
@@ -3561,7 +3572,6 @@ if 'batch_results' in st.session_state:
             ('_no_signal_df',            'No Signal Samples'),
             ('_replicate_stats_df',      'Replicate Statistics'),
             ('_precision_comparison_df', 'Precision Comparison'),
-            ('_std_curve_variance_df',   'Std Curve Variance'),
             ('_limited_dilution_df',     'Limited Dilution'),
         ]
         for _ss_key, _sheet_name in _xl_keys:
@@ -3569,22 +3579,35 @@ if 'batch_results' in st.session_state:
             if _df is not None and len(_df) > 0:
                 _xl_extra[_sheet_name] = _df
 
+        # Per-channel standard curve variance sheets
+        _xl_cal_channels = st.session_state.get('_std_curve_channels', [None])
+        for _xl_ch in _xl_cal_channels:
+            _ch_sfx = f"_{_xl_ch}" if _xl_ch else ""
+            _ch_label = f" ({_xl_ch})" if _xl_ch else ""
+            _var_df_ch = st.session_state.get(f'_std_curve_variance_df{_ch_sfx}')
+            if _var_df_ch is not None and len(_var_df_ch) > 0:
+                _xl_extra[f'Std Curve Variance{_ch_label}'] = _var_df_ch
+
         # Gather chart sheets (data + summary + native Excel chart)
+        # Per-channel D0 and Ct standard curve sheets
         _xl_charts = {}
-        _d0_df = st.session_state.get('_std_curve_d0_df')
-        _d0_sum = st.session_state.get('_std_curve_d0_summary')
-        if _d0_df is not None and len(_d0_df) > 0:
-            _xl_charts['Std Curve D0'] = {
-                'data': _d0_df, 'summary': _d0_sum or {},
-                'chart_type': 'std_curve_d0',
-            }
-        _ct_df = st.session_state.get('_std_curve_ct_df')
-        _ct_sum = st.session_state.get('_std_curve_ct_summary')
-        if _ct_df is not None and len(_ct_df) > 0:
-            _xl_charts['Std Curve Ct'] = {
-                'data': _ct_df, 'summary': _ct_sum or {},
-                'chart_type': 'std_curve_ct',
-            }
+        for _xl_ch in _xl_cal_channels:
+            _ch_sfx = f"_{_xl_ch}" if _xl_ch else ""
+            _ch_label = f" ({_xl_ch})" if _xl_ch else ""
+            _d0_df = st.session_state.get(f'_std_curve_d0_df{_ch_sfx}')
+            _d0_sum = st.session_state.get(f'_std_curve_d0_summary{_ch_sfx}')
+            if _d0_df is not None and len(_d0_df) > 0:
+                _xl_charts[f'Std Curve D0{_ch_label}'] = {
+                    'data': _d0_df, 'summary': _d0_sum or {},
+                    'chart_type': 'std_curve_d0',
+                }
+            _ct_df = st.session_state.get(f'_std_curve_ct_df{_ch_sfx}')
+            _ct_sum = st.session_state.get(f'_std_curve_ct_summary{_ch_sfx}')
+            if _ct_df is not None and len(_ct_df) > 0:
+                _xl_charts[f'Std Curve Ct{_ch_label}'] = {
+                    'data': _ct_df, 'summary': _ct_sum or {},
+                    'chart_type': 'std_curve_ct',
+                }
         _dil_df = st.session_state.get('_dilution_series_df')
         _dil_sum = st.session_state.get('_dilution_series_summary')
         if _dil_df is not None and len(_dil_df) > 0:
@@ -3709,6 +3732,7 @@ if 'batch_results' in st.session_state:
         # Determine if we need per-channel standard curves
         _has_multi_ch = 'Channel' in results_df.columns and results_df['Channel'].nunique() > 1
         _cal_channels = list(results_df['Channel'].unique()) if _has_multi_ch else [None]
+        st.session_state['_std_curve_channels'] = _cal_channels
 
         _any_cal_succeeded = False
         _per_ch_cals = {}  # channel → (calibration, ct_calibration)
@@ -3776,9 +3800,10 @@ if 'batch_results' in st.session_state:
                     fig_cal = plot_calibration(calibration, channel_label=_ch_label)
                     st.plotly_chart(fig_cal, use_container_width=True)
 
-                    # Store D0 standard curve data for Excel export
-                    st.session_state['_std_curve_d0_df'] = calibration['per_point_data'].copy()
-                    st.session_state['_std_curve_d0_summary'] = {
+                    # Store D0 standard curve data for Excel export (per-channel)
+                    _d0_key_suffix = f"_{_cal_ch}" if _cal_ch else ""
+                    st.session_state[f'_std_curve_d0_df{_d0_key_suffix}'] = calibration['per_point_data'].copy()
+                    st.session_state[f'_std_curve_d0_summary{_d0_key_suffix}'] = {
                         'slope': calibration['slope'],
                         'intercept': calibration['intercept'],
                         'r_squared': calibration['r_squared'],
@@ -3814,9 +3839,10 @@ if 'batch_results' in st.session_state:
                     fig_ct = plot_ct_calibration(ct_calibration, channel_label=_ch_label)
                     st.plotly_chart(fig_ct, use_container_width=True)
 
-                    # Store Ct standard curve data for Excel export
-                    st.session_state['_std_curve_ct_df'] = ct_calibration['per_point_data'].copy()
-                    st.session_state['_std_curve_ct_summary'] = {
+                    # Store Ct standard curve data for Excel export (per-channel)
+                    _ct_key_suffix = f"_{_cal_ch}" if _cal_ch else ""
+                    st.session_state[f'_std_curve_ct_df{_ct_key_suffix}'] = ct_calibration['per_point_data'].copy()
+                    st.session_state[f'_std_curve_ct_summary{_ct_key_suffix}'] = {
                         'slope': ct_calibration['slope'],
                         'intercept': ct_calibration['intercept'],
                         'r_squared': ct_calibration['r_squared'],
@@ -3848,9 +3874,10 @@ if 'batch_results' in st.session_state:
                         var_data.append(row)
                 _var_df = pd.DataFrame(var_data)
                 st.dataframe(_var_df, use_container_width=True)
-                # Store for Excel export
+                # Store for Excel export (per-channel)
                 if len(_var_df) > 0:
-                    st.session_state['_std_curve_variance_df'] = _var_df
+                    _var_key_suffix = f"_{_cal_ch}" if _cal_ch else ""
+                    st.session_state[f'_std_curve_variance_df{_var_key_suffix}'] = _var_df
 
             # ── Apply calibration for this channel ─────────────────
             if _cal_ch is not None:
