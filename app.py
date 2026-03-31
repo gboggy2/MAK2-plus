@@ -475,6 +475,18 @@ if data_source == "Example Data":
                 selected_filename
             )
             
+            # Clear stale results from previous dataset
+            for key in ['batch_results', 'batch_results_list', 'fitted_params',
+                        'optimizer', 'bootstrap_results',
+                        '_no_signal_df', '_replicate_stats_df',
+                        '_precision_comparison_df', '_std_curve_variance_df',
+                        '_limited_dilution_df', '_dilution_series_df',
+                        '_dilution_series_summary', '_std_curve_d0_df',
+                        '_std_curve_d0_summary', '_std_curve_ct_df',
+                        '_std_curve_ct_summary']:
+                if key in st.session_state:
+                    del st.session_state[key]
+
             # Store in session state immediately
             st.session_state.loaded_cycles = loaded_cycles
             st.session_state.fluorescence_df = fluorescence_df
@@ -554,7 +566,12 @@ elif data_source == "Upload File":
                 st.session_state['last_meta_file_key'] = meta_key
                 # Clear fit results so thresholds are re-applied on next run
                 for key in ['batch_results', 'batch_results_list', 'fitted_params',
-                            'optimizer', 'bootstrap_results']:
+                            'optimizer', 'bootstrap_results',
+                            '_no_signal_df', '_replicate_stats_df', '_precision_comparison_df',
+                            '_std_curve_variance_df', '_limited_dilution_df',
+                            '_dilution_series_df', '_dilution_series_summary',
+                            '_std_curve_d0_df', '_std_curve_d0_summary',
+                            '_std_curve_ct_df', '_std_curve_ct_summary']:
                     if key in st.session_state:
                         del st.session_state[key]
                 n = parsed_meta['n_wells']
@@ -578,10 +595,17 @@ elif data_source == "Upload File":
             st.session_state['last_uploaded_file_key'] = file_key
             # Clear all previous results for the new file
             for key in ['fitted_params', 'optimizer', 'bootstrap_results', 'batch_results',
+                       'batch_results_list',
                        'uploaded_cycles', 'uploaded_samples', 'uploaded_metadata',
                        'selected_target', 'target_confirmed', 'selected_channels', 'all_targets',
                        'abi_extra_info', 'abi_passive_reference', 'rox_normalized',
-                       'abi_results_meta', 'sample_metadata', 'last_meta_file_key']:
+                       'abi_results_meta', 'sample_metadata', 'last_meta_file_key',
+                       # Excel export data
+                       '_no_signal_df', '_replicate_stats_df', '_precision_comparison_df',
+                       '_std_curve_variance_df', '_limited_dilution_df',
+                       '_dilution_series_df', '_dilution_series_summary',
+                       '_std_curve_d0_df', '_std_curve_d0_summary',
+                       '_std_curve_ct_df', '_std_curve_ct_summary']:
                 if key in st.session_state:
                     del st.session_state[key]
         
@@ -809,8 +833,15 @@ elif data_source == "Upload File":
                                 'cycle_range': (ref_cycles.min(), ref_cycles.max()),
                             }
                             for key in ['fitted_params', 'optimizer', 'bootstrap_results',
-                                        'batch_results', 'upload_ready_batch',
-                                        'upload_ready_single', 'upload_batch_samples']:
+                                        'batch_results', 'batch_results_list',
+                                        'upload_ready_batch',
+                                        'upload_ready_single', 'upload_batch_samples',
+                                        '_no_signal_df', '_replicate_stats_df',
+                                        '_precision_comparison_df', '_std_curve_variance_df',
+                                        '_limited_dilution_df', '_dilution_series_df',
+                                        '_dilution_series_summary', '_std_curve_d0_df',
+                                        '_std_curve_d0_summary', '_std_curve_ct_df',
+                                        '_std_curve_ct_summary']:
                                 if key in st.session_state:
                                     del st.session_state[key]
                             norm_word = "with" if new_rox_norm else "without"
