@@ -2306,13 +2306,20 @@ if cycles is not None and fluorescence is not None:
             # ── Skip retries for truly hopeless wells (R² < 0.90) ──
             # Wells with R² 0.90-0.99 are worth retrying — higher-tier
             # optimizers (T2-LHS, T3-DE) frequently push them above 0.99.
-            # Wells below 0.90 are noise/drift with no chance of recovery.
+            # Wells below 0.90 are noise/drift with no chance of recovery,
+            # UNLESS they are late amplifiers — those benefit from analytical
+            # exponential priors in the retry path.
+            _last_cycle = float(cycles[-1])
             _skip_count = 0
             for i in list(retry_indices):
                 _r2_i = results_list[i].get('R2')
                 if _r2_i is not None and _r2_i < 0.90:
-                    retry_indices.discard(i)
-                    _skip_count += 1
+                    # Don't skip late amplifiers — they can be rescued
+                    _fe_i = results_list[i].get('fit_end_cycle')
+                    _is_late_i = (_fe_i is not None and _fe_i >= _last_cycle - 1)
+                    if not _is_late_i:
+                        retry_indices.discard(i)
+                        _skip_count += 1
             if _skip_count > 0:
                 status_text.text(f"Skipped {_skip_count} wells below R² 0.90 threshold")
 
