@@ -226,10 +226,30 @@ def _build_excel_download(results_df, extra_sheets=None, chart_sheets=None):
     return buf.getvalue()
 
 
+def _make_scatter_series(ws, x_col, y_col, data_rows, title="Data"):
+    """Create a scatter series with visible circle markers and no connecting line."""
+    from openpyxl.chart import Reference, Series as XlSeries
+    from openpyxl.chart.marker import Marker
+
+    x_vals = Reference(ws, min_col=x_col, min_row=2, max_row=data_rows + 1)
+    y_vals = Reference(ws, min_col=y_col, min_row=2, max_row=data_rows + 1)
+    series = XlSeries(y_vals, x_vals, title=title)
+    series.marker = Marker(symbol='circle', size=7)
+    series.graphicalProperties.line.noFill = True  # no connecting line
+    return series
+
+
 def _add_std_curve_d0_chart(ws, df, data_rows):
     """Add D0 standard curve scatter chart to worksheet."""
-    from openpyxl.chart import ScatterChart, Reference, Series as XlSeries
+    from openpyxl.chart import ScatterChart
+    from openpyxl.chart.trendline import Trendline
     from openpyxl.utils import get_column_letter
+
+    cols = list(df.columns)
+    x_col = cols.index('log10_D0') + 1 if 'log10_D0' in cols else None
+    y_col = cols.index('log10_Copies') + 1 if 'log10_Copies' in cols else None
+    if not (x_col and y_col):
+        return
 
     chart = ScatterChart()
     chart.title = "D0 Standard Curve (log-log)"
@@ -239,28 +259,24 @@ def _add_std_curve_d0_chart(ws, df, data_rows):
     chart.width = 18
     chart.height = 12
 
-    # Find column indices (1-based, header at row 1, data starts row 2)
-    cols = list(df.columns)
-    x_col = cols.index('log10_D0') + 1 if 'log10_D0' in cols else None
-    y_col = cols.index('log10_Copies') + 1 if 'log10_Copies' in cols else None
-
-    if x_col and y_col:
-        x_vals = Reference(ws, min_col=x_col, min_row=2, max_row=data_rows + 1)
-        y_vals = Reference(ws, min_col=y_col, min_row=2, max_row=data_rows + 1)
-        series = XlSeries(y_vals, x_vals, title="Standards")
-        series.graphicalProperties.line.noFill = True  # scatter, no line
-        # Add linear trendline with R² and equation
-        from openpyxl.chart.trendline import Trendline
-        series.trendline = Trendline(trendlineType='linear',
-                                     dispRSqr=True, dispEq=True)
-        chart.series.append(series)
-        ws.add_chart(chart, f"{get_column_letter(len(cols) + 2)}2")
+    series = _make_scatter_series(ws, x_col, y_col, data_rows, "Standards")
+    series.trendline = Trendline(trendlineType='linear',
+                                 dispRSqr=True, dispEq=True)
+    chart.series.append(series)
+    ws.add_chart(chart, f"{get_column_letter(len(cols) + 2)}2")
 
 
 def _add_std_curve_ct_chart(ws, df, data_rows):
     """Add Ct standard curve scatter chart to worksheet."""
-    from openpyxl.chart import ScatterChart, Reference, Series as XlSeries
+    from openpyxl.chart import ScatterChart
+    from openpyxl.chart.trendline import Trendline
     from openpyxl.utils import get_column_letter
+
+    cols = list(df.columns)
+    x_col = cols.index('Ct') + 1 if 'Ct' in cols else None
+    y_col = cols.index('log10_Copies') + 1 if 'log10_Copies' in cols else None
+    if not (x_col and y_col):
+        return
 
     chart = ScatterChart()
     chart.title = "Ct Standard Curve"
@@ -270,25 +286,17 @@ def _add_std_curve_ct_chart(ws, df, data_rows):
     chart.width = 18
     chart.height = 12
 
-    cols = list(df.columns)
-    x_col = cols.index('Ct') + 1 if 'Ct' in cols else None
-    y_col = cols.index('log10_Copies') + 1 if 'log10_Copies' in cols else None
-
-    if x_col and y_col:
-        x_vals = Reference(ws, min_col=x_col, min_row=2, max_row=data_rows + 1)
-        y_vals = Reference(ws, min_col=y_col, min_row=2, max_row=data_rows + 1)
-        series = XlSeries(y_vals, x_vals, title="Standards")
-        series.graphicalProperties.line.noFill = True
-        from openpyxl.chart.trendline import Trendline
-        series.trendline = Trendline(trendlineType='linear',
-                                     dispRSqr=True, dispEq=True)
-        chart.series.append(series)
-        ws.add_chart(chart, f"{get_column_letter(len(cols) + 2)}2")
+    series = _make_scatter_series(ws, x_col, y_col, data_rows, "Standards")
+    series.trendline = Trendline(trendlineType='linear',
+                                 dispRSqr=True, dispEq=True)
+    chart.series.append(series)
+    ws.add_chart(chart, f"{get_column_letter(len(cols) + 2)}2")
 
 
 def _add_dilution_chart(ws, df, data_rows):
     """Add dilution series scatter charts (Ct and D0 vs dilution)."""
-    from openpyxl.chart import ScatterChart, Reference, Series as XlSeries
+    from openpyxl.chart import ScatterChart
+    from openpyxl.chart.trendline import Trendline
     from openpyxl.utils import get_column_letter
 
     cols = list(df.columns)
@@ -301,13 +309,13 @@ def _add_dilution_chart(ws, df, data_rows):
         chart1.title = "Ct vs Dilution Factor"
         chart1.x_axis.title = "Dilution Factor"
         chart1.y_axis.title = "Mean Ct"
+        chart1.x_axis.scaling.logBase = 10
         chart1.style = 2
         chart1.width = 16
         chart1.height = 10
-        x_vals = Reference(ws, min_col=dil_col, min_row=2, max_row=data_rows + 1)
-        y_vals = Reference(ws, min_col=ct_col, min_row=2, max_row=data_rows + 1)
-        series = XlSeries(y_vals, x_vals, title="Ct Mean")
-        series.graphicalProperties.line.noFill = True
+        series = _make_scatter_series(ws, dil_col, ct_col, data_rows, "Ct Mean")
+        series.trendline = Trendline(trendlineType='linear',
+                                     dispRSqr=True, dispEq=True)
         chart1.series.append(series)
         ws.add_chart(chart1, f"{get_column_letter(len(cols) + 2)}2")
 
@@ -316,13 +324,14 @@ def _add_dilution_chart(ws, df, data_rows):
         chart2.title = "D0 vs Dilution Factor"
         chart2.x_axis.title = "Dilution Factor"
         chart2.y_axis.title = "Mean D0"
+        chart2.x_axis.scaling.logBase = 10
+        chart2.y_axis.scaling.logBase = 10
         chart2.style = 2
         chart2.width = 16
         chart2.height = 10
-        x_vals = Reference(ws, min_col=dil_col, min_row=2, max_row=data_rows + 1)
-        y_vals = Reference(ws, min_col=d0_col, min_row=2, max_row=data_rows + 1)
-        series = XlSeries(y_vals, x_vals, title="D0 Mean")
-        series.graphicalProperties.line.noFill = True
+        series = _make_scatter_series(ws, dil_col, d0_col, data_rows, "D0 Mean")
+        series.trendline = Trendline(trendlineType='power',
+                                     dispRSqr=True, dispEq=True)
         chart2.series.append(series)
         ws.add_chart(chart2, f"{get_column_letter(len(cols) + 2)}15")
 
