@@ -321,33 +321,39 @@ def _add_error_bars(series, sheet_name, sd_col, data_rows):
 
 
 def _add_dilution_chart(ws, df, data_rows):
-    """Add dilution series scatter charts (Ct and D0 vs dilution)."""
+    """Add dilution series scatter charts using log10-transformed data.
+
+    Plots log10(Dilution) on x and Ct or log10(D0) on y, both on plain
+    linear axes, so the linear trendline equation is y = mx + b.
+    """
     from openpyxl.chart import ScatterChart
     from openpyxl.chart.trendline import Trendline
     from openpyxl.utils import get_column_letter
 
     cols = list(df.columns)
-    dil_col = cols.index('Dilution') + 1 if 'Dilution' in cols else None
-    log_dil_col = cols.index('log10_Dilution') + 1 if 'log10_Dilution' in cols else None
-    ct_col = cols.index('Ct_Mean') + 1 if 'Ct_Mean' in cols else None
-    d0_col = cols.index('D0_Mean') + 1 if 'D0_Mean' in cols else None
-    log_d0_col = cols.index('log10_D0_Mean') + 1 if 'log10_D0_Mean' in cols else None
-    ct_sd_col = cols.index('Ct_SD') + 1 if 'Ct_SD' in cols else None
+
+    def _col(name):
+        return cols.index(name) + 1 if name in cols else None
+
+    log_dil = _col('log10_Dilution')
+    ct_col = _col('Ct_Mean')
+    log_d0 = _col('log10_D0_Mean')
+    ct_sd_col = _col('Ct_SD')
     sheet_name = ws.title
 
-    # Use log10-transformed columns so linear trendline gives y = mx + b
-    x_col = log_dil_col or dil_col
-    x_log = not log_dil_col  # use log axis only if data isn't pre-transformed
+    if not log_dil:
+        return  # need log10 columns
 
-    if x_col and ct_col:
+    # Chart 1: Ct vs log10(Dilution) — linear axes, linear trendline
+    if ct_col:
         chart1 = ScatterChart()
         chart1.title = "Ct vs log10(Dilution)"
         chart1.legend.position = 'b'
-        _style_axis(chart1.x_axis, "log10(Dilution Factor)", "0.0", log=x_log)
+        _style_axis(chart1.x_axis, "log10(Dilution)", "0.0")
         _style_axis(chart1.y_axis, "Mean Ct", "0.0")
         chart1.width = 16
         chart1.height = 10
-        series = _make_scatter_series(ws, x_col, ct_col, data_rows,
+        series = _make_scatter_series(ws, log_dil, ct_col, data_rows,
                                       "Ct Mean", color="4472C4")
         if ct_sd_col:
             _add_error_bars(series, sheet_name, ct_sd_col, data_rows)
@@ -356,18 +362,16 @@ def _add_dilution_chart(ws, df, data_rows):
         chart1.series.append(series)
         ws.add_chart(chart1, f"{get_column_letter(len(cols) + 2)}2")
 
-    y_col = log_d0_col or d0_col
-    y_log = not log_d0_col
-
-    if x_col and y_col:
+    # Chart 2: log10(D0) vs log10(Dilution) — linear axes, linear trendline
+    if log_d0:
         chart2 = ScatterChart()
         chart2.title = "log10(D0) vs log10(Dilution)"
         chart2.legend.position = 'b'
-        _style_axis(chart2.x_axis, "log10(Dilution Factor)", "0.0", log=x_log)
-        _style_axis(chart2.y_axis, "log10(Mean D0)", "0.0", log=y_log)
+        _style_axis(chart2.x_axis, "log10(Dilution)", "0.0")
+        _style_axis(chart2.y_axis, "log10(D0)", "0.0")
         chart2.width = 16
         chart2.height = 10
-        series = _make_scatter_series(ws, x_col, y_col, data_rows,
+        series = _make_scatter_series(ws, log_dil, log_d0, data_rows,
                                       "D0 Mean", color="ED7D31")
         series.trendline = Trendline(trendlineType='linear',
                                      dispRSqr=True, dispEq=True)
