@@ -4449,21 +4449,40 @@ if 'batch_results_list' in st.session_state and 'batch_all_samples' in st.sessio
     selected_idx = sample_names.index(selected_sample)
     selected_result = results_list[selected_idx]
         
-    # Check if fit was successful
+    # Determine pass/fail status for plot title
     _success_val = selected_result.get('Success', '')
-    if (_success_val and
-        (str(_success_val).startswith('✓') or
-         _success_val == '⚠️ k@bound' or
-         _success_val == '⚠️ R² below target' or
-         _success_val == '⚠️ Degenerate k')):
-        # Get the corresponding fluorescence data
+    _error_val = selected_result.get('error')
+    _has_fit_params = (
+        selected_result.get('D0') is not None
+        and not (isinstance(selected_result.get('D0'), float) and np.isnan(selected_result['D0']))
+    )
+    if _error_val and not (isinstance(_error_val, float) and pd.isna(_error_val)):
+        _status_label = f"FAIL — {_error_val}"
+        _status_color = "red"
+    elif _success_val and str(_success_val).startswith('✓'):
+        _status_label = f"PASS ({_success_val})"
+        _status_color = "green"
+    elif _success_val:
+        _status_label = f"PASS ({_success_val})"
+        _status_color = "orange"
+    else:
+        _status_label = "FAIL"
+        _status_color = "red"
+
+    # Get fluorescence data — prefer all_samples, fall back to stored fluor_data
+    if selected_sample in all_samples:
         sample_fluor = all_samples[selected_sample]
-            
-        # Use the stored parameters from batch fit to generate prediction
-        model_viz = MAK2Model()
-            
-        # Generate curve using stored parameters (use actual cycle array)
-        try:
+    elif selected_result.get('fluor_data') is not None:
+        sample_fluor = np.asarray(selected_result['fluor_data'])
+    else:
+        sample_fluor = None
+
+    try:
+        # Generate fit prediction if parameters are available
+        F_pred = None
+        eff_batch = None
+        if _has_fit_params:
+            model_viz = MAK2Model()
             F_pred = model_viz.simulate_to_cycle(
                 D0=selected_result['D0'],
                 k=selected_result['k'],
@@ -4472,8 +4491,6 @@ if 'batch_results_list' in st.session_state and 'batch_all_samples' in st.sessio
                 F_bg_intercept=selected_result['F_bg_intercept'],
                 F_bg_slope=selected_result['F_bg_slope']
             )
-
-            # Cycle-by-cycle amplification efficiency
             _, D_batch_eff, _ = model_viz.simulate_cycles(
                 D0=selected_result['D0'],
                 k=selected_result['k'],
@@ -4484,29 +4501,41 @@ if 'batch_results_list' in st.session_state and 'batch_all_samples' in st.sessio
             )
             eff_batch = calculate_amplification_efficiency(D_batch_eff)
 
-            # 3-row stacked plot: Fit, Residuals, Efficiency (shared x-axis)
+        # Build subplot layout — 3 rows if we have fit, 1 row if data only
+        _has_full_viz = F_pred is not None and sample_fluor is not None
+        if _has_full_viz:
             fig_batch = make_subplots(
                 rows=3, cols=1,
-                subplot_titles=(f"MAK2 Fit: {selected_sample}", "Residuals", "Amplification Efficiency"),
+                subplot_titles=(
+                    f"<span style='color:{_status_color}'>{_status_label}</span> — {selected_sample}",
+                    "Residuals", "Amplification Efficiency",
+                ),
                 vertical_spacing=0.08,
                 row_heights=[0.50, 0.22, 0.28],
                 shared_xaxes=True,
             )
+        else:
+            fig_batch = make_subplots(
+                rows=1, cols=1,
+                subplot_titles=(
+                    f"<span style='color:{_status_color}'>{_status_label}</span> — {selected_sample}",
+                ),
+            )
 
-            # Row 1: Data and fit
+        # Row 1: Data markers
+        if sample_fluor is not None:
             fig_batch.add_trace(
                 go.Scatter(
-                    x=cycles, y=sample_fluor,
+                    x=cycles[:len(sample_fluor)], y=sample_fluor,
                     mode='markers',
                     name='Data',
                     marker=dict(size=8, color='blue', opacity=0.6)
                 ),
                 row=1, col=1
             )
+
+        if _has_full_viz:
             # Draw fit line only within the fit window (fit_start_cycle onwards).
-            # Extrapolating the linear background back to cycle 0 is misleading
-            # when the pre-fit-window data followed a non-linear trajectory
-            # (e.g. JOE thermal transient), so we clip the line at fit_start.
             _vis_fit_start = selected_result.get('fit_start_cycle')
             if _vis_fit_start is not None:
                 _fit_mask   = cycles >= _vis_fit_start
@@ -4525,8 +4554,7 @@ if 'batch_results_list' in st.session_state and 'batch_all_samples' in st.sessio
                 row=1, col=1
             )
 
-            # Row 2: Residuals — only within the fit window so the plot
-            # reflects actual fit quality, not model extrapolation error.
+            # Row 2: Residuals — only within the fit window
             residuals = sample_fluor - F_pred
             _res_in_window = residuals[cycles >= _vis_fit_start] if _vis_fit_start is not None else residuals
             fig_batch.add_trace(
@@ -4553,17 +4581,16 @@ if 'batch_results_list' in st.session_state and 'batch_all_samples' in st.sessio
                 row=3, col=1
             )
 
+        # ── Annotations only for full (fitted) visualizations ────────
+        _n_viz_rows = 3 if _has_full_viz else 1
+
+        if _has_full_viz:
             # Ct threshold line on fit plot (row 1).
-            # The threshold is ΔRn above the linear baseline, so on the raw
-            # Rn plot it appears as a SLOPED line: threshold(c) = slope*c + intercept + ΔRn.
-            # This matches the instrument's display and correctly shows that the
-            # threshold rises with the background fluorescence drift.
             ch_thresholds_stored = batch_settings.get('channel_thresholds', {})
             sample_ch = _ch(selected_sample) if '_' in selected_sample or '::' in selected_sample else 'default'
             ct_threshold = ch_thresholds_stored.get(
                 sample_ch, batch_settings.get('global_threshold'))
 
-            # Per-sample linear baseline stored during Ct computation
             ct_bl_slope_vis     = selected_result.get('Ct_baseline_slope', 0.0)
             ct_bl_intercept_vis = selected_result.get('Ct_baseline_intercept', 0.0)
             ct_baseline_mean    = selected_result.get(
@@ -4576,7 +4603,7 @@ if 'batch_results_list' in st.session_state and 'batch_all_samples' in st.sessio
             # ── Fit window: start (orange) and end (green) vlines ────────────
             fit_start_vis = selected_result.get('fit_start_cycle')
             if fit_start_vis is not None:
-                for row_idx in range(1, 4):
+                for row_idx in range(1, _n_viz_rows + 1):
                     fig_batch.add_vline(
                         x=fit_start_vis,
                         line_dash="dash",
@@ -4591,21 +4618,16 @@ if 'batch_results_list' in st.session_state and 'batch_all_samples' in st.sessio
                     row=1, col=1,
                 )
 
-            # Use the stored fit_end_cycle (the last cycle the optimizer
-            # actually included) rather than recomputing find_slope_threshold_cycle
-            # on the full array, which can give the wrong answer when the thermal
-            # transient shifts the apparent max-slope index.
             final_cycle = selected_result.get('fit_end_cycle')
-            if final_cycle is None:
-                # Fallback for old result dicts that don't have the key
+            if final_cycle is None and sample_fluor is not None:
                 from mak2_model import find_slope_threshold_cycle
                 trunc_idx  = find_slope_threshold_cycle(
                     sample_fluor,
                     cycles_after_max=batch_settings.get('cycles_after_max', 3)
                 )
                 final_cycle = float(cycles[min(trunc_idx, len(cycles) - 1)])
-            if final_cycle < cycles[-1]:
-                for row_idx in range(1, 4):
+            if final_cycle is not None and final_cycle < cycles[-1]:
+                for row_idx in range(1, _n_viz_rows + 1):
                     fig_batch.add_vline(
                         x=final_cycle,
                         line_dash="dash",
@@ -4624,7 +4646,7 @@ if 'batch_results_list' in st.session_state and 'batch_all_samples' in st.sessio
             ct_val = selected_result.get('Ct', np.nan)
             ct_is_nan = ct_val is None or (isinstance(ct_val, float) and np.isnan(ct_val))
             if not ct_is_nan:
-                for row_idx in range(1, 4):
+                for row_idx in range(1, _n_viz_rows + 1):
                     fig_batch.add_vline(
                         x=ct_val,
                         line_dash="dot",
@@ -4639,13 +4661,12 @@ if 'batch_results_list' in st.session_state and 'batch_all_samples' in st.sessio
                     row=1, col=1,
                 )
             else:
-                # No Ct — check if instrument flagged this as Undetermined
                 inst_status_vis = selected_result.get('Instrument', '')
                 if inst_status_vis:
                     fig_batch.add_annotation(
                         x=0.5, xref="x domain",
                         y=0.95, yref="y domain",
-                        text=f"⚠️ Instrument: {inst_status_vis}",
+                        text=f"Instrument: {inst_status_vis}",
                         showarrow=False,
                         xanchor="center", yanchor="top",
                         font=dict(size=12, color="crimson"),
@@ -4654,10 +4675,6 @@ if 'batch_results_list' in st.session_state and 'batch_all_samples' in st.sessio
                     )
 
             # ── Threshold: short segment anchored at Ct crossing ──────────────
-            # thresh(c) = bl_slope·c + bl_intercept + ΔRn
-            # Draw only a ±5-cycle window around Ct so the line visually
-            # intersects the curve at exactly the fractional Ct, with the
-            # correct slope from the linear baseline subtraction.
             if ct_threshold is not None and ct_threshold > 0:
                 _abi_meta_vis   = st.session_state.get('abi_results_meta')
                 _rox_active_vis = st.session_state.get('rox_normalized', False)
@@ -4670,8 +4687,7 @@ if 'batch_results_list' in st.session_state and 'batch_all_samples' in st.sessio
                     or abs(ct_bl_slope_vis) > 1e-12
                 )
 
-                # Narrow x-range centred on Ct (or midpoint if no Ct)
-                _span = 5  # half-width in cycles
+                _span = 5
                 if not ct_is_nan:
                     _tx_lo = max(float(cycles[0]),  ct_val - _span)
                     _tx_hi = min(float(cycles[-1]), ct_val + _span)
@@ -4679,8 +4695,6 @@ if 'batch_results_list' in st.session_state and 'batch_all_samples' in st.sessio
                     _tx_lo, _tx_hi = float(cycles[0]), float(cycles[-1])
                 _tx = np.linspace(_tx_lo, _tx_hi, 60)
 
-                # The Ct baseline and threshold are in Rn units when ROX was used.
-                # Scale to raw RFU for the plot by multiplying by mean ROX.
                 _ct_rox_mean_vis = selected_result.get('ct_rox_mean')
 
                 if has_linear_baseline:
@@ -4689,7 +4703,6 @@ if 'batch_results_list' in st.session_state and 'batch_all_samples' in st.sessio
                     _ty_rn = np.full_like(_tx, float(ct_baseline_mean + ct_threshold))
 
                 if _ct_rox_mean_vis is not None and _ct_rox_mean_vis > 0:
-                    # Convert Rn threshold line back to raw RFU
                     _ty = _ty_rn * _ct_rox_mean_vis
                 else:
                     _ty = _ty_rn
@@ -4701,8 +4714,7 @@ if 'batch_results_list' in st.session_state and 'batch_all_samples' in st.sessio
 
                 fig_batch.add_trace(
                     go.Scatter(
-                        x=_tx,
-                        y=_ty,
+                        x=_tx, y=_ty,
                         mode='lines',
                         name='Threshold',
                         line=dict(color='purple', dash='dot', width=1.5),
@@ -4719,22 +4731,28 @@ if 'batch_results_list' in st.session_state and 'batch_all_samples' in st.sessio
                     row=1, col=1,
                 )
 
+        # ── Layout and render ──────────────────────────────────────────
+        if _has_full_viz:
             fig_batch.update_xaxes(title_text="Cycle", row=3, col=1)
             fig_batch.update_yaxes(title_text="Fluorescence", row=1, col=1)
             fig_batch.update_yaxes(title_text="Residual", row=2, col=1)
             fig_batch.update_yaxes(title_text="Efficiency", row=3, col=1)
             fig_batch.update_layout(height=800, showlegend=True)
+        else:
+            fig_batch.update_xaxes(title_text="Cycle", row=1, col=1)
+            fig_batch.update_yaxes(title_text="Fluorescence", row=1, col=1)
+            fig_batch.update_layout(height=400, showlegend=True)
 
-            st.plotly_chart(fig_batch, use_container_width=True)
-                
-            # Show parameters
+        st.plotly_chart(fig_batch, use_container_width=True)
+
+        # Show parameters if available
+        if _has_fit_params:
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("D₀", f"{selected_result['D0']:.2e}")
             col2.metric("k", f"{selected_result['k']:.6f}")
             col3.metric("P₀", f"{selected_result['P0']:.2e}")
             col4.metric("R²", f"{selected_result['R2']:.4f}")
 
-            # Baseline end comparison: metadata vs estimate
             _bl_meta_vis = selected_result.get('bl_end_meta')
             _bl_est_vis  = selected_result.get('bl_end_est')
             if _bl_meta_vis is not None or _bl_est_vis is not None:
@@ -4749,10 +4767,8 @@ if 'batch_results_list' in st.session_state and 'batch_all_samples' in st.sessio
                     _bl_parts.append(f"{_bl_icon} Δ = {_bl_diff:.0f} cycles")
                 st.caption(" · ".join(_bl_parts))
 
-        except Exception as e:
-            st.error(f"Could not visualize fit: {str(e)}")
-    else:
-        st.warning(f"Fitting failed for {selected_sample}. No visualization available.")
+    except Exception as e:
+        st.error(f"Could not visualize fit: {str(e)}")
     
 
 
