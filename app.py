@@ -328,42 +328,48 @@ def _add_dilution_chart(ws, df, data_rows):
 
     cols = list(df.columns)
     dil_col = cols.index('Dilution') + 1 if 'Dilution' in cols else None
+    log_dil_col = cols.index('log10_Dilution') + 1 if 'log10_Dilution' in cols else None
     ct_col = cols.index('Ct_Mean') + 1 if 'Ct_Mean' in cols else None
     d0_col = cols.index('D0_Mean') + 1 if 'D0_Mean' in cols else None
+    log_d0_col = cols.index('log10_D0_Mean') + 1 if 'log10_D0_Mean' in cols else None
     ct_sd_col = cols.index('Ct_SD') + 1 if 'Ct_SD' in cols else None
-    d0_sd_col = cols.index('D0_SD') + 1 if 'D0_SD' in cols else None
     sheet_name = ws.title
 
-    if dil_col and ct_col:
+    # Use log10-transformed columns so linear trendline gives y = mx + b
+    x_col = log_dil_col or dil_col
+    x_log = not log_dil_col  # use log axis only if data isn't pre-transformed
+
+    if x_col and ct_col:
         chart1 = ScatterChart()
-        chart1.title = "Ct vs Dilution Factor"
+        chart1.title = "Ct vs log10(Dilution)"
         chart1.legend.position = 'b'
-        _style_axis(chart1.x_axis, "Dilution Factor", "0", log=True)
+        _style_axis(chart1.x_axis, "log10(Dilution Factor)", "0.0", log=x_log)
         _style_axis(chart1.y_axis, "Mean Ct", "0.0")
         chart1.width = 16
         chart1.height = 10
-        series = _make_scatter_series(ws, dil_col, ct_col, data_rows,
+        series = _make_scatter_series(ws, x_col, ct_col, data_rows,
                                       "Ct Mean", color="4472C4")
         if ct_sd_col:
             _add_error_bars(series, sheet_name, ct_sd_col, data_rows)
-        series.trendline = Trendline(trendlineType='log',
+        series.trendline = Trendline(trendlineType='linear',
                                      dispRSqr=True, dispEq=True)
         chart1.series.append(series)
         ws.add_chart(chart1, f"{get_column_letter(len(cols) + 2)}2")
 
-    if dil_col and d0_col:
+    y_col = log_d0_col or d0_col
+    y_log = not log_d0_col
+
+    if x_col and y_col:
         chart2 = ScatterChart()
-        chart2.title = "D0 vs Dilution Factor"
+        chart2.title = "log10(D0) vs log10(Dilution)"
         chart2.legend.position = 'b'
-        _style_axis(chart2.x_axis, "Dilution Factor", "0", log=True)
-        _style_axis(chart2.y_axis, "Mean D0", "0.00E+00", log=True)
+        _style_axis(chart2.x_axis, "log10(Dilution Factor)", "0.0", log=x_log)
+        _style_axis(chart2.y_axis, "log10(Mean D0)", "0.0", log=y_log)
         chart2.width = 16
         chart2.height = 10
-        series = _make_scatter_series(ws, dil_col, d0_col, data_rows,
+        series = _make_scatter_series(ws, x_col, y_col, data_rows,
                                       "D0 Mean", color="ED7D31")
-        if d0_sd_col:
-            _add_error_bars(series, sheet_name, d0_sd_col, data_rows)
-        series.trendline = Trendline(trendlineType='power',
+        series.trendline = Trendline(trendlineType='linear',
                                      dispRSqr=True, dispEq=True)
         chart2.series.append(series)
         ws.add_chart(chart2, f"{get_column_letter(len(cols) + 2)}15")
@@ -3996,7 +4002,10 @@ if 'batch_results' in st.session_state:
                                     st.write(data_debug[['Group', 'D0_Mean', 'D0_SD']].to_string())
 
                                 # Store dilution data for Excel export
-                                st.session_state['_dilution_series_df'] = dilution_analysis['data']
+                                _dil_export = dilution_analysis['data'].copy()
+                                _dil_export['log10_Dilution'] = np.log10(_dil_export['Dilution'].astype(float))
+                                _dil_export['log10_D0_Mean'] = np.log10(_dil_export['D0_Mean'].astype(float))
+                                st.session_state['_dilution_series_df'] = _dil_export
                                 st.session_state['_dilution_series_summary'] = {
                                     'ct_slope': dilution_analysis['ct_analysis']['slope'],
                                     'ct_intercept': dilution_analysis['ct_analysis']['intercept'],
