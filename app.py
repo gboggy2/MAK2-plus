@@ -1883,23 +1883,32 @@ if cycles is not None and fluorescence is not None:
                     _na_baseline_sd = float(np.std(fluor_data[:_na_sd_window])) if _na_sd_window >= 3 else 1.0
                     _na_range       = float(np.max(fluor_data) - np.min(fluor_data))
                     if _na_baseline_sd > 0 and _na_range < 5.0 * _na_baseline_sd:
-                        results_list.append({
-                            'Sample': sample_name,
-                            'D0': np.nan, 'k': np.nan, 'P0': np.nan,
-                            'F_bg_intercept': np.nan, 'F_bg_slope': np.nan,
-                            'R2': np.nan, 'SSR': np.nan, 'RMSE': np.nan, 'NRMSE': np.nan,
-                            'Tier': None, 'Instrument': '',
-                            'Ct': np.nan, 'Ct_baseline_mean': np.nan,
-                            'Ct_baseline_slope': np.nan, 'Ct_baseline_intercept': np.nan,
-                            'fit_start_cycle': np.nan, 'fit_end_cycle': np.nan,
-                            'bl_end_meta': np.nan, 'bl_end_est': np.nan,
-                            'ct_rox_mean': np.nan,
-                            'Success': '', 'FixedBG': '', 'Fallback': '', 'FallbackOK': '',
-                            'bg_slope_est': None, 'bg_intercept_est': None,
-                            'error': 'No amplification detected',
-                            'fluor_data': fluor_data,
-                        })
-                        continue
+                        # Late-amp rescue: check if the last 10 cycles show
+                        # signal rise above baseline noise — possible late
+                        # amplifier that only lifts off near the end.
+                        _na_late_range = float(
+                            np.max(fluor_data[-10:]) - np.min(fluor_data[-10:])
+                        ) if len(fluor_data) >= 10 else 0.0
+                        if _na_late_range > 3.0 * _na_baseline_sd:
+                            pass  # let it through — possible late amplifier
+                        else:
+                            results_list.append({
+                                'Sample': sample_name,
+                                'D0': np.nan, 'k': np.nan, 'P0': np.nan,
+                                'F_bg_intercept': np.nan, 'F_bg_slope': np.nan,
+                                'R2': np.nan, 'SSR': np.nan, 'RMSE': np.nan, 'NRMSE': np.nan,
+                                'Tier': None, 'Instrument': '',
+                                'Ct': np.nan, 'Ct_baseline_mean': np.nan,
+                                'Ct_baseline_slope': np.nan, 'Ct_baseline_intercept': np.nan,
+                                'fit_start_cycle': np.nan, 'fit_end_cycle': np.nan,
+                                'bl_end_meta': np.nan, 'bl_end_est': np.nan,
+                                'ct_rox_mean': np.nan,
+                                'Success': '', 'FixedBG': '', 'Fallback': '', 'FallbackOK': '',
+                                'bg_slope_est': None, 'bg_intercept_est': None,
+                                'error': 'No amplification detected',
+                                'fluor_data': fluor_data,
+                            })
+                            continue
 
                     model_batch = MAK2Model()
                     optimizer_batch = MAK2Optimizer(model_batch)
@@ -3061,13 +3070,25 @@ if cycles is not None and fluorescence is not None:
                 _pf_reject = False
                 _pf_reason = ''
 
+                # Detect late amplifiers early — needed by Gate 0 and Gate 3.
+                _pf_fe_g0 = _pf_r.get('fit_end_cycle')
+                _pf_is_late = (
+                    _pf_fe_g0 is not None
+                    and not (isinstance(_pf_fe_g0, float) and np.isnan(_pf_fe_g0))
+                    and _pf_fe_g0 >= float(cycles[-1]) - 1
+                )
+
                 # Gate 0: poor R² — a MAK2 sigmoid+linear-background model
                 # can fit monotonic drift/noise to R²≈0.98, so the threshold
                 # must be well above that.  All legitimate amplifications on
                 # real qPCR data give R² ≥ 0.996; 0.99 provides margin.
-                if _pf_r2 is not None and _pf_r2 < 0.99:
+                # Late amplifiers (fit extends to last cycle) get a relaxed
+                # threshold of 0.90 because incomplete S-curves inherently
+                # have lower R² — the linear-vs-MAK2 gate catches drift.
+                _pf_r2_thresh = 0.90 if _pf_is_late else 0.99
+                if _pf_r2 is not None and _pf_r2 < _pf_r2_thresh:
                     _pf_reject = True
-                    _pf_reason = f'R\u00b2 = {_pf_r2:.4f} < 0.99'
+                    _pf_reason = f'R\u00b2 = {_pf_r2:.4f} < {_pf_r2_thresh}'
 
                 # Gate 1: removed — signal departure check is redundant
                 # with upstream detect_no_signal_samples() and too
@@ -3082,6 +3103,71 @@ if cycles is not None and fluorescence is not None:
                         _pf_reject = True
                         _pf_reason = f'Fit window {_pf_fe2 - _pf_fs2:.0f} cycles < 8'
 
+                # Gate 2b: linear-vs-MAK2 comparison on pre-inflection data.
+                # In real amplification the pre-inflection region (fit_start
+                # to max-slope cycle) is exponential growth where a sigmoid
+                # massively outperforms a straight line.  In drift, both
+                # fit equally well.  Reject if MAK2 R² improvement < 0.01.
+                # Skip for late amplifiers — incomplete S-curves may not
+                # have enough pre-inflection data.
+                if (not _pf_reject and not _pf_is_late
+                        and _pf_r.get('D0') is not None
+                        and not (isinstance(_pf_r['D0'], float) and np.isnan(_pf_r['D0']))
+                        and _pf_r.get('fluor_data') is not None):
+                    try:
+                        _pf_fs2b = _pf_r.get('fit_start_cycle')
+                        _pf_fe2b = _pf_r.get('fit_end_cycle')
+                        if _pf_fs2b is not None and _pf_fe2b is not None:
+                            _pf_m2b = MAK2Model()
+                            _pf_c_full2b = cycles[:len(_pf_r['fluor_data'])]
+                            _pf_pred2b = _pf_m2b.simulate_to_cycle(
+                                D0=_pf_r['D0'], k=_pf_r['k'], P0=_pf_r['P0'],
+                                cycles=_pf_c_full2b,
+                                F_bg_intercept=_pf_r['F_bg_intercept'],
+                                F_bg_slope=_pf_r['F_bg_slope'],
+                            )
+                            # Restrict to fit window
+                            _pf_win2b = (_pf_c_full2b >= _pf_fs2b) & (_pf_c_full2b <= _pf_fe2b)
+                            _pf_cycles_win = _pf_c_full2b[_pf_win2b]
+                            _pf_pred_win2b = _pf_pred2b[_pf_win2b]
+                            _pf_fluor_full2b = np.asarray(_pf_r['fluor_data'])
+                            _pf_fluor_win2b = _pf_fluor_full2b[_pf_win2b]
+
+                            # Find max-slope cycle from MAK2 prediction
+                            _pf_d1_2b = np.gradient(_pf_pred_win2b, _pf_cycles_win)
+                            _pf_max_slope_idx = int(np.argmax(_pf_d1_2b))
+                            _pf_max_slope_cycle = _pf_cycles_win[_pf_max_slope_idx]
+
+                            # Pre-inflection region: fit_start → max_slope_cycle
+                            _pf_pre_mask = _pf_cycles_win <= _pf_max_slope_cycle
+                            _pf_fluor_pre = _pf_fluor_win2b[_pf_pre_mask]
+                            _pf_cycles_pre = _pf_cycles_win[_pf_pre_mask]
+
+                            if len(_pf_fluor_pre) >= 4:
+                                # R² of linear fit on pre-inflection data
+                                _pf_coeffs = np.polyfit(_pf_cycles_pre, _pf_fluor_pre, 1)
+                                _pf_lin_pred = np.polyval(_pf_coeffs, _pf_cycles_pre)
+                                _pf_ss_tot = float(np.sum((_pf_fluor_pre - np.mean(_pf_fluor_pre))**2))
+                                if _pf_ss_tot > 0:
+                                    _pf_ss_res_lin = float(np.sum((_pf_fluor_pre - _pf_lin_pred)**2))
+                                    _pf_r2_lin = 1.0 - _pf_ss_res_lin / _pf_ss_tot
+
+                                    # R² of MAK2 on same pre-inflection region
+                                    _pf_mak2_pre = _pf_pred_win2b[_pf_pre_mask]
+                                    _pf_ss_res_mak = float(np.sum((_pf_fluor_pre - _pf_mak2_pre)**2))
+                                    _pf_r2_mak = 1.0 - _pf_ss_res_mak / _pf_ss_tot
+
+                                    # Reject if MAK2 doesn't outperform linear
+                                    if _pf_r2_mak - _pf_r2_lin < 0.01:
+                                        _pf_reject = True
+                                        _pf_reason = (
+                                            f'MAK2 not better than linear in growth region '
+                                            f'(R\u00b2_MAK2={_pf_r2_mak:.4f}, '
+                                            f'R\u00b2_lin={_pf_r2_lin:.4f})'
+                                        )
+                    except Exception:
+                        pass
+
                 # Gate 3: sigmoid shape — the fitted curve within the fit
                 # window must show a clear inflection (second derivative
                 # sign change).  Only check within fit window, not the
@@ -3091,12 +3177,7 @@ if cycles is not None and fluorescence is not None:
                 # exponential rise without reaching the inflection point.
                 # Skip for high-R² fits (≥ 0.999) — the fit quality
                 # already validates the curve shape.
-                _pf_fe_late = _pf_r.get('fit_end_cycle')
-                _pf_is_late = (
-                    _pf_fe_late is not None
-                    and not (isinstance(_pf_fe_late, float) and np.isnan(_pf_fe_late))
-                    and _pf_fe_late >= float(cycles[-1]) - 1
-                )
+                # _pf_is_late already computed above (before Gate 0)
                 _pf_fit_width = (
                     (_pf_r.get('fit_end_cycle') or 0)
                     - (_pf_r.get('fit_start_cycle') or 0)
