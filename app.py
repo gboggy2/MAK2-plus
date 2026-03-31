@@ -76,6 +76,51 @@ os.makedirs(_RESULTS_CACHE_DIR, exist_ok=True)
 def _results_cache_path():
     return os.path.join(_RESULTS_CACHE_DIR, 'last_batch_results.pkl')
 
+def _checkpoint_cache_path():
+    return os.path.join(_RESULTS_CACHE_DIR, 'batch_checkpoint.pkl')
+
+def _save_checkpoint(checkpoint_data):
+    """Atomic-write checkpoint to disk after each well. Called per-well."""
+    try:
+        _results_store['checkpoint'] = checkpoint_data
+        path = _checkpoint_cache_path()
+        tmp_path = path + '.tmp'
+        with open(tmp_path, 'wb') as f:
+            pickle.dump(checkpoint_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp_path, path)  # atomic on POSIX
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+def _restore_checkpoint():
+    """Try to load an incomplete batch checkpoint. Returns dict or None."""
+    if 'checkpoint' in _results_store:
+        return _results_store['checkpoint']
+    path = _checkpoint_cache_path()
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'rb') as f:
+            cp = pickle.load(f)
+        if cp.get('version') != 1:
+            return None
+        _results_store['checkpoint'] = cp
+        return cp
+    except Exception:
+        return None
+
+def _clear_checkpoint():
+    """Remove checkpoint after batch completes successfully."""
+    _results_store.pop('checkpoint', None)
+    try:
+        path = _checkpoint_cache_path()
+        if os.path.exists(path):
+            os.unlink(path)
+    except OSError:
+        pass
+
 def _save_results_to_disk(results_df, results_list, all_samples, no_signal_samples, cycles, settings):
     """Persist batch results to both in-memory store and disk."""
     try:
@@ -151,12 +196,18 @@ if not _session_has_results:
         st.toast("Restored previous batch results", icon="✅")
         _session_has_results = True
 
+# Detect incomplete checkpoint (batch interrupted mid-fit)
+_checkpoint_data = _restore_checkpoint()
+_has_incomplete_checkpoint = (_checkpoint_data is not None and not _session_has_results)
+
 # Diagnostic sidebar — always visible so we can debug persistence
+_has_checkpoint_file = os.path.exists(_checkpoint_cache_path())
 with st.sidebar.expander("🔧 Cache diagnostics", expanded=False):
     st.caption(
         f"Session has results: **{_session_has_results}**\n\n"
         f"Memory cache: **{'yes' if _cache_has_memory else 'no'}**\n\n"
-        f"Disk cache: **{'yes' if _cache_has_disk else 'no'}**"
+        f"Disk cache: **{'yes' if _cache_has_disk else 'no'}**\n\n"
+        f"Checkpoint: **{'yes' if _has_checkpoint_file else 'no'}**"
     )
 
 # ============================================================================
@@ -990,6 +1041,20 @@ elif data_source == "Manual Entry":
         except:
             st.sidebar.error("Invalid format. Use: cycle,fluorescence")
 
+# ── Resume bootstrap: if _resume_checkpoint triggered a rerun, restore
+# batch_mode / all_samples / cycles / fluorescence from session state so
+# the main content path can reach the batch fit code.
+if '_resume_checkpoint' in st.session_state and cycles is None:
+    if st.session_state.get('upload_ready_batch', False):
+        cycles = st.session_state.get('upload_cycles')
+        all_samples = st.session_state.get('upload_batch_samples', {})
+        batch_mode = True
+        _preview = st.session_state.get('upload_preview_sample')
+        if _preview and _preview in all_samples:
+            fluorescence = all_samples[_preview]
+        elif all_samples:
+            fluorescence = next(iter(all_samples.values()))
+
 # Main content
 if cycles is not None and fluorescence is not None:
     
@@ -1516,7 +1581,11 @@ if cycles is not None and fluorescence is not None:
     # Fit button(s)
     if batch_mode and all_samples:
         # Batch mode - fit all samples
-        if st.sidebar.button("🔬 Batch Fit All Samples", type="primary"):
+        _fit_btn = st.sidebar.button("🔬 Batch Fit All Samples", type="primary")
+        _resume_pending = '_resume_checkpoint' in st.session_state
+        if _fit_btn or _resume_pending:
+          _is_resuming = _resume_pending
+          _resume_cp = st.session_state.pop('_resume_checkpoint', None) if _is_resuming else None
           try:
             # Clear any previous manual fit results
             if 'fitted_params' in st.session_state:
@@ -1526,216 +1595,282 @@ if cycles is not None and fluorescence is not None:
 
             st.subheader("🔄 Batch Fitting Results")
 
-            # === SIGNAL DETECTION: Pre-filter samples before fitting ===
-            from data_processing import detect_no_signal_samples
+            # ── Resume from checkpoint: restore all state ────────────────────────
+            if _is_resuming and _resume_cp is not None:
+                from collections import OrderedDict as _OD
+                _cp_sample_names = _resume_cp['sample_names']
+                all_samples_to_fit = _OD(
+                    (k, np.array(_resume_cp['all_samples'][k]))
+                    for k in _cp_sample_names
+                )
+                no_signal_samples = _resume_cp.get('no_signal_samples', {})
+                cycles = np.array(_resume_cp['cycles'])
+                _cp_settings = _resume_cp['settings']
+                first_fit_cycle    = _cp_settings.get('first_fit_cycle', 1)
+                cycles_before_max  = _cp_settings.get('cycles_before_max', 3)
+                cycles_after_max   = _cp_settings.get('cycles_after_max', 3)
+                auto_truncate      = _cp_settings.get('auto_truncate', True)
+                truncate_cycle     = _cp_settings.get('truncate_cycle', None)
+                custom_bounds_dict = _cp_settings.get('custom_bounds_dict', {})
+                global_threshold      = _cp_settings.get('global_threshold')
+                global_baseline_mean  = _cp_settings.get('global_baseline_mean', 0.0)
+                channel_thresholds    = _cp_settings.get('channel_thresholds', {})
+                channel_baseline_means = _cp_settings.get('channel_baseline_means', {})
+                sample_metadata = _resume_cp.get('sample_metadata')
+                results_list = _resume_cp['results_list']
+                _pass1_start_idx = _resume_cp['pass1_completed_count']
+                _pass2_start_set = set(_resume_cp.get('pass2_completed_indices', []))
+                _cp_current_pass = _resume_cp.get('current_pass', 'pass1')
+                progress_bar = st.progress(_pass1_start_idx / len(all_samples_to_fit))
+                status_text = st.empty()
+                if _cp_current_pass == 'pass1':
+                    st.info(f"▶️ Resuming Pass 1 from well {_pass1_start_idx + 1}/{len(all_samples_to_fit)}")
+                else:
+                    st.info(f"▶️ Resuming Pass 2 retries")
 
-            with st.status("🔍 Detecting samples with no signal...", expanded=True) as status:
-                st.write(f"Analyzing {len(all_samples)} samples...")
+                # Restore ROX data if available
+                if _resume_cp.get('rox_by_well'):
+                    st.session_state['rox_by_well'] = {
+                        k: np.array(v) for k, v in _resume_cp['rox_by_well'].items()
+                    }
+                if _resume_cp.get('rox_normalized') is not None:
+                    st.session_state['rox_normalized'] = _resume_cp['rox_normalized']
+                if sample_metadata:
+                    st.session_state['sample_metadata'] = sample_metadata
 
-                # Run signal detection PER CHANNEL so each channel's
-                # range threshold is relative to its own max, not the
-                # plate-wide max.  This prevents e.g. CY3 wells (lower
-                # absolute fluorescence) from being rejected because FAM
-                # has a much larger absolute range.
-                _sel_channels = st.session_state.get('selected_channels', [])
-                if _sel_channels and len(_sel_channels) > 1:
-                    valid_samples = {}
-                    no_signal_samples = {}
-                    plate_stats = {'max_range': 0}
-                    for _det_ch in _sel_channels:
-                        _det_ch_samples = {
-                            name: fluor for name, fluor in all_samples.items()
-                            if _ch(name) == _det_ch
-                        }
-                        if not _det_ch_samples:
-                            continue
-                        _v, _ns, _ps = detect_no_signal_samples(
-                            cycles, _det_ch_samples,
+            else:
+                # Fresh run — normal signal detection + threshold computation
+                _pass1_start_idx = 0
+                _pass2_start_set = set()
+                _cp_current_pass = 'pass1'
+
+            # === SIGNAL DETECTION + THRESHOLD COMPUTATION ===
+            # (skipped on resume — restored from checkpoint above)
+            if not (_is_resuming and _resume_cp is not None):
+                from data_processing import detect_no_signal_samples
+
+                with st.status("🔍 Detecting samples with no signal...", expanded=True) as status:
+                    st.write(f"Analyzing {len(all_samples)} samples...")
+
+                    # Run signal detection PER CHANNEL so each channel's
+                    # range threshold is relative to its own max, not the
+                    # plate-wide max.  This prevents e.g. CY3 wells (lower
+                    # absolute fluorescence) from being rejected because FAM
+                    # has a much larger absolute range.
+                    _sel_channels = st.session_state.get('selected_channels', [])
+                    if _sel_channels and len(_sel_channels) > 1:
+                        valid_samples = {}
+                        no_signal_samples = {}
+                        plate_stats = {'max_range': 0}
+                        for _det_ch in _sel_channels:
+                            _det_ch_samples = {
+                                name: fluor for name, fluor in all_samples.items()
+                                if _ch(name) == _det_ch
+                            }
+                            if not _det_ch_samples:
+                                continue
+                            _v, _ns, _ps = detect_no_signal_samples(
+                                cycles, _det_ch_samples,
+                                min_range_pct=2.0, min_r2=0.80, verbose=False
+                            )
+                            valid_samples.update(_v)
+                            no_signal_samples.update(_ns)
+                            plate_stats['max_range'] = max(
+                                plate_stats['max_range'], _ps.get('max_range', 0)
+                            )
+                        st.write(
+                            f"Per-channel signal detection: "
+                            f"{', '.join(f'{ch}: {sum(1 for n in valid_samples if _ch(n)==ch)}' for ch in _sel_channels)}"
+                        )
+                    else:
+                        valid_samples, no_signal_samples, plate_stats = detect_no_signal_samples(
+                            cycles, all_samples,
                             min_range_pct=2.0, min_r2=0.80, verbose=False
                         )
-                        valid_samples.update(_v)
-                        no_signal_samples.update(_ns)
-                        plate_stats['max_range'] = max(
-                            plate_stats['max_range'], _ps.get('max_range', 0)
-                        )
-                    st.write(
-                        f"Per-channel signal detection: "
-                        f"{', '.join(f'{ch}: {sum(1 for n in valid_samples if _ch(n)==ch)}' for ch in _sel_channels)}"
-                    )
-                else:
-                    valid_samples, no_signal_samples, plate_stats = detect_no_signal_samples(
-                        cycles, all_samples,
-                        min_range_pct=2.0, min_r2=0.80, verbose=False
-                    )
 
-                # ── Reconcile with instrument metadata (highest authority) ─────────────
-                # If the metadata CSV is loaded, use the instrument's calls to
-                # RESCUE wells our algorithm rejected, but never to SUPPRESS wells
-                # our algorithm accepted.  The instrument's NOAMP flag can be wrong
-                # (e.g. late amplifiers with real signal), so we trust our own
-                # data-driven detection over the instrument's determination.
-                #
-                #  • A well our algorithm REJECTED but the instrument called AMPLIFIED
-                #    (has a numeric Ct and NOAMP=False) is rescued → valid_samples.
-                _smeta = st.session_state.get('sample_metadata', {})
-                if _smeta:
-                    rescued, suppressed = [], []
-                    for sname, info in list(no_signal_samples.items()):
-                        wm = _smeta.get(sname, {})
-                        if 'Ct_instrument' not in wm:
-                            continue
-                        inst_ct = wm.get('Ct_instrument')
-                        inst_noamp = wm.get('NOAMP', False)
-                        inst_undetermined = (
-                            inst_ct is None
-                            or (isinstance(inst_ct, float) and np.isnan(inst_ct))
-                        )
-                        if not inst_undetermined and not inst_noamp:
-                            # Instrument says amplified — rescue it
-                            valid_samples[sname] = all_samples[sname]
-                            del no_signal_samples[sname]
-                            rescued.append(sname)
-                    if rescued:
-                        st.write(f"🔁 Rescued {len(rescued)} wells overridden by instrument metadata: "
-                                 f"{', '.join(rescued[:5])}{'…' if len(rescued) > 5 else ''}")
+                    # ── Reconcile with instrument metadata (highest authority) ─────────────
+                    _smeta = st.session_state.get('sample_metadata', {})
+                    if _smeta:
+                        rescued, suppressed = [], []
+                        for sname, info in list(no_signal_samples.items()):
+                            wm = _smeta.get(sname, {})
+                            if 'Ct_instrument' not in wm:
+                                continue
+                            inst_ct = wm.get('Ct_instrument')
+                            inst_noamp = wm.get('NOAMP', False)
+                            inst_undetermined = (
+                                inst_ct is None
+                                or (isinstance(inst_ct, float) and np.isnan(inst_ct))
+                            )
+                            if not inst_undetermined and not inst_noamp:
+                                valid_samples[sname] = all_samples[sname]
+                                del no_signal_samples[sname]
+                                rescued.append(sname)
+                        if rescued:
+                            st.write(f"🔁 Rescued {len(rescued)} wells overridden by instrument metadata: "
+                                     f"{', '.join(rescued[:5])}{'…' if len(rescued) > 5 else ''}")
 
-                st.write(f"✅ Found {len(valid_samples)} samples with valid signal")
+                    st.write(f"✅ Found {len(valid_samples)} samples with valid signal")
+                    if no_signal_samples:
+                        st.write(f"⚠️ Flagged {len(no_signal_samples)} samples with no detectable signal")
+
+                    status.update(label="✅ Signal detection complete", state="complete")
+
+                # Show flagged samples if any
                 if no_signal_samples:
-                    st.write(f"⚠️ Flagged {len(no_signal_samples)} samples with no detectable signal")
+                    with st.expander(f"⚠️ {len(no_signal_samples)} samples flagged (will be skipped)", expanded=True):
+                        st.info("These samples have insufficient signal for MAK2+ fitting (likely NTC, failed reactions, or no template).")
 
-                status.update(label="✅ Signal detection complete", state="complete")
+                        no_signal_df = pd.DataFrame([
+                            {
+                                'Sample': name,
+                                'Reason': info['reason'],
+                                'Range': f"{info['F_range']:.4f}",
+                                '% of Max': f"{info['F_range_pct']:.1f}%"
+                            }
+                            for name, info in no_signal_samples.items()
+                        ])
+                        st.dataframe(no_signal_df, use_container_width=True)
+                        st.session_state['_no_signal_df'] = no_signal_df
 
-            # Show flagged samples if any
-            if no_signal_samples:
-                with st.expander(f"⚠️ {len(no_signal_samples)} samples flagged (will be skipped)", expanded=True):
-                    st.info("These samples have insufficient signal for MAK2+ fitting (likely NTC, failed reactions, or no template).")
+                # Update all_samples to only include valid samples
+                all_samples_to_fit = valid_samples
 
-                    no_signal_df = pd.DataFrame([
-                        {
-                            'Sample': name,
-                            'Reason': info['reason'],
-                            'Range': f"{info['F_range']:.4f}",
-                            '% of Max': f"{info['F_range_pct']:.1f}%"
-                        }
-                        for name, info in no_signal_samples.items()
-                    ])
-                    st.dataframe(no_signal_df, use_container_width=True)
-                    # Store for Excel export
-                    st.session_state['_no_signal_df'] = no_signal_df
+                results_list = []
+                progress_bar = st.progress(0)
+                status_text = st.empty()
 
-            # Update all_samples to only include valid samples
-            all_samples_to_fit = valid_samples
+                # ── Per-channel threshold computation ────────────────────────────────
+                status_text.text("Calculating per-channel thresholds for Ct analysis...")
+                global_threshold     = None
+                global_baseline_mean = 0.0
+                channel_thresholds      = {}
+                channel_baseline_means  = {}
 
-            results_list = []
-            progress_bar = st.progress(0)
-            status_text = st.empty()
+                all_fluorescence = list(all_samples_to_fit.values())
 
-            # ── Per-channel threshold computation ────────────────────────────────────
-            # Real qPCR instruments (QuantStudio, CFX) set one threshold per dye,
-            # not one per plate.  For multiplexed raw data (FAM baseline ~1.7 M RFU,
-            # JOE baseline ~250 k RFU) a single plate-wide threshold is meaningless:
-            #   • It renders the plot threshold line below the FAM baseline or above
-            #     the JOE plateau (whichever channel it's not tuned for).
-            #   • The 5 % dynamic-range floor is dominated by the highest-signal
-            #     channel, making the threshold too strict for weaker channels.
-            # Solution: compute threshold independently for each detected channel.
-            status_text.text("Calculating per-channel thresholds for Ct analysis...")
-            global_threshold     = None
-            global_baseline_mean = 0.0
-            channel_thresholds      = {}   # {channel → threshold in δRn units}
-            channel_baseline_means  = {}   # {channel → baseline mean in raw RFU}
+                if all_fluorescence:
+                    baseline_end = max(3, int(len(cycles) * 0.15))
 
-            all_fluorescence = list(all_samples_to_fit.values())
+                    ch_arrays = {}
+                    for sname, fd in all_samples_to_fit.items():
+                        ch_arrays.setdefault(_ch(sname), []).append(fd)
 
-            if all_fluorescence:
-                # Conservative baseline window: first 15 % of cycles (min 3)
-                baseline_end = max(3, int(len(cycles) * 0.15))
+                    for ch, arrays in ch_arrays.items():
+                        ch_sds    = []
+                        ch_means  = []
+                        ch_early_all = []
+                        for fd in arrays:
+                            early = fd[:baseline_end]
+                            ch_early_all.extend(early)
+                            ch_sds.append(np.std(early))
+                            ch_means.append(np.mean(early))
 
-                # Group samples by channel
-                ch_arrays = {}
-                for sname, fd in all_samples_to_fit.items():
-                    ch_arrays.setdefault(_ch(sname), []).append(fd)
+                        ch_sub = (np.mean(ch_early_all) < 0.1) or \
+                                 np.any(np.array(ch_early_all) < 0)
+                        ch_baseline_mean = 0.0 if ch_sub else np.median(ch_means)
+                        ch_median_sd     = np.median(ch_sds)
+                        ch_max           = np.max([np.max(fd) for fd in arrays])
+                        ch_dyn_range     = ch_max - ch_baseline_mean
 
-                for ch, arrays in ch_arrays.items():
-                    ch_sds    = []
-                    ch_means  = []
-                    ch_early_all = []
-                    for fd in arrays:
-                        early = fd[:baseline_end]
-                        ch_early_all.extend(early)
-                        ch_sds.append(np.std(early))
-                        ch_means.append(np.mean(early))
+                        ch_thresh = max(
+                            10 * ch_median_sd if ch_median_sd > 0 else 0.01,
+                            0.05 * ch_dyn_range
+                        )
+                        channel_thresholds[ch]     = ch_thresh
+                        channel_baseline_means[ch] = ch_baseline_mean
 
-                    ch_sub = (np.mean(ch_early_all) < 0.1) or \
-                             np.any(np.array(ch_early_all) < 0)
-                    ch_baseline_mean = 0.0 if ch_sub else np.median(ch_means)
-                    ch_median_sd     = np.median(ch_sds)
-                    ch_max           = np.max([np.max(fd) for fd in arrays])
-                    ch_dyn_range     = ch_max - ch_baseline_mean
+                    if len(channel_thresholds) == 1:
+                        global_threshold     = next(iter(channel_thresholds.values()))
+                        global_baseline_mean = next(iter(channel_baseline_means.values()))
+                    else:
+                        all_sds = [s for arrays in ch_arrays.values()
+                                   for fd in arrays
+                                   for s in [np.std(fd[:baseline_end])]]
+                        all_means = [np.mean(fd[:baseline_end])
+                                     for arrays in ch_arrays.values()
+                                     for fd in arrays]
+                        already_sub = (np.mean([v for fd in all_fluorescence
+                                                for v in fd[:baseline_end]]) < 0.1)
+                        global_baseline_mean = 0.0 if already_sub else np.median(all_means)
+                        plate_max     = np.max([np.max(f) for f in all_fluorescence])
+                        global_threshold = max(
+                            10 * np.median(all_sds) if all_sds else 0.01,
+                            0.05 * (plate_max - global_baseline_mean)
+                        )
 
-                    ch_thresh = max(
-                        10 * ch_median_sd if ch_median_sd > 0 else 0.01,
-                        0.05 * ch_dyn_range
-                    )
-                    channel_thresholds[ch]     = ch_thresh
-                    channel_baseline_means[ch] = ch_baseline_mean
+                    if len(channel_thresholds) > 1:
+                        lines = ', '.join(
+                            f'{c}: {v:,.4g}' for c, v in sorted(channel_thresholds.items())
+                        )
+                        st.info(f"📊 Per-channel thresholds (above baseline): {lines}")
+                    else:
+                        st.info(
+                            f"📊 Using threshold: {global_threshold:,.4g} "
+                            f"(from {len(all_samples_to_fit)} samples)"
+                        )
 
-                # Global fallback (single-channel data or unknown channel)
-                if len(channel_thresholds) == 1:
-                    global_threshold     = next(iter(channel_thresholds.values()))
-                    global_baseline_mean = next(iter(channel_baseline_means.values()))
-                else:
-                    # Multi-channel: compute a conservative plate-wide fallback
-                    all_sds = [s for arrays in ch_arrays.values()
-                               for fd in arrays
-                               for s in [np.std(fd[:baseline_end])]]
-                    all_means = [np.mean(fd[:baseline_end])
-                                 for arrays in ch_arrays.values()
-                                 for fd in arrays]
-                    already_sub = (np.mean([v for fd in all_fluorescence
-                                            for v in fd[:baseline_end]]) < 0.1)
-                    global_baseline_mean = 0.0 if already_sub else np.median(all_means)
-                    plate_max     = np.max([np.max(f) for f in all_fluorescence])
-                    global_threshold = max(
-                        10 * np.median(all_sds) if all_sds else 0.01,
-                        0.05 * (plate_max - global_baseline_mean)
-                    )
+                # Override thresholds with instrument values when metadata is loaded.
+                abi_results_meta = st.session_state.get('abi_results_meta')
+                rox_norm_active  = st.session_state.get('rox_normalized', False)
+                if abi_results_meta and rox_norm_active:
+                    inst_thresholds = abi_results_meta.get('channel_thresholds', {})
+                    if inst_thresholds:
+                        for ch, val in inst_thresholds.items():
+                            if ch in channel_thresholds:
+                                channel_thresholds[ch] = val
+                        if len(inst_thresholds) == 1:
+                            global_threshold = next(iter(inst_thresholds.values()))
+                        lines = ', '.join(
+                            f'{c}={v}' for c, v in sorted(inst_thresholds.items())
+                        )
+                        st.success(f"✅ Using instrument Ct thresholds (ΔRn): {lines}")
 
-                if len(channel_thresholds) > 1:
-                    lines = ', '.join(
-                        f'{c}: {v:,.4g}' for c, v in sorted(channel_thresholds.items())
-                    )
-                    st.info(f"📊 Per-channel thresholds (above baseline): {lines}")
-                else:
-                    st.info(
-                        f"📊 Using threshold: {global_threshold:,.4g} "
-                        f"(from {len(all_samples_to_fit)} samples)"
-                    )
+                # Get sample metadata for instrument CT values
+                sample_metadata = st.session_state.get('sample_metadata')
 
-            # Override thresholds with instrument values when metadata is loaded.
-            # Instrument thresholds are in ΔRn units (post-ROX normalisation).
-            # Only override when ROX normalisation is active so the scale matches.
-            abi_results_meta = st.session_state.get('abi_results_meta')
-            rox_norm_active  = st.session_state.get('rox_normalized', False)
-            if abi_results_meta and rox_norm_active:
-                inst_thresholds = abi_results_meta.get('channel_thresholds', {})
-                if inst_thresholds:
-                    for ch, val in inst_thresholds.items():
-                        if ch in channel_thresholds:
-                            channel_thresholds[ch] = val
-                        # Also update global if single-channel
-                    if len(inst_thresholds) == 1:
-                        global_threshold = next(iter(inst_thresholds.values()))
-                    lines = ', '.join(
-                        f'{c}={v}' for c, v in sorted(inst_thresholds.items())
-                    )
-                    st.success(f"✅ Using instrument Ct thresholds (ΔRn): {lines}")
-
-            # Get sample metadata for instrument CT values
-            sample_metadata = st.session_state.get('sample_metadata')
+            # ── Build checkpoint object ──────────────────────────────────────────
+            from datetime import datetime as _dt
+            _checkpoint = {
+                'version': 1,
+                'created_at': _resume_cp['created_at'] if (_is_resuming and _resume_cp) else _dt.utcnow().isoformat(),
+                'updated_at': _dt.utcnow().isoformat(),
+                'current_pass': _cp_current_pass,
+                'pass1_completed_count': _pass1_start_idx,
+                'pass1_total': len(all_samples_to_fit),
+                'pass2_completed_indices': list(_pass2_start_set),
+                'retry_indices': _resume_cp.get('retry_indices', []) if (_is_resuming and _resume_cp) else [],
+                'results_list': results_list,
+                'sample_names': list(all_samples_to_fit.keys()),
+                'all_samples': {k: v.tolist() if hasattr(v, 'tolist') else v
+                                for k, v in all_samples_to_fit.items()},
+                'no_signal_samples': no_signal_samples,
+                'cycles': cycles.tolist() if hasattr(cycles, 'tolist') else cycles,
+                'settings': {
+                    'first_fit_cycle': first_fit_cycle,
+                    'cycles_before_max': cycles_before_max,
+                    'cycles_after_max': cycles_after_max,
+                    'auto_truncate': auto_truncate,
+                    'truncate_cycle': truncate_cycle,
+                    'custom_bounds_dict': custom_bounds_dict,
+                    'global_threshold': global_threshold,
+                    'global_baseline_mean': global_baseline_mean,
+                    'channel_thresholds': channel_thresholds,
+                    'channel_baseline_means': channel_baseline_means,
+                },
+                'sample_metadata': st.session_state.get('sample_metadata'),
+                'rox_by_well': {k: v.tolist() if hasattr(v, 'tolist') else v
+                                for k, v in st.session_state.get('rox_by_well', {}).items()},
+                'rox_normalized': st.session_state.get('rox_normalized', False),
+            }
 
             # Pass 1: Fit all samples normally
+            # (if resuming into Pass 2, skip Pass 1 entirely)
+            _skip_pass1 = (_is_resuming and _resume_cp is not None
+                           and _cp_current_pass == 'pass2')
             for i, (sample_name, fluor_data) in enumerate(all_samples_to_fit.items()):
+                if _skip_pass1 or i < _pass1_start_idx:
+                    continue  # already completed in previous session
                 status_text.text(f"Pass 1: Fitting {sample_name}... ({i+1}/{len(all_samples_to_fit)})")
 
                 try:
@@ -2189,7 +2324,18 @@ if cycles is not None and fluorescence is not None:
                     })
                 
                 progress_bar.progress((i + 1) / len(all_samples_to_fit))
-            
+
+                # ── Checkpoint: save progress after each well ────────────────────
+                _checkpoint['pass1_completed_count'] = i + 1
+                _checkpoint['results_list'] = results_list
+                _checkpoint['updated_at'] = _dt.utcnow().isoformat()
+                _save_checkpoint(_checkpoint)
+
+            # ── Mark Pass 1 complete in checkpoint ────────────────────────────────
+            _checkpoint['current_pass'] = 'pass2'
+            _checkpoint['results_list'] = results_list
+            _save_checkpoint(_checkpoint)
+
             # ── Pass 2: Channel-aware retry ─────────────────────────────────────────
             # Strategy: learn per-channel priors from reliable pass-1 fits, then
             # retry every sample that is: (a) high SSR, (b) errored, or
@@ -2325,6 +2471,10 @@ if cycles is not None and fluorescence is not None:
 
             retry_indices = sorted(retry_indices)
 
+            # Save retry indices to checkpoint
+            _checkpoint['retry_indices'] = retry_indices
+            _save_checkpoint(_checkpoint)
+
             if retry_indices and (channel_medians or all_k_vals):
                 status_text.text(
                     f"Pass 2: Retrying {len(retry_indices)} samples with "
@@ -2333,6 +2483,9 @@ if cycles is not None and fluorescence is not None:
 
                 import time as _time_mod
                 for idx in retry_indices:
+                    # Skip retries already completed in a previous session
+                    if idx in _pass2_start_set:
+                        continue
                     _retry_t0   = _time_mod.perf_counter()
                     result      = results_list[idx]
                     # Detect late amplifiers early: if pass-1 fit_end is at/near
@@ -2880,7 +3033,13 @@ if cycles is not None and fluorescence is not None:
                             results_list[idx]['Success'] = f'✗ Error: {str(e)[:30]}'
                         else:
                             results_list[idx]['Success'] = '⚠️ Retry failed'
-            
+
+                    # ── Checkpoint: save progress after each retry ──────────
+                    _checkpoint['pass2_completed_indices'].append(idx)
+                    _checkpoint['results_list'] = results_list
+                    _checkpoint['updated_at'] = _dt.utcnow().isoformat()
+                    _save_checkpoint(_checkpoint)
+
             # ── Post-fit non-amplification check ───────────────────────
             # Even when the optimizer converges, the well may not show
             # real amplification.  Three quality gates catch false
@@ -2945,7 +3104,7 @@ if cycles is not None and fluorescence is not None:
                 _pf_high_r2 = (
                     _pf_r2 is not None
                     and _pf_r2 >= 0.999
-                    and _pf_fit_width >= 15
+                    and _pf_fit_width >= 10
                 )
                 if (not _pf_reject and not _pf_is_late and not _pf_high_r2
                         and _pf_r.get('D0') is not None
@@ -3001,7 +3160,7 @@ if cycles is not None and fluorescence is not None:
             # Store core session state FIRST so results are never lost
             st.session_state['batch_results'] = results_df
             st.session_state['batch_results_list'] = results_list
-            st.session_state['batch_all_samples'] = all_samples
+            st.session_state['batch_all_samples'] = all_samples_to_fit if _is_resuming else all_samples
             st.session_state['batch_no_signal_samples'] = no_signal_samples
             st.session_state['batch_cycles'] = cycles
             st.session_state['batch_settings'] = {
@@ -3019,10 +3178,14 @@ if cycles is not None and fluorescence is not None:
 
             # Persist to disk so results survive session resets
             _save_results_to_disk(
-                results_df, results_list, all_samples,
+                results_df, results_list,
+                all_samples_to_fit if _is_resuming else all_samples,
                 no_signal_samples, cycles,
                 st.session_state['batch_settings'],
             )
+
+            # Batch complete — clear the checkpoint (no longer needed)
+            _clear_checkpoint()
 
             # Now add display columns (if this fails, raw results still persist)
             try:
@@ -3208,7 +3371,7 @@ if cycles is not None and fluorescence is not None:
                     )
                     _sq_r2_val = optimizer.metrics.get('r_squared', 0) if hasattr(optimizer, 'metrics') and optimizer.metrics else 0
                     _sq_fit_width = (_sq_fe - _sq_fs) if (_sq_fs is not None and _sq_fe is not None) else 0
-                    _sq_high_r2 = (_sq_r2_val >= 0.999 and _sq_fit_width >= 15)
+                    _sq_high_r2 = (_sq_r2_val >= 0.999 and _sq_fit_width >= 10)
                     if not _sq_is_late and not _sq_high_r2:
                         try:
                             _sq_pred = optimizer.predict(cycles)
@@ -3249,6 +3412,54 @@ if cycles is not None and fluorescence is not None:
                         st.session_state['fit_debug_output'] = debug_output
                     st.error(f"Fitting failed: {str(e)}")
                     st.stop()
+
+# ============================================================================
+# RESUME FROM CHECKPOINT — independent of file upload / data source state
+# ============================================================================
+if (_has_incomplete_checkpoint
+    and 'batch_results' not in st.session_state
+    and '_resume_checkpoint' not in st.session_state):
+    _cp = _checkpoint_data
+    _cp_total = _cp.get('pass1_total', 0)
+    _cp_done = _cp.get('pass1_completed_count', 0)
+    _cp_pass = _cp.get('current_pass', 'pass1')
+    if _cp_pass == 'pass1':
+        _cp_pct = (_cp_done / _cp_total * 100) if _cp_total > 0 else 0
+        _cp_msg = f"Pass 1: {_cp_done}/{_cp_total} wells completed ({_cp_pct:.0f}%)"
+    else:
+        _cp_p2_done = len(_cp.get('pass2_completed_indices', []))
+        _cp_p2_total = len(_cp.get('retry_indices', []))
+        _cp_msg = f"Pass 1 complete. Pass 2: {_cp_p2_done}/{_cp_p2_total} retries completed"
+
+    st.warning(f"⏸️ Incomplete batch fitting detected — {_cp_msg}")
+    _cp_col1, _cp_col2 = st.columns(2)
+    with _cp_col1:
+        if st.button("▶️ Resume fitting", type="primary", key="resume_checkpoint"):
+            # Store checkpoint in session state and rerun — the main batch
+            # fitting path will pick it up via _is_resuming flag.
+            st.session_state['_resume_checkpoint'] = _cp
+            # Also restore sample data so batch_mode + all_samples are set
+            _cp_samples = {}
+            for k in _cp['sample_names']:
+                _cp_samples[k] = np.array(_cp['all_samples'][k])
+            st.session_state['upload_batch_samples'] = _cp_samples
+            st.session_state['upload_cycles'] = np.array(_cp['cycles'])
+            st.session_state['upload_ready_batch'] = True
+            # Set a preview sample so the UI doesn't crash
+            st.session_state['upload_preview_sample'] = _cp['sample_names'][0]
+            if _cp.get('rox_by_well'):
+                st.session_state['rox_by_well'] = {
+                    k: np.array(v) for k, v in _cp['rox_by_well'].items()
+                }
+            if _cp.get('rox_normalized') is not None:
+                st.session_state['rox_normalized'] = _cp['rox_normalized']
+            if _cp.get('sample_metadata'):
+                st.session_state['sample_metadata'] = _cp['sample_metadata']
+            st.rerun()
+    with _cp_col2:
+        if st.button("🗑️ Discard and start fresh", key="discard_checkpoint"):
+            _clear_checkpoint()
+            st.rerun()
 
 # ============================================================================
 # RESULTS DISPLAY — independent of file upload / cycles state
