@@ -1883,13 +1883,14 @@ if cycles is not None and fluorescence is not None:
                     _na_baseline_sd = float(np.std(fluor_data[:_na_sd_window])) if _na_sd_window >= 3 else 1.0
                     _na_range       = float(np.max(fluor_data) - np.min(fluor_data))
                     if _na_baseline_sd > 0 and _na_range < 5.0 * _na_baseline_sd:
-                        # Late-amp rescue: check if the last 10 cycles show
-                        # signal rise above baseline noise — possible late
-                        # amplifier that only lifts off near the end.
-                        _na_late_range = float(
-                            np.max(fluor_data[-10:]) - np.min(fluor_data[-10:])
-                        ) if len(fluor_data) >= 10 else 0.0
-                        if _na_late_range > 3.0 * _na_baseline_sd:
+                        # Late-amp rescue: check if the mean of the last 5
+                        # cycles exceeds baseline_mean + 2× baseline SD.
+                        # This catches gradual late amplifiers whose total
+                        # range is small but whose tail is clearly rising
+                        # above the baseline floor.
+                        _na_baseline_mean = float(np.mean(fluor_data[:_na_sd_window])) if _na_sd_window >= 3 else 0.0
+                        _na_tail_mean = float(np.mean(fluor_data[-5:])) if len(fluor_data) >= 5 else 0.0
+                        if _na_tail_mean > _na_baseline_mean + 2.0 * _na_baseline_sd:
                             pass  # let it through — possible late amplifier
                         else:
                             results_list.append({
@@ -3099,9 +3100,9 @@ if cycles is not None and fluorescence is not None:
                     _pf_fs2 = _pf_r.get('fit_start_cycle')
                     _pf_fe2 = _pf_r.get('fit_end_cycle')
                     if (_pf_fs2 is not None and _pf_fe2 is not None
-                            and _pf_fe2 - _pf_fs2 < 8):
+                            and _pf_fe2 - _pf_fs2 < 10):
                         _pf_reject = True
-                        _pf_reason = f'Fit window {_pf_fe2 - _pf_fs2:.0f} cycles < 8'
+                        _pf_reason = f'Fit window {_pf_fe2 - _pf_fs2:.0f} cycles < 10'
 
                 # Gate 2b: linear-vs-MAK2 comparison on pre-inflection data.
                 # In real amplification the pre-inflection region (fit_start
@@ -3158,7 +3159,7 @@ if cycles is not None and fluorescence is not None:
                                     _pf_r2_mak = 1.0 - _pf_ss_res_mak / _pf_ss_tot
 
                                     # Reject if MAK2 doesn't outperform linear
-                                    if _pf_r2_mak - _pf_r2_lin < 0.01:
+                                    if _pf_r2_mak - _pf_r2_lin < 0.05:
                                         _pf_reject = True
                                         _pf_reason = (
                                             f'MAK2 not better than linear in growth region '
