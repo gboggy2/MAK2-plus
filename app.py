@@ -163,22 +163,24 @@ with st.sidebar.expander("🔧 Cache diagnostics", expanded=False):
 # EXCEL EXPORT
 # ============================================================================
 
-def _build_excel_download(results_df, replicate_stats=None, precision_comparison=None):
+def _build_excel_download(results_df, extra_sheets=None):
     """Build a multi-sheet Excel file with all available results.
 
-    Sheets:
-      - Batch Results: main fitted parameters + metadata
-      - Replicate Statistics: mean/SD/CV per group (if available)
-      - Precision Comparison: Ct vs D0 precision (if available)
+    Args:
+        results_df: Main batch results DataFrame (always included).
+        extra_sheets: dict of {sheet_name: DataFrame} for additional tabs.
     """
     import io
+    if extra_sheets is None:
+        extra_sheets = {}
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine='openpyxl') as writer:
         results_df.to_excel(writer, sheet_name='Batch Results', index=False)
-        if replicate_stats is not None and len(replicate_stats) > 0:
-            replicate_stats.to_excel(writer, sheet_name='Replicate Statistics', index=False)
-        if precision_comparison is not None and len(precision_comparison) > 0:
-            precision_comparison.to_excel(writer, sheet_name='Precision Comparison', index=False)
+        for sheet_name, df in extra_sheets.items():
+            if df is not None and len(df) > 0:
+                # Excel sheet names max 31 chars
+                safe_name = sheet_name[:31]
+                df.to_excel(writer, sheet_name=safe_name, index=False)
     buf.seek(0)
     return buf.getvalue()
 
@@ -1393,6 +1395,8 @@ if cycles is not None and fluorescence is not None:
                         for name, info in no_signal_samples.items()
                     ])
                     st.dataframe(no_signal_df, use_container_width=True)
+                    # Store for Excel export
+                    st.session_state['_no_signal_df'] = no_signal_df
 
             # Update all_samples to only include valid samples
             all_samples_to_fit = valid_samples
@@ -2992,16 +2996,25 @@ if 'batch_results' in st.session_state:
     # Prominent download buttons at top of results
     try:
         _xl_results_top = st.session_state['batch_results']
-        _xl_rep_top = st.session_state.get('_replicate_stats_df')
-        _xl_prec_top = st.session_state.get('_precision_comparison_df')
-        _xl_bytes_top = _build_excel_download(_xl_results_top, _xl_rep_top, _xl_prec_top)
-        _xl_sheets_top = ["Batch Results"]
-        if _xl_rep_top is not None:
-            _xl_sheets_top.append("Replicate Statistics")
-        if _xl_prec_top is not None:
-            _xl_sheets_top.append("Precision Comparison")
+        # Gather all available extra sheets
+        _xl_extra = {}
+        _xl_keys = [
+            ('_no_signal_df',            'No Signal Samples'),
+            ('_replicate_stats_df',      'Replicate Statistics'),
+            ('_precision_comparison_df', 'Precision Comparison'),
+            ('_std_curve_variance_df',   'Std Curve Variance'),
+            ('_limited_dilution_df',     'Limited Dilution'),
+            ('_dilution_series_df',      'Dilution Series'),
+        ]
+        for _ss_key, _sheet_name in _xl_keys:
+            _df = st.session_state.get(_ss_key)
+            if _df is not None and len(_df) > 0:
+                _xl_extra[_sheet_name] = _df
+        _xl_bytes_top = _build_excel_download(_xl_results_top, _xl_extra)
+        _xl_sheet_names = ["Batch Results"] + list(_xl_extra.keys())
+        _n_sheets = len(_xl_sheet_names)
         st.download_button(
-            f"📥 Download Complete Results (.xlsx — {', '.join(_xl_sheets_top)})",
+            f"📥 Download Complete Results (.xlsx, {_n_sheets} sheet{'s' if _n_sheets > 1 else ''})",
             _xl_bytes_top,
             "batch_fit_results.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -3224,7 +3237,11 @@ if 'batch_results' in st.session_state:
                                 row['SD Ct'] = f"{ct_var['sd_Ct']:.3f}" if not np.isnan(ct_var['sd_Ct']) else '-'
                                 row['Ct CV%'] = f"{ct_var['cv_Ct_pct']:.2f}" if not np.isnan(ct_var['cv_Ct_pct']) else '-'
                         var_data.append(row)
-                st.dataframe(pd.DataFrame(var_data), use_container_width=True)
+                _var_df = pd.DataFrame(var_data)
+                st.dataframe(_var_df, use_container_width=True)
+                # Store for Excel export
+                if len(_var_df) > 0:
+                    st.session_state['_std_curve_variance_df'] = _var_df
 
             # ── Apply calibration for this channel ─────────────────
             if _cal_ch is not None:
@@ -3336,6 +3353,7 @@ if 'batch_results' in st.session_state:
                     pos_details['D0'] * ld_calibration['conversion_factor']
                 )
                 st.dataframe(pos_details, use_container_width=True)
+                st.session_state['_limited_dilution_df'] = pos_details
 
                 st.markdown(
                     f"**D0 statistics:** mean = {ld_calibration['mean_d0_positive']:.3e}, "
@@ -3742,6 +3760,9 @@ if 'batch_results' in st.session_state:
                                     st.write(data_debug[['Group', 'Ct_Mean', 'Ct_SD']].to_string())
                                     st.write("\n**D0 Standard Deviations:**")
                                     st.write(data_debug[['Group', 'D0_Mean', 'D0_SD']].to_string())
+
+                                # Store dilution data for Excel export
+                                st.session_state['_dilution_series_df'] = dilution_analysis['data']
 
                                 dilution_plot = plot_dilution_series_comparison(dilution_analysis)
                                 st.plotly_chart(dilution_plot, use_container_width=True)
