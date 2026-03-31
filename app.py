@@ -2522,6 +2522,30 @@ if cycles is not None and fluorescence is not None:
                         informed_bounds['F_bg_slope']     = (_r_s_min, _r_s_max)
                         informed_bounds['F_bg_intercept'] = (_r_int_lo, _r_int_hi)
 
+                        # Late-amp enhancement: when pass-1 failed badly and the
+                        # well is a late amplifier, run analytical exponential
+                        # phase detection to get tight D0/k priors.
+                        _pass1_r2 = result.get('R2')
+                        _pass1_failed = (_pass1_r2 is None
+                                         or (isinstance(_pass1_r2, float) and
+                                             (np.isnan(_pass1_r2) or _pass1_r2 < 0.90)))
+                        if _pass1_late and _pass1_failed:
+                            try:
+                                from mak2_model import estimate_MAK2_params_from_exponential
+                                _la_est, _la_bounds = estimate_MAK2_params_from_exponential(
+                                    cycles_retry, fluor_retry,
+                                    P0_assumed=pP0 if pP0 > 0 else 1.0,
+                                    verbose=False,
+                                )
+                                if 'D0' in _la_bounds:
+                                    informed_bounds['D0'] = _la_bounds['D0']
+                                if 'k' in _la_bounds:
+                                    _la_k_lo = max(0.01, _la_bounds['k'][0] * 0.5)
+                                    _la_k_hi = min(1.2, _la_bounds['k'][1] * 2.0)
+                                    informed_bounds['k'] = (_la_k_lo, _la_k_hi)
+                            except Exception:
+                                pass  # fall through to existing retry logic
+
                         # Retry uses extended truncation (+7 cycles after max slope)
                         # so the optimizer sees the post-truncation data that constrains k.
                         # Without this, wells that overshoot at the end of the pass-1
@@ -2907,7 +2931,15 @@ if cycles is not None and fluorescence is not None:
                     and not (isinstance(_pf_fe_late, float) and np.isnan(_pf_fe_late))
                     and _pf_fe_late >= float(cycles[-1]) - 1
                 )
-                _pf_high_r2 = (_pf_r2 is not None and _pf_r2 >= 0.999)
+                _pf_fit_width = (
+                    (_pf_r.get('fit_end_cycle') or 0)
+                    - (_pf_r.get('fit_start_cycle') or 0)
+                )
+                _pf_high_r2 = (
+                    _pf_r2 is not None
+                    and _pf_r2 >= 0.999
+                    and _pf_fit_width >= 15
+                )
                 if (not _pf_reject and not _pf_is_late and not _pf_high_r2
                         and _pf_r.get('D0') is not None
                         and not (isinstance(_pf_r['D0'], float) and np.isnan(_pf_r['D0']))
@@ -3168,7 +3200,8 @@ if cycles is not None and fluorescence is not None:
                         and _sq_fe >= float(cycles[-1]) - 1
                     )
                     _sq_r2_val = optimizer.metrics.get('r_squared', 0) if hasattr(optimizer, 'metrics') and optimizer.metrics else 0
-                    _sq_high_r2 = (_sq_r2_val >= 0.999)
+                    _sq_fit_width = (_sq_fe - _sq_fs) if (_sq_fs is not None and _sq_fe is not None) else 0
+                    _sq_high_r2 = (_sq_r2_val >= 0.999 and _sq_fit_width >= 15)
                     if not _sq_is_late and not _sq_high_r2:
                         try:
                             _sq_pred = optimizer.predict(cycles)
