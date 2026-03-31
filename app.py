@@ -226,17 +226,29 @@ def _build_excel_download(results_df, extra_sheets=None, chart_sheets=None):
     return buf.getvalue()
 
 
-def _make_scatter_series(ws, x_col, y_col, data_rows, title="Data"):
-    """Create a scatter series with visible circle markers and no connecting line."""
+def _make_scatter_series(ws, x_col, y_col, data_rows, title="Data",
+                         color="4472C4"):
+    """Create a scatter series with uniform-color circle markers, no connecting line."""
     from openpyxl.chart import Reference, Series as XlSeries
     from openpyxl.chart.marker import Marker
+    from openpyxl.drawing.fill import PatternFillProperties, ColorChoice
 
     x_vals = Reference(ws, min_col=x_col, min_row=2, max_row=data_rows + 1)
     y_vals = Reference(ws, min_col=y_col, min_row=2, max_row=data_rows + 1)
     series = XlSeries(y_vals, x_vals, title=title)
     series.marker = Marker(symbol='circle', size=7)
+    series.marker.graphicalProperties.solidFill = color
     series.graphicalProperties.line.noFill = True  # no connecting line
     return series
+
+
+def _configure_log_axis(axis, title, num_fmt="0.E+0"):
+    """Configure a log-scale axis with visible labels and tick marks."""
+    axis.title = title
+    axis.scaling.logBase = 10
+    axis.numFmt = num_fmt
+    axis.majorTickMark = "out"
+    axis.minorTickMark = "out"
 
 
 def _add_std_curve_d0_chart(ws, df, data_rows):
@@ -255,6 +267,10 @@ def _add_std_curve_d0_chart(ws, df, data_rows):
     chart.title = "D0 Standard Curve (log-log)"
     chart.x_axis.title = "log10(D0)"
     chart.y_axis.title = "log10(Known Copies)"
+    chart.x_axis.numFmt = '0.00'
+    chart.y_axis.numFmt = '0.00'
+    chart.x_axis.majorTickMark = "out"
+    chart.y_axis.majorTickMark = "out"
     chart.style = 2
     chart.width = 18
     chart.height = 12
@@ -282,6 +298,10 @@ def _add_std_curve_ct_chart(ws, df, data_rows):
     chart.title = "Ct Standard Curve"
     chart.x_axis.title = "Ct"
     chart.y_axis.title = "log10(Known Copies)"
+    chart.x_axis.numFmt = '0.0'
+    chart.y_axis.numFmt = '0.00'
+    chart.x_axis.majorTickMark = "out"
+    chart.y_axis.majorTickMark = "out"
     chart.style = 2
     chart.width = 18
     chart.height = 12
@@ -307,14 +327,17 @@ def _add_dilution_chart(ws, df, data_rows):
     if dil_col and ct_col:
         chart1 = ScatterChart()
         chart1.title = "Ct vs Dilution Factor"
-        chart1.x_axis.title = "Dilution Factor"
+        _configure_log_axis(chart1.x_axis, "Dilution Factor", "0")
         chart1.y_axis.title = "Mean Ct"
-        chart1.x_axis.scaling.logBase = 10
+        chart1.y_axis.numFmt = '0.0'
+        chart1.y_axis.majorTickMark = "out"
         chart1.style = 2
         chart1.width = 16
         chart1.height = 10
-        series = _make_scatter_series(ws, dil_col, ct_col, data_rows, "Ct Mean")
-        series.trendline = Trendline(trendlineType='linear',
+        series = _make_scatter_series(ws, dil_col, ct_col, data_rows,
+                                      "Ct Mean", color="4472C4")
+        # Ct = m·log(dilution) + b  →  logarithmic trendline
+        series.trendline = Trendline(trendlineType='log',
                                      dispRSqr=True, dispEq=True)
         chart1.series.append(series)
         ws.add_chart(chart1, f"{get_column_letter(len(cols) + 2)}2")
@@ -322,14 +345,14 @@ def _add_dilution_chart(ws, df, data_rows):
     if dil_col and d0_col:
         chart2 = ScatterChart()
         chart2.title = "D0 vs Dilution Factor"
-        chart2.x_axis.title = "Dilution Factor"
-        chart2.y_axis.title = "Mean D0"
-        chart2.x_axis.scaling.logBase = 10
-        chart2.y_axis.scaling.logBase = 10
+        _configure_log_axis(chart2.x_axis, "Dilution Factor", "0")
+        _configure_log_axis(chart2.y_axis, "Mean D0", "0.0E+0")
         chart2.style = 2
         chart2.width = 16
         chart2.height = 10
-        series = _make_scatter_series(ws, dil_col, d0_col, data_rows, "D0 Mean")
+        series = _make_scatter_series(ws, dil_col, d0_col, data_rows,
+                                      "D0 Mean", color="ED7D31")
+        # D0 ∝ 1/dilution  →  power trendline on log-log axes
         series.trendline = Trendline(trendlineType='power',
                                      dispRSqr=True, dispEq=True)
         chart2.series.append(series)
