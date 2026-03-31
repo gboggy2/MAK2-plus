@@ -144,7 +144,7 @@ class MAK2Optimizer:
         if disabled_tiers is None:
             disabled_tiers = set()
         self.tier_log = []
-        self._fit_deadline = time.perf_counter() + 60.0  # 60-second timeout
+        self._fit_deadline = time.perf_counter() + 20.0  # 20-second timeout
         self._fit_timed_out = False
         _tier1_start = time.perf_counter()
 
@@ -1373,7 +1373,7 @@ class MAK2Optimizer:
 
                 # Generate LHS samples for FULL 5D parameter space with WIDENED bounds
                 # Use more samples for fallback since we need thorough exploration
-                n_lhs_fallback = 100  # More samples for challenging cases
+                n_lhs_fallback = 40  # Reduced from 100 — most good fits found in top 10
                 print(f"   Generating {n_lhs_fallback} LHS samples for 5D parameter space...")
 
                 # qmc is already imported at the top

@@ -2074,6 +2074,18 @@ if cycles is not None and fluorescence is not None:
                     except Exception:
                         pass
 
+            # ── Skip retries for wells Gate 0 will reject (R² < 0.99) ──
+            # These wells are fitting noise/drift; retrying wastes 15-60s
+            # each with no chance of producing a valid result.
+            _skip_count = 0
+            for i in list(retry_indices):
+                _r2_i = results_list[i].get('R2')
+                if _r2_i is not None and _r2_i < 0.99:
+                    retry_indices.discard(i)
+                    _skip_count += 1
+            if _skip_count > 0:
+                status_text.text(f"Skipped {_skip_count} wells below R² 0.99 threshold")
+
             retry_indices = sorted(retry_indices)
 
             if retry_indices and (channel_medians or all_k_vals):
@@ -2092,7 +2104,7 @@ if cycles is not None and fluorescence is not None:
                         result.get('fit_end_cycle') is not None
                         and result['fit_end_cycle'] >= float(cycles[-1]) - 1
                     )
-                    _RETRY_TIMEOUT = 15.0 if _pass1_late else 60.0
+                    _RETRY_TIMEOUT = 10.0 if _pass1_late else 30.0
                     sample_name = result['Sample']
                     fluor_data  = result['fluor_data']
                     if fluor_data is None:
