@@ -242,13 +242,15 @@ def _make_scatter_series(ws, x_col, y_col, data_rows, title="Data",
     return series
 
 
-def _configure_log_axis(axis, title, num_fmt="0.E+0"):
-    """Configure a log-scale axis with visible labels and tick marks."""
+def _style_axis(axis, title, num_fmt="General", log=False):
+    """Configure an axis with visible labels, tick marks, and no gridlines."""
     axis.title = title
-    axis.scaling.logBase = 10
+    axis.delete = False          # force tick labels visible
     axis.numFmt = num_fmt
     axis.majorTickMark = "out"
-    axis.minorTickMark = "out"
+    axis.majorGridlines = None   # remove gridlines
+    if log:
+        axis.scaling.logBase = 10
 
 
 def _add_std_curve_d0_chart(ws, df, data_rows):
@@ -265,13 +267,9 @@ def _add_std_curve_d0_chart(ws, df, data_rows):
 
     chart = ScatterChart()
     chart.title = "D0 Standard Curve (log-log)"
-    chart.x_axis.title = "log10(D0)"
-    chart.y_axis.title = "log10(Known Copies)"
-    chart.x_axis.numFmt = '0.00'
-    chart.y_axis.numFmt = '0.00'
-    chart.x_axis.majorTickMark = "out"
-    chart.y_axis.majorTickMark = "out"
-    chart.style = 2
+    chart.legend.position = 'b'
+    _style_axis(chart.x_axis, "log10(D0)", "0.00")
+    _style_axis(chart.y_axis, "log10(Known Copies)", "0.00")
     chart.width = 18
     chart.height = 12
 
@@ -296,13 +294,9 @@ def _add_std_curve_ct_chart(ws, df, data_rows):
 
     chart = ScatterChart()
     chart.title = "Ct Standard Curve"
-    chart.x_axis.title = "Ct"
-    chart.y_axis.title = "log10(Known Copies)"
-    chart.x_axis.numFmt = '0.0'
-    chart.y_axis.numFmt = '0.00'
-    chart.x_axis.majorTickMark = "out"
-    chart.y_axis.majorTickMark = "out"
-    chart.style = 2
+    chart.legend.position = 'b'
+    _style_axis(chart.x_axis, "Ct", "0.0")
+    _style_axis(chart.y_axis, "log10(Known Copies)", "0.00")
     chart.width = 18
     chart.height = 12
 
@@ -311,6 +305,19 @@ def _add_std_curve_ct_chart(ws, df, data_rows):
                                  dispRSqr=True, dispEq=True)
     chart.series.append(series)
     ws.add_chart(chart, f"{get_column_letter(len(cols) + 2)}2")
+
+
+def _add_error_bars(series, sheet_name, sd_col, data_rows):
+    """Add y-axis error bars from a standard deviation column."""
+    from openpyxl.chart.error_bar import ErrorBars
+    from openpyxl.chart.series import NumDataSource, NumRef
+    from openpyxl.utils import get_column_letter
+
+    col_letter = get_column_letter(sd_col)
+    ref = f"'{sheet_name}'!${col_letter}$2:${col_letter}${data_rows + 1}"
+    src = NumDataSource(numRef=NumRef(f=ref))
+    series.errBars = ErrorBars(errDir='y', errBarType='both',
+                               errValType='cust', plus=src, minus=src)
 
 
 def _add_dilution_chart(ws, df, data_rows):
@@ -323,20 +330,22 @@ def _add_dilution_chart(ws, df, data_rows):
     dil_col = cols.index('Dilution') + 1 if 'Dilution' in cols else None
     ct_col = cols.index('Ct_Mean') + 1 if 'Ct_Mean' in cols else None
     d0_col = cols.index('D0_Mean') + 1 if 'D0_Mean' in cols else None
+    ct_sd_col = cols.index('Ct_SD') + 1 if 'Ct_SD' in cols else None
+    d0_sd_col = cols.index('D0_SD') + 1 if 'D0_SD' in cols else None
+    sheet_name = ws.title
 
     if dil_col and ct_col:
         chart1 = ScatterChart()
         chart1.title = "Ct vs Dilution Factor"
-        _configure_log_axis(chart1.x_axis, "Dilution Factor", "0")
-        chart1.y_axis.title = "Mean Ct"
-        chart1.y_axis.numFmt = '0.0'
-        chart1.y_axis.majorTickMark = "out"
-        chart1.style = 2
+        chart1.legend.position = 'b'
+        _style_axis(chart1.x_axis, "Dilution Factor", "0", log=True)
+        _style_axis(chart1.y_axis, "Mean Ct", "0.0")
         chart1.width = 16
         chart1.height = 10
         series = _make_scatter_series(ws, dil_col, ct_col, data_rows,
                                       "Ct Mean", color="4472C4")
-        # Ct = m·log(dilution) + b  →  logarithmic trendline
+        if ct_sd_col:
+            _add_error_bars(series, sheet_name, ct_sd_col, data_rows)
         series.trendline = Trendline(trendlineType='log',
                                      dispRSqr=True, dispEq=True)
         chart1.series.append(series)
@@ -345,14 +354,15 @@ def _add_dilution_chart(ws, df, data_rows):
     if dil_col and d0_col:
         chart2 = ScatterChart()
         chart2.title = "D0 vs Dilution Factor"
-        _configure_log_axis(chart2.x_axis, "Dilution Factor", "0")
-        _configure_log_axis(chart2.y_axis, "Mean D0", "0.0E+0")
-        chart2.style = 2
+        chart2.legend.position = 'b'
+        _style_axis(chart2.x_axis, "Dilution Factor", "0", log=True)
+        _style_axis(chart2.y_axis, "Mean D0", "0.00E+00", log=True)
         chart2.width = 16
         chart2.height = 10
         series = _make_scatter_series(ws, dil_col, d0_col, data_rows,
                                       "D0 Mean", color="ED7D31")
-        # D0 ∝ 1/dilution  →  power trendline on log-log axes
+        if d0_sd_col:
+            _add_error_bars(series, sheet_name, d0_sd_col, data_rows)
         series.trendline = Trendline(trendlineType='power',
                                      dispRSqr=True, dispEq=True)
         chart2.series.append(series)
