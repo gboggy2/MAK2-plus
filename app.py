@@ -70,7 +70,7 @@ def _get_results_store():
 
 _results_store = _get_results_store()
 
-_RESULTS_CACHE_DIR = os.path.join(tempfile.gettempdir(), 'mak2_results')
+_RESULTS_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.cache')
 os.makedirs(_RESULTS_CACHE_DIR, exist_ok=True)
 
 def _results_cache_path():

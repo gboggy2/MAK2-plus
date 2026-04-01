@@ -2,3 +2,4 @@
 !.streamlit/config.toml
 secrets.toml
 __pycache__/
+.cache/
