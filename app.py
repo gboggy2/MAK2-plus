@@ -492,7 +492,7 @@ if 'example_loader' not in st.session_state:
 
 data_source = st.sidebar.radio(
     "Choose data source:",
-    ["Example Data", "Upload File", "Manual Entry"]
+    ["Example Data", "Upload File", "Manual Entry", "Load Previous Results"]
 )
 
 cycles = None
@@ -1051,6 +1051,139 @@ elif data_source == "Manual Entry":
                     del st.session_state['bootstrap_results']
         except:
             st.sidebar.error("Invalid format. Use: cycle,fluorescence")
+
+elif data_source == "Load Previous Results":
+    _prev_file = st.sidebar.file_uploader(
+        "Upload a previous batch_fit_results .xlsx",
+        type=['xlsx'],
+        help="Upload an Excel file exported from a previous MAK2+ batch fit to restore all results.",
+        key="prev_results_uploader",
+    )
+    if _prev_file is not None:
+        _prev_key = f"{_prev_file.name}_{_prev_file.size}"
+        if st.session_state.get('_prev_results_key') != _prev_key:
+            try:
+                _prev_sheets = pd.read_excel(_prev_file, sheet_name=None)
+
+                # ── Batch Results ──
+                if 'Batch Results' not in _prev_sheets:
+                    st.sidebar.error("No 'Batch Results' sheet found in file.")
+                else:
+                    _prev_results_df = _prev_sheets['Batch Results']
+
+                    # ── Input Data → cycles + all_samples + fluor_data ──
+                    _prev_cycles = None
+                    _prev_all_samples = {}
+                    _prev_no_signal = {}
+                    if 'Input Data' in _prev_sheets:
+                        _input_df = _prev_sheets['Input Data']
+                        if 'Cycle' in _input_df.columns:
+                            _prev_cycles = _input_df['Cycle'].values.astype(float)
+                            for _col in _input_df.columns:
+                                if _col != 'Cycle':
+                                    _prev_all_samples[_col] = _input_df[_col].values.astype(float)
+
+                    # ── Settings → batch_settings ──
+                    _prev_settings = {}
+                    if 'Settings' in _prev_sheets:
+                        _sdf = _prev_sheets['Settings']
+                        _flat = {}
+                        for _, _sr in _sdf.iterrows():
+                            _flat[str(_sr['Setting'])] = str(_sr['Value']) if pd.notna(_sr['Value']) else ''
+                        # Reconstruct typed dict
+                        _nested_keys = {}  # parent → {child: val}
+                        for _fk, _fv in _flat.items():
+                            if '.' in _fk:
+                                _parent, _child = _fk.split('.', 1)
+                                _nested_keys.setdefault(_parent, {})[_child] = _fv
+                            else:
+                                _prev_settings[_fk] = _fv
+                        # Convert types
+                        for _k in ['first_fit_cycle', 'truncate_cycle',
+                                    'global_threshold', 'global_baseline_mean']:
+                            if _k in _prev_settings:
+                                try:
+                                    _prev_settings[_k] = float(_prev_settings[_k]) if _prev_settings[_k] not in ('', 'None') else None
+                                except ValueError:
+                                    _prev_settings[_k] = None
+                        for _k in ['cycles_before_max', 'cycles_after_max']:
+                            if _k in _prev_settings:
+                                try:
+                                    _prev_settings[_k] = int(float(_prev_settings[_k]))
+                                except (ValueError, TypeError):
+                                    _prev_settings[_k] = 3
+                        if 'auto_truncate' in _prev_settings:
+                            _prev_settings['auto_truncate'] = _prev_settings['auto_truncate'] in ('True', 'true', '1')
+                        # Nested dicts
+                        for _nk, _nv in _nested_keys.items():
+                            _typed = {}
+                            for _ck, _cv in _nv.items():
+                                try:
+                                    _typed[_ck] = float(_cv) if _cv not in ('', 'None') else None
+                                except ValueError:
+                                    _typed[_ck] = _cv
+                            _prev_settings[_nk] = _typed
+                        # Defaults
+                        _prev_settings.setdefault('custom_bounds_dict', None)
+
+                    # ── Metadata → sample_metadata ──
+                    _prev_meta = {}
+                    if 'Metadata' in _prev_sheets:
+                        _mdf = _prev_sheets['Metadata']
+                        for _, _mr in _mdf.iterrows():
+                            _wk = str(_mr.get('Well_Key', ''))
+                            if _wk:
+                                _md = {c: _mr[c] for c in _mdf.columns if c != 'Well_Key' and pd.notna(_mr[c])}
+                                _prev_meta[_wk] = _md
+
+                    # ── No Signal samples ──
+                    if 'No Signal Samples' in _prev_sheets:
+                        _ns_df = _prev_sheets['No Signal Samples']
+                        if 'Sample' in _ns_df.columns:
+                            for _, _nsr in _ns_df.iterrows():
+                                _ns_name = str(_nsr['Sample'])
+                                if _ns_name in _prev_all_samples:
+                                    _prev_no_signal[_ns_name] = _prev_all_samples.pop(_ns_name)
+
+                    # ── Rebuild results_list with fluor_data ──
+                    _prev_results_list = []
+                    for _, _rr in _prev_results_df.iterrows():
+                        _rd = _rr.to_dict()
+                        _sn = _rd.get('Sample', '')
+                        if _sn in _prev_all_samples:
+                            _rd['fluor_data'] = _prev_all_samples[_sn]
+                        elif _sn in _prev_no_signal:
+                            _rd['fluor_data'] = _prev_no_signal[_sn]
+                        else:
+                            _rd['fluor_data'] = None
+                        _prev_results_list.append(_rd)
+
+                    # ── Set session state ──
+                    st.session_state['batch_results'] = _prev_results_df
+                    st.session_state['batch_results_list'] = _prev_results_list
+                    st.session_state['batch_all_samples'] = _prev_all_samples
+                    st.session_state['batch_no_signal_samples'] = _prev_no_signal
+                    if _prev_cycles is not None:
+                        st.session_state['batch_cycles'] = _prev_cycles
+                    if _prev_settings:
+                        st.session_state['batch_settings'] = _prev_settings
+                    if _prev_meta:
+                        st.session_state['sample_metadata'] = _prev_meta
+
+                    # Store no-signal DataFrame for display
+                    if 'No Signal Samples' in _prev_sheets:
+                        st.session_state['_no_signal_df'] = _prev_sheets['No Signal Samples']
+
+                    st.session_state['_prev_results_key'] = _prev_key
+                    _n_wells = len(_prev_results_list)
+                    _n_pass = sum(1 for r in _prev_results_list
+                                 if r.get('Success') and str(r.get('Success', '')).startswith('✓'))
+                    st.sidebar.success(
+                        f"✅ Loaded {_n_wells} wells ({_n_pass} passed) from previous results"
+                    )
+                    st.rerun()
+            except Exception as _e:
+                st.sidebar.error(f"Failed to load results: {_e}")
 
 # ── Resume bootstrap: if _resume_checkpoint triggered a rerun, restore
 # batch_mode / all_samples / cycles / fluorescence from session state so
@@ -3615,6 +3748,51 @@ if 'batch_results' in st.session_state:
                 'data': _dil_df, 'summary': _dil_sum or {},
                 'chart_type': 'dilution_series',
             }
+
+        # ── Input Data sheet: raw fluorescence (cycles as rows, wells as cols) ──
+        _xl_all_samples = st.session_state.get('batch_all_samples', {})
+        _xl_no_signal = st.session_state.get('batch_no_signal_samples', {})
+        _xl_cycles = st.session_state.get('batch_cycles')
+        if _xl_cycles is not None and (_xl_all_samples or _xl_no_signal):
+            _all_wells = {}
+            _all_wells.update(_xl_all_samples)
+            _all_wells.update(_xl_no_signal)
+            _input_data = {'Cycle': _xl_cycles}
+            for _wn, _wd in _all_wells.items():
+                _input_data[_wn] = np.asarray(_wd)[:len(_xl_cycles)]
+            _xl_extra['Input Data'] = pd.DataFrame(_input_data)
+
+        # ── Metadata sheet: sample_metadata table ──
+        _xl_meta = st.session_state.get('sample_metadata')
+        if _xl_meta and isinstance(_xl_meta, dict):
+            _meta_rows = []
+            for _mk, _mv in _xl_meta.items():
+                _row = {'Well_Key': _mk}
+                if isinstance(_mv, dict):
+                    _row.update(_mv)
+                _meta_rows.append(_row)
+            if _meta_rows:
+                _xl_extra['Metadata'] = pd.DataFrame(_meta_rows)
+
+        # ── Settings sheet: batch_settings key-value pairs ──
+        _xl_batch_settings = st.session_state.get('batch_settings')
+        if _xl_batch_settings:
+            _settings_rows = []
+            for _sk, _sv in _xl_batch_settings.items():
+                if isinstance(_sv, dict):
+                    # Flatten nested dicts (e.g. channel_thresholds)
+                    for _sk2, _sv2 in _sv.items():
+                        _settings_rows.append({
+                            'Setting': f'{_sk}.{_sk2}',
+                            'Value': str(_sv2) if _sv2 is not None else '',
+                        })
+                else:
+                    _settings_rows.append({
+                        'Setting': _sk,
+                        'Value': str(_sv) if _sv is not None else '',
+                    })
+            if _settings_rows:
+                _xl_extra['Settings'] = pd.DataFrame(_settings_rows)
 
         _xl_bytes_top = _build_excel_download(
             _xl_results_top, _xl_extra, chart_sheets=_xl_charts
