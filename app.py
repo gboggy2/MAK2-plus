@@ -3751,15 +3751,30 @@ if 'batch_results' in st.session_state:
 
         # ── Input Data sheet: raw fluorescence (cycles as rows, wells as cols) ──
         _xl_all_samples = st.session_state.get('batch_all_samples', {})
-        _xl_no_signal = st.session_state.get('batch_no_signal_samples', {})
         _xl_cycles = st.session_state.get('batch_cycles')
-        if _xl_cycles is not None and (_xl_all_samples or _xl_no_signal):
-            _all_wells = {}
-            _all_wells.update(_xl_all_samples)
-            _all_wells.update(_xl_no_signal)
+        if _xl_cycles is not None and _xl_all_samples:
             _input_data = {'Cycle': _xl_cycles}
-            for _wn, _wd in _all_wells.items():
-                _input_data[_wn] = np.asarray(_wd)[:len(_xl_cycles)]
+            # Include fitted wells from batch_all_samples
+            for _wn, _wd in _xl_all_samples.items():
+                _arr = np.asarray(_wd)
+                if _arr.ndim >= 1:
+                    _input_data[_wn] = _arr[:len(_xl_cycles)]
+            # Include no-signal wells from upload source if available
+            _xl_upload_samples = st.session_state.get('upload_batch_samples', {})
+            _xl_no_signal_keys = st.session_state.get('batch_no_signal_samples', {})
+            for _ns_name in _xl_no_signal_keys:
+                if _ns_name not in _input_data and _ns_name in _xl_upload_samples:
+                    _arr = np.asarray(_xl_upload_samples[_ns_name])
+                    if _arr.ndim >= 1:
+                        _input_data[_ns_name] = _arr[:len(_xl_cycles)]
+            # Also check results_list for fluor_data of wells not yet included
+            _xl_results_list = st.session_state.get('batch_results_list', [])
+            for _rl in _xl_results_list:
+                _rn = _rl.get('Sample', '')
+                if _rn and _rn not in _input_data and _rl.get('fluor_data') is not None:
+                    _arr = np.asarray(_rl['fluor_data'])
+                    if _arr.ndim >= 1:
+                        _input_data[_rn] = _arr[:len(_xl_cycles)]
             _xl_extra['Input Data'] = pd.DataFrame(_input_data)
 
         # ── Metadata sheet: sample_metadata table ──
@@ -3907,7 +3922,15 @@ if 'batch_results' in st.session_state:
         st.markdown("---")
         st.subheader("📐 Standard Curve Calibration")
 
-        # Determine if we need per-channel standard curves
+        # Determine if we need per-channel standard curves.
+        # If Channel column doesn't exist, try to derive from sample names
+        # (e.g. FAM_A1 → FAM) — handles cases where selected_channels
+        # wasn't set during batch fit.
+        if 'Channel' not in results_df.columns:
+            _derived_ch = results_df['Sample'].map(_ch)
+            _uniq_ch = _derived_ch[_derived_ch != 'default'].unique()
+            if len(_uniq_ch) > 1:
+                results_df.insert(0, 'Channel', _derived_ch)
         _has_multi_ch = 'Channel' in results_df.columns and results_df['Channel'].nunique() > 1
         _cal_channels = list(results_df['Channel'].unique()) if _has_multi_ch else [None]
         st.session_state['_std_curve_channels'] = _cal_channels
