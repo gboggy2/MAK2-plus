@@ -136,7 +136,7 @@ def _clear_checkpoint():
     except OSError:
         pass
 
-def _save_results_to_disk(results_df, results_list, all_samples, no_signal_samples, cycles, settings):
+def _save_results_to_disk(results_df, results_list, all_samples, no_signal_samples, cycles, settings, no_signal_fluor=None):
     """Persist batch results to both in-memory store and disk."""
     try:
         slim_list = []
@@ -148,6 +148,7 @@ def _save_results_to_disk(results_df, results_list, all_samples, no_signal_sampl
             'results_list': slim_list,
             'all_samples': {k: v.tolist() if hasattr(v, 'tolist') else v for k, v in all_samples.items()},
             'no_signal_samples': no_signal_samples,
+            'no_signal_fluor': {k: v.tolist() if hasattr(v, 'tolist') else v for k, v in (no_signal_fluor or {}).items()},
             'cycles': cycles.tolist() if hasattr(cycles, 'tolist') else cycles,
             'settings': settings,
         }
@@ -193,6 +194,11 @@ def _restore_results_from_cache():
             k: np.array(v) for k, v in payload['all_samples'].items()
         }
         st.session_state['batch_no_signal_samples'] = payload['no_signal_samples']
+        _ns_fluor_payload = payload.get('no_signal_fluor', {})
+        if _ns_fluor_payload:
+            st.session_state['batch_no_signal_fluor'] = {
+                k: np.array(v) for k, v in _ns_fluor_payload.items()
+            }
         st.session_state['batch_cycles'] = np.array(payload['cycles'])
         st.session_state['batch_settings'] = payload['settings']
         return True
@@ -3403,11 +3409,21 @@ if cycles is not None and fluorescence is not None:
             }
 
             # Persist to disk so results survive session resets
+            # Collect fluorescence data for no-signal wells
+            _ns_fluor_save = {}
+            _all_src = all_samples if not _is_resuming else {}
+            for _ns_key in no_signal_samples:
+                if _ns_key in _all_src:
+                    _ns_fluor_save[_ns_key] = _all_src[_ns_key]
+                elif _ns_key in st.session_state.get('upload_batch_samples', {}):
+                    _ns_fluor_save[_ns_key] = st.session_state['upload_batch_samples'][_ns_key]
+            st.session_state['batch_no_signal_fluor'] = _ns_fluor_save
             _save_results_to_disk(
                 results_df, results_list,
                 all_samples_to_fit if _is_resuming else all_samples,
                 no_signal_samples, cycles,
                 st.session_state['batch_settings'],
+                no_signal_fluor=_ns_fluor_save,
             )
 
             # Batch complete — clear the checkpoint (no longer needed)
@@ -4979,17 +4995,25 @@ if ('batch_no_signal_samples' in st.session_state
     _ns_cycles = st.session_state['batch_cycles']
     # Collect fluorescence data for skipped wells
     _ns_fluor = {}
+    _ns_saved = st.session_state.get('batch_no_signal_fluor', {})
     _ns_upload = st.session_state.get('upload_batch_samples', {})
     _ns_results_list = st.session_state.get('batch_results_list', [])
     for _ns_name in _ns_samples:
-        if _ns_name in _ns_upload:
+        if _ns_name in _ns_saved:
+            _ns_fluor[_ns_name] = np.asarray(_ns_saved[_ns_name])
+        elif _ns_name in _ns_upload:
             _ns_fluor[_ns_name] = np.asarray(_ns_upload[_ns_name])
         else:
-            # Try results_list fluor_data
-            for _rl in _ns_results_list:
-                if _rl.get('Sample') == _ns_name and _rl.get('fluor_data') is not None:
-                    _ns_fluor[_ns_name] = np.asarray(_rl['fluor_data'])
-                    break
+            # Check if batch_no_signal_samples itself holds fluor arrays (import case)
+            _ns_val = _ns_samples[_ns_name]
+            if isinstance(_ns_val, (np.ndarray, list)) and not isinstance(_ns_val, dict):
+                _ns_fluor[_ns_name] = np.asarray(_ns_val)
+            else:
+                # Try results_list fluor_data
+                for _rl in _ns_results_list:
+                    if _rl.get('Sample') == _ns_name and _rl.get('fluor_data') is not None:
+                        _ns_fluor[_ns_name] = np.asarray(_rl['fluor_data'])
+                        break
     if _ns_fluor:
         st.markdown("---")
         st.subheader("🚫 Visualize Skipped Wells (No Signal)")
