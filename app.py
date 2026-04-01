@@ -1918,6 +1918,11 @@ if cycles is not None and fluorescence is not None:
                 # Update all_samples to only include valid samples
                 all_samples_to_fit = valid_samples
 
+                # Save no-signal fluor data NOW while all_samples is guaranteed in scope
+                st.session_state['batch_no_signal_fluor'] = {
+                    name: all_samples[name] for name in no_signal_samples if name in all_samples
+                }
+
                 results_list = []
                 progress_bar = st.progress(0)
                 status_text = st.empty()
@@ -3442,13 +3447,15 @@ if cycles is not None and fluorescence is not None:
 
             # Persist to disk so results survive session resets
             # Collect fluorescence data for no-signal wells
-            _ns_fluor_save = {}
+            # Start with the early save (line ~1922) so we never clobber it
+            _ns_fluor_save = dict(st.session_state.get('batch_no_signal_fluor', {}))
             _all_src = all_samples if not _is_resuming else {}
             for _ns_key in no_signal_samples:
-                if _ns_key in _all_src:
-                    _ns_fluor_save[_ns_key] = _all_src[_ns_key]
-                elif _ns_key in st.session_state.get('upload_batch_samples', {}):
-                    _ns_fluor_save[_ns_key] = st.session_state['upload_batch_samples'][_ns_key]
+                if _ns_key not in _ns_fluor_save:
+                    if _ns_key in _all_src:
+                        _ns_fluor_save[_ns_key] = _all_src[_ns_key]
+                    elif _ns_key in st.session_state.get('upload_batch_samples', {}):
+                        _ns_fluor_save[_ns_key] = st.session_state['upload_batch_samples'][_ns_key]
             st.session_state['batch_no_signal_fluor'] = _ns_fluor_save
             _save_results_to_disk(
                 results_df, results_list,
@@ -3807,14 +3814,22 @@ if 'batch_results' in st.session_state:
                 _arr = np.asarray(_wd)
                 if _arr.ndim >= 1:
                     _input_data[_wn] = _arr[:len(_xl_cycles)]
-            # Include no-signal wells from upload source if available
-            _xl_upload_samples = st.session_state.get('upload_batch_samples', {})
-            _xl_no_signal_keys = st.session_state.get('batch_no_signal_samples', {})
-            for _ns_name in _xl_no_signal_keys:
-                if _ns_name not in _input_data and _ns_name in _xl_upload_samples:
-                    _arr = np.asarray(_xl_upload_samples[_ns_name])
-                    if _arr.ndim >= 1:
-                        _input_data[_ns_name] = _arr[:len(_xl_cycles)]
+            # Include no-signal wells from saved fluor or upload source
+            try:
+                _xl_ns_fluor = st.session_state.get('batch_no_signal_fluor', {})
+                _xl_upload_samples = st.session_state.get('upload_batch_samples', {})
+                _xl_no_signal_keys = st.session_state.get('batch_no_signal_samples', {})
+                for _ns_name in _xl_no_signal_keys:
+                    if _ns_name not in _input_data:
+                        _ns_src = _xl_ns_fluor.get(_ns_name)
+                        if _ns_src is None:
+                            _ns_src = _xl_upload_samples.get(_ns_name)
+                        if _ns_src is not None:
+                            _arr = np.asarray(_ns_src)
+                            if _arr.ndim >= 1:
+                                _input_data[_ns_name] = _arr[:len(_xl_cycles)]
+            except Exception:
+                pass  # export proceeds without no-signal wells in Input Data
             # Also check results_list for fluor_data of wells not yet included
             _xl_results_list = st.session_state.get('batch_results_list', [])
             for _rl in _xl_results_list:
