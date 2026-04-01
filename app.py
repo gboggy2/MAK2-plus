@@ -1143,13 +1143,44 @@ elif data_source == "Load Previous Results":
                                 _prev_meta[_wk] = _md
 
                     # ── No Signal samples ──
+                    _prev_no_signal_fluor = {}
                     if 'No Signal Samples' in _prev_sheets:
                         _ns_df = _prev_sheets['No Signal Samples']
                         if 'Sample' in _ns_df.columns:
                             for _, _nsr in _ns_df.iterrows():
                                 _ns_name = str(_nsr['Sample'])
+                                # Store fluor data separately
                                 if _ns_name in _prev_all_samples:
-                                    _prev_no_signal[_ns_name] = _prev_all_samples.pop(_ns_name)
+                                    _prev_no_signal_fluor[_ns_name] = _prev_all_samples.pop(_ns_name)
+                                # Build metadata dict from the No Signal sheet columns
+                                _ns_meta = {}
+                                if 'Reason' in _ns_df.columns and pd.notna(_nsr.get('Reason')):
+                                    _ns_meta['reason'] = str(_nsr['Reason'])
+                                if 'Fluorescence Range' in _ns_df.columns and pd.notna(_nsr.get('Fluorescence Range')):
+                                    try:
+                                        _ns_meta['F_range'] = float(_nsr['Fluorescence Range'])
+                                    except (ValueError, TypeError):
+                                        _ns_meta['F_range'] = 0.0
+                                if '% of Max on Plate' in _ns_df.columns and pd.notna(_nsr.get('% of Max on Plate')):
+                                    try:
+                                        _ns_meta['F_range_pct'] = float(str(_nsr['% of Max on Plate']).rstrip('%'))
+                                    except (ValueError, TypeError):
+                                        _ns_meta['F_range_pct'] = 0.0
+                                # Also check alternate column names (Range, % of Max) from older exports
+                                if 'F_range' not in _ns_meta and 'Range' in _ns_df.columns:
+                                    try:
+                                        _ns_meta['F_range'] = float(_nsr.get('Range', 0))
+                                    except (ValueError, TypeError):
+                                        pass
+                                if 'F_range_pct' not in _ns_meta and '% of Max' in _ns_df.columns:
+                                    try:
+                                        _ns_meta['F_range_pct'] = float(str(_nsr.get('% of Max', '0')).rstrip('%'))
+                                    except (ValueError, TypeError):
+                                        pass
+                                _ns_meta.setdefault('reason', 'No signal detected')
+                                _ns_meta.setdefault('F_range', 0.0)
+                                _ns_meta.setdefault('F_range_pct', 0.0)
+                                _prev_no_signal[_ns_name] = _ns_meta
 
                     # ── Rebuild results_list with fluor_data ──
                     _prev_results_list = []
@@ -1158,8 +1189,8 @@ elif data_source == "Load Previous Results":
                         _sn = _rd.get('Sample', '')
                         if _sn in _prev_all_samples:
                             _rd['fluor_data'] = _prev_all_samples[_sn]
-                        elif _sn in _prev_no_signal:
-                            _rd['fluor_data'] = _prev_no_signal[_sn]
+                        elif _sn in _prev_no_signal_fluor:
+                            _rd['fluor_data'] = _prev_no_signal_fluor[_sn]
                         else:
                             _rd['fluor_data'] = None
                         _prev_results_list.append(_rd)
@@ -1169,6 +1200,7 @@ elif data_source == "Load Previous Results":
                     st.session_state['batch_results_list'] = _prev_results_list
                     st.session_state['batch_all_samples'] = _prev_all_samples
                     st.session_state['batch_no_signal_samples'] = _prev_no_signal
+                    st.session_state['batch_no_signal_fluor'] = _prev_no_signal_fluor
                     if _prev_cycles is not None:
                         st.session_state['batch_cycles'] = _prev_cycles
                     if _prev_settings:
@@ -1875,8 +1907,8 @@ if cycles is not None and fluorescence is not None:
                             {
                                 'Sample': name,
                                 'Reason': info['reason'],
-                                'Range': f"{info['F_range']:.4f}",
-                                '% of Max': f"{info['F_range_pct']:.1f}%"
+                                'Fluorescence Range': f"{info['F_range']:.4f}",
+                                '% of Max on Plate': f"{info['F_range_pct']:.1f}%"
                             }
                             for name, info in no_signal_samples.items()
                         ])
