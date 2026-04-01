@@ -4970,7 +4970,66 @@ if 'batch_results_list' in st.session_state and 'batch_all_samples' in st.sessio
 
     except Exception as e:
         st.error(f"Could not visualize fit: {str(e)}")
-    
+
+# ── Visualize skipped (no-signal) wells ──────────────────────────────────
+if ('batch_no_signal_samples' in st.session_state
+        and st.session_state['batch_no_signal_samples']
+        and 'batch_cycles' in st.session_state):
+    _ns_samples = st.session_state['batch_no_signal_samples']
+    _ns_cycles = st.session_state['batch_cycles']
+    # Collect fluorescence data for skipped wells
+    _ns_fluor = {}
+    _ns_upload = st.session_state.get('upload_batch_samples', {})
+    _ns_results_list = st.session_state.get('batch_results_list', [])
+    for _ns_name in _ns_samples:
+        if _ns_name in _ns_upload:
+            _ns_fluor[_ns_name] = np.asarray(_ns_upload[_ns_name])
+        else:
+            # Try results_list fluor_data
+            for _rl in _ns_results_list:
+                if _rl.get('Sample') == _ns_name and _rl.get('fluor_data') is not None:
+                    _ns_fluor[_ns_name] = np.asarray(_rl['fluor_data'])
+                    break
+    if _ns_fluor:
+        st.markdown("---")
+        st.subheader("🚫 Visualize Skipped Wells (No Signal)")
+        _ns_names = list(_ns_fluor.keys())
+        _ns_selected = st.selectbox(
+            "Select skipped well to visualize:",
+            _ns_names,
+            key="ns_viz_selector",
+        )
+        _ns_info = _ns_samples.get(_ns_selected, {})
+        _ns_reason = _ns_info.get('reason', 'No signal detected') if isinstance(_ns_info, dict) else 'No signal detected'
+        st.caption(f"Skip reason: {_ns_reason}")
+
+        _ns_fd = _ns_fluor[_ns_selected]
+        _ns_cyc = _ns_cycles[:len(_ns_fd)]
+
+        _ns_fig = go.Figure()
+        _ns_fig.add_trace(go.Scatter(
+            x=_ns_cyc, y=_ns_fd,
+            mode='markers+lines',
+            name='Data',
+            marker=dict(size=6, color='blue', opacity=0.6),
+            line=dict(color='blue', width=1, dash='dot'),
+        ))
+        _ns_fig.update_layout(
+            title=f"<span style='color:gray'>SKIPPED</span> — {_ns_selected}",
+            xaxis_title="Cycle",
+            yaxis_title="Fluorescence",
+            height=400,
+            showlegend=True,
+        )
+        st.plotly_chart(_ns_fig, use_container_width=True)
+
+        # Show basic stats
+        _ns_c1, _ns_c2, _ns_c3 = st.columns(3)
+        _ns_c1.metric("Range", f"{float(np.max(_ns_fd) - np.min(_ns_fd)):.4f}")
+        _ns_bl_sd = float(np.std(_ns_fd[:min(12, len(_ns_fd) // 4)])) if len(_ns_fd) >= 12 else float(np.std(_ns_fd))
+        _ns_c2.metric("Baseline SD", f"{_ns_bl_sd:.4f}")
+        _ns_range_ratio = float(np.max(_ns_fd) - np.min(_ns_fd)) / _ns_bl_sd if _ns_bl_sd > 0 else 0
+        _ns_c3.metric("Range / Baseline SD", f"{_ns_range_ratio:.1f}×")
 
 
 if 'fitted_params' in st.session_state:
