@@ -61,14 +61,20 @@ def build_standard_curve(
             per_point_data, warnings
         Returns None if < 2 concentration levels or no valid standards.
     """
-    if not sample_metadata:
-        return None
-
-    # 1. Identify standard wells
+    # 1. Identify standard wells from metadata
     standard_wells = {}
-    for well, meta in sample_metadata.items():
+    for well, meta in (sample_metadata or {}).items():
         if meta.get('Task') == 'STANDARD' and meta.get('Quantity') is not None:
             standard_wells[well] = meta['Quantity']
+
+    # Also check results_df columns (Task/Known_Copies from EDS Sample Setup)
+    if 'Task' in results_df.columns and 'Known_Copies' in results_df.columns:
+        for _, row in results_df.iterrows():
+            well = row.get('Sample', '')
+            if well and well not in standard_wells and row.get('Task') == 'STANDARD':
+                qty = row.get('Known_Copies')
+                if pd.notna(qty) and float(qty) > 0:
+                    standard_wells[well] = float(qty)
 
     if len(standard_wells) < 2:
         return None
@@ -226,28 +232,44 @@ def build_ct_standard_curve(
         Calibration dict with slope, intercept, r_squared, efficiency,
         per_point_data, replicate_variance, warnings, etc.
     """
-    if not sample_metadata:
-        return None
     if 'Ct' not in results_df.columns:
         return None
 
-    # 1. Identify standard wells
+    # 1. Identify standard wells from metadata
     standard_wells = {}
-    for well, meta in sample_metadata.items():
+    for well, meta in (sample_metadata or {}).items():
         if meta.get('Task') == 'STANDARD' and meta.get('Quantity') is not None:
             standard_wells[well] = meta['Quantity']
+
+    # Also check results_df columns (Task/Known_Copies from EDS Sample Setup)
+    if 'Task' in results_df.columns and 'Known_Copies' in results_df.columns:
+        for _, row in results_df.iterrows():
+            well = row.get('Sample', '')
+            if well and well not in standard_wells and row.get('Task') == 'STANDARD':
+                qty = row.get('Known_Copies')
+                if pd.notna(qty) and float(qty) > 0:
+                    standard_wells[well] = float(qty)
 
     if len(standard_wells) < 2:
         return None
 
-    # 2. Match to results_df
+    # 2. Match to results_df — prefer instrument Ct for fair comparison
+    _used_instrument_ct = 0
+    _used_fitted_ct = 0
     points = []
     for well, copies in standard_wells.items():
         match = results_df[results_df['Sample'] == well]
         if len(match) == 0:
             continue
         row = match.iloc[0]
-        ct_val = row.get('Ct', np.nan)
+        # Prefer instrument Ct from metadata; fall back to app-calculated Ct
+        _well_meta = (sample_metadata or {}).get(well, {})
+        ct_val = _well_meta.get('Ct_instrument', None)
+        if ct_val is not None and not (isinstance(ct_val, float) and np.isnan(ct_val)) and ct_val > 0:
+            _used_instrument_ct += 1
+        else:
+            ct_val = row.get('Ct', np.nan)
+            _used_fitted_ct += 1
         if pd.isna(ct_val) or ct_val <= 0:
             continue
         success = str(row.get('Success', ''))
@@ -336,6 +358,14 @@ def build_ct_standard_curve(
             f"High Ct replicate variability (pooled CV = {pooled_cv:.1f}%)."
         )
 
+    # Determine Ct source label
+    if _used_instrument_ct > 0 and _used_fitted_ct == 0:
+        _ct_source = 'Instrument'
+    elif _used_instrument_ct == 0:
+        _ct_source = 'MAK2+ (calculated)'
+    else:
+        _ct_source = f'Mixed ({_used_instrument_ct} instrument, {_used_fitted_ct} calculated)'
+
     return {
         'slope': slope,
         'intercept': intercept,
@@ -348,6 +378,7 @@ def build_ct_standard_curve(
         'n_standards': len(points_df),
         'n_concentrations': len(unique_copies),
         'per_point_data': points_df,
+        'ct_source': _ct_source,
         'warnings': warnings,
     }
 

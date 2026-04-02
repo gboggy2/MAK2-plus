@@ -4088,9 +4088,11 @@ if 'batch_results' in st.session_state:
                         f"**log\u2081\u2080(copies) = {ct_calibration['slope']:.4f} \u00d7 Ct "
                         f"+ {ct_calibration['intercept']:.4f}**"
                     )
+                    _ct_src = ct_calibration.get('ct_source', 'MAK2+ (calculated)')
                     st.caption(
                         f"Standards: {ct_calibration['n_standards']} wells, "
-                        f"{ct_calibration['n_concentrations']} levels"
+                        f"{ct_calibration['n_concentrations']} levels  \n"
+                        f"Ct source: {_ct_src}"
                     )
                     if not np.isnan(ct_calibration['pooled_replicate_cv']):
                         st.caption(
