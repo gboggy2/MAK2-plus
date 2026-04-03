@@ -1394,15 +1394,14 @@ class MAK2Optimizer:
                 lhs_scores_5d = []
                 for i in range(n_lhs_fallback):
                     try:
-                        _, _, predicted_F = self.model.simulate_cycles(
+                        predicted = self.model.simulate_to_cycle(
                             D0=D0_lhs_5d[i],
                             k=k_lhs_5d[i],
                             P0=P0_lhs_5d[i],
-                            n_cycles=len(cycles_fit),
+                            cycles=cycles_fit,
                             F_bg_intercept=F_bg_int_lhs_5d[i],
                             F_bg_slope=F_bg_slope_lhs_5d[i]
                         )
-                        predicted = np.interp(cycles_fit, np.arange(len(predicted_F)), predicted_F)
                         ssr = np.sum((fluorescence_fit - predicted)**2)
                         lhs_scores_5d.append((ssr, i))
                     except:
@@ -1834,27 +1833,15 @@ class MAK2Optimizer:
             F_bg_slope_init = np.clip(F_bg_slope_init, bounds['F_bg_slope'][0], bounds['F_bg_slope'][1])
         else:
             # Random initial guess within bounds
-            # For D0, bias toward lower bound (perfect doubling estimate) when bounds are wide
-            D0_range_log = np.log10(bounds['D0'][1]) - np.log10(bounds['D0'][0])
-            
-            if D0_range_log > 5:  # Very wide bounds (>100,000x range)
-                # Strongly bias toward lower bound (perfect doubling)
-                # Sample from lower 25% of range in log space
-                log_D0_lower = np.log10(bounds['D0'][0])
-                log_D0_upper = log_D0_lower + D0_range_log * 0.25
-                D0_init = 10**(np.random.uniform(log_D0_lower, log_D0_upper))
-            elif D0_range_log > 3:  # Wide bounds (>1000x range)
-                # Moderately bias toward lower bound
-                # Sample from lower 50% of range in log space
-                log_D0_lower = np.log10(bounds['D0'][0])
-                log_D0_upper = log_D0_lower + D0_range_log * 0.5
-                D0_init = 10**(np.random.uniform(log_D0_lower, log_D0_upper))
-            else:  # Narrow bounds
-                # Use full range (original behavior)
-                D0_init = 10**(np.random.uniform(
-                    np.log10(bounds['D0'][0]), 
-                    np.log10(bounds['D0'][1])
-                ))
+            # Sample D0 uniformly in log space across the full range.
+            # Early-Ct wells need D0 ≈ 1e-5 while late-Ct wells need
+            # D0 ≈ 1e-12; biasing toward either end misses the other.
+            # The multi-start approach (multiple seeds) and LHS tiers
+            # ensure sufficient exploration across the full range.
+            D0_init = 10**(np.random.uniform(
+                np.log10(bounds['D0'][0]),
+                np.log10(bounds['D0'][1])
+            ))
             
             # Use LHS samples if provided, otherwise use the D0_init from above
             D0_init = lhs_D0 if lhs_D0 is not None else D0_init

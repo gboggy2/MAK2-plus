@@ -2659,7 +2659,7 @@ if cycles is not None and fluorescence is not None:
                 if _r2_i is not None and _r2_i < 0.90:
                     # Don't skip late amplifiers — they can be rescued
                     _fe_i = results_list[i].get('fit_end_cycle')
-                    _is_late_i = (_fe_i is not None and _fe_i >= _last_cycle - max(1, cycles_after_max))
+                    _is_late_i = (_fe_i is not None and _fe_i >= _last_cycle - min(max(1, cycles_after_max), 5))
                     if not _is_late_i:
                         retry_indices.discard(i)
                         _skip_count += 1
@@ -2689,7 +2689,7 @@ if cycles is not None and fluorescence is not None:
                     # the last cycle, use a shorter timeout since 0.995 is acceptable.
                     _pass1_late = (
                         result.get('fit_end_cycle') is not None
-                        and result['fit_end_cycle'] >= float(cycles[-1]) - max(1, cycles_after_max)
+                        and result['fit_end_cycle'] >= float(cycles[-1]) - min(max(1, cycles_after_max), 5)
                     )
                     _RETRY_TIMEOUT = 10.0 if _pass1_late else 30.0
                     sample_name = result['Sample']
@@ -2932,7 +2932,7 @@ if cycles is not None and fluorescence is not None:
                         # Always target 0.999 during retries — only relax to
                         # 0.995 for late amplifiers at the final acceptance step
                         # (after all retry attempts including extended baseline).
-                        _retry_is_late = (_fit_end_cycle_r >= _last_cyc - max(1, cycles_after_max))
+                        _retry_is_late = (_fit_end_cycle_r >= _last_cyc - min(max(1, cycles_after_max), 5))
                         _r2_target = 0.999
 
                         # Recalculate Ct — reuse the metadata baseline window
@@ -3214,7 +3214,7 @@ if cycles is not None and fluorescence is not None:
                             _orig_fe = result.get('fit_end_cycle')
                             _orig_late = (_orig_fe is not None and
                                           not (isinstance(_orig_fe, float) and np.isnan(_orig_fe)) and
-                                          float(_orig_fe) >= _last_cyc - max(1, cycles_after_max))
+                                          float(_orig_fe) >= _last_cyc - min(max(1, cycles_after_max), 5))
                             _orig_r2_thr = 0.995 if _orig_late else 0.999
                             if orig_r2 is not None and orig_r2 >= _orig_r2_thr:
                                 results_list[idx]['Success'] = '✓'
@@ -3263,7 +3263,7 @@ if cycles is not None and fluorescence is not None:
                 _pf_is_late = (
                     _pf_fe_g0 is not None
                     and not (isinstance(_pf_fe_g0, float) and np.isnan(_pf_fe_g0))
-                    and _pf_fe_g0 >= float(cycles[-1]) - max(1, cycles_after_max)
+                    and _pf_fe_g0 >= float(cycles[-1]) - min(max(1, cycles_after_max), 5)
                 )
 
                 # Gate 0: poor R² — a MAK2 sigmoid+linear-background model
