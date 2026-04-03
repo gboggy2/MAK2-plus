@@ -267,9 +267,21 @@ class MAK2Optimizer:
                 bounds = default_bounds
                 self.analytical_estimates = None
         else:
-            # User provided custom bounds - don't use analytical estimation
+            # User provided custom D0 bounds — keep them, but still run
+            # analytical estimation for INITIAL GUESSES (not bounds).
+            # Without this, seed=1 in _fit_attempt falls through to random
+            # init, missing the exponential-phase D0/k estimate that is
+            # critical for convergence on both early-Ct and late-Ct wells.
+            try:
+                estimates, _ = estimate_MAK2_params_from_exponential(
+                    cycles_fit, fluorescence_fit,
+                    P0_assumed=1.0,
+                    verbose=verbose
+                )
+                self.analytical_estimates = estimates
+            except Exception:
+                self.analytical_estimates = None
             # Ensure all required bounds are present
-            self.analytical_estimates = None
             if 'k' not in bounds:
                 bounds['k'] = (0.05, 1.2)  # Realistic qPCR range with some flexibility
             if 'P0' not in bounds:

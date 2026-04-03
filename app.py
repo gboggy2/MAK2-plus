@@ -2646,17 +2646,17 @@ if cycles is not None and fluorescence is not None:
                     except Exception:
                         pass
 
-            # ── Skip retries for truly hopeless wells (R² < 0.90) ──
-            # Wells with R² 0.90-0.99 are worth retrying — higher-tier
+            # ── Skip retries for truly hopeless wells (R² < 0.85) ──
+            # Wells with R² 0.85-0.99 are worth retrying — higher-tier
             # optimizers (T2-LHS, T3-DE) frequently push them above 0.99.
-            # Wells below 0.90 are noise/drift with no chance of recovery,
+            # Wells below 0.85 are noise/drift with no chance of recovery,
             # UNLESS they are late amplifiers — those benefit from analytical
             # exponential priors in the retry path.
             _last_cycle = float(cycles[-1])
             _skip_count = 0
             for i in list(retry_indices):
                 _r2_i = results_list[i].get('R2')
-                if _r2_i is not None and _r2_i < 0.90:
+                if _r2_i is not None and _r2_i < 0.85:
                     # Don't skip late amplifiers — they can be rescued
                     _fe_i = results_list[i].get('fit_end_cycle')
                     _is_late_i = (_fe_i is not None and _fe_i >= _last_cycle - min(max(1, cycles_after_max), 5))
@@ -3271,9 +3271,11 @@ if cycles is not None and fluorescence is not None:
                 # must be well above that.  All legitimate amplifications on
                 # real qPCR data give R² ≥ 0.996; 0.99 provides margin.
                 # Late amplifiers (fit extends to last cycle) get a relaxed
-                # threshold of 0.90 because incomplete S-curves inherently
+                # threshold of 0.85 because incomplete S-curves inherently
                 # have lower R² — the linear-vs-MAK2 gate catches drift.
-                _pf_r2_thresh = 0.90 if _pf_is_late else 0.99
+                # 0.85 accommodates very late amplifiers where only the
+                # exponential rise is captured without any plateau.
+                _pf_r2_thresh = 0.85 if _pf_is_late else 0.99
                 if _pf_r2 is not None and _pf_r2 < _pf_r2_thresh:
                     _pf_reject = True
                     _pf_reason = f'R\u00b2 = {_pf_r2:.4f} < {_pf_r2_thresh}'
