@@ -421,17 +421,17 @@ class MAK2Optimizer:
                     }
 
                     # Calculate SSR for this guess
-                    _, _, predicted_F = self.model.simulate_cycles(
+                    # Use simulate_to_cycle (not simulate_cycles) so predictions
+                    # align with actual cycle numbers, not 0-indexed offsets.
+                    predicted_fit = self.model.simulate_to_cycle(
                         D0=test_params['D0'],
                         k=test_params['k'],
                         P0=test_params['P0'],
-                        n_cycles=len(cycles_fit),
+                        cycles=cycles_fit,
                         F_bg_intercept=test_params['F_bg_intercept'],
                         F_bg_slope=test_params['F_bg_slope']
                     )
 
-                    # Interpolate to data cycles
-                    predicted_fit = np.interp(cycles_fit, np.arange(len(predicted_F)), predicted_F)
                     ssr = np.sum((fluorescence_fit - predicted_fit) ** 2)
 
                     lhs_scores.append((ssr, i, d0, k, p0))
