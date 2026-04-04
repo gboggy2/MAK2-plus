@@ -281,6 +281,42 @@ class MAK2Optimizer:
                 self.analytical_estimates = estimates
             except Exception:
                 self.analytical_estimates = None
+
+            # Heuristic fallback: if analytical estimation failed, estimate
+            # D0 from the sigmoid shape.  For a standard qPCR curve the
+            # signal rises from baseline to plateau over ~10 doublings, so
+            # D0 ≈ F_range / 2^(midpoint_cycle - first_cycle).
+            # This gives seed=1 a fighting chance instead of random init.
+            if self.analytical_estimates is None and len(cycles_fit) >= 5:
+                try:
+                    _F_max = float(np.max(fluorescence_fit))
+                    _F_min = float(np.min(fluorescence_fit))
+                    _F_range = _F_max - _F_min
+                    _F_mid = (_F_max + _F_min) / 2.0
+                    # Find the cycle closest to the midpoint fluorescence
+                    _mid_idx = int(np.argmin(np.abs(fluorescence_fit - _F_mid)))
+                    _mid_cycle = float(cycles_fit[_mid_idx])
+                    _first_cycle = float(cycles_fit[0])
+                    _n_doublings = _mid_cycle - _first_cycle
+                    if _n_doublings > 0 and _F_range > 0:
+                        _D0_est = _F_range / (2.0 ** _n_doublings)
+                        # Reasonable k and P0 from data
+                        _k_est = 0.3  # typical qPCR efficiency
+                        _P0_est = _F_range * 1.5  # primer > signal range
+                        self.analytical_estimates = {
+                            'D0': np.clip(_D0_est, bounds['D0'][0], bounds['D0'][1]),
+                            'k': np.clip(_k_est, bounds.get('k', (0.05, 1.2))[0],
+                                         bounds.get('k', (0.05, 1.2))[1]),
+                            'P0': np.clip(_P0_est, bounds.get('P0', (0.05, 10))[0],
+                                          bounds.get('P0', (0.05, 10))[1]),
+                            'F_bg_intercept': _F_min,
+                            'F_bg_slope': 0.0,
+                        }
+                        print(f"  📐 Heuristic D0 estimate: {_D0_est:.2e} "
+                              f"(midpoint at cycle {_mid_cycle:.0f}, "
+                              f"{_n_doublings:.0f} doublings from start)")
+                except Exception:
+                    pass  # heuristic failed, fall back to LHS
             # Ensure all required bounds are present
             if 'k' not in bounds:
                 bounds['k'] = (0.05, 1.2)  # Realistic qPCR range with some flexibility
@@ -392,6 +428,18 @@ class MAK2Optimizer:
                 k_lhs[0] = original_bounds['k'][0] + 0.1 * (original_bounds['k'][1] - original_bounds['k'][0])  # 10% into k range (low k)
                 P0_lhs[0] = original_bounds['P0'][0] + 0.85 * (original_bounds['P0'][1] - original_bounds['P0'][0])  # 85% into P0 range (high P0)
                 print(f"📍 Biased attempt 2 toward high-P0 low-k upper-D0 corner for maximum plateau")
+
+            # Override attempt 3 with heuristic D0 estimate if available.
+            # This ensures the LHS pool always includes at least one sample
+            # near the sigmoid-derived D0, even if analytical estimation failed.
+            if (n_lhs_samples >= 2
+                    and hasattr(self, 'analytical_estimates')
+                    and self.analytical_estimates is not None):
+                D0_lhs[1] = self.analytical_estimates['D0']
+                k_lhs[1] = self.analytical_estimates['k']
+                P0_lhs[1] = self.analytical_estimates['P0']
+                print(f"📍 Biased attempt 3 toward analytical/heuristic estimate: "
+                      f"D0={D0_lhs[1]:.2e}, k={k_lhs[1]:.4f}, P0={P0_lhs[1]:.2e}")
 
             # Evaluate all LHS samples to find best starting points
             # This is the key to escaping local minima: we test many points
