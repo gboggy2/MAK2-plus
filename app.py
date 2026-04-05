@@ -2269,6 +2269,23 @@ if cycles is not None and fluorescence is not None:
                     _max_slope_idx = _floor_idx + _max_slope_offset
                     fit_start_idx  = max(_floor_idx, _max_slope_idx - cycles_before_max)
 
+                    # ── Smart-start diagnostic (always printed) ────────────────────
+                    _ss_max_slope_cycle = float(cycles[min(_max_slope_idx, len(cycles)-1)])
+                    _ss_fit_start_cycle = float(cycles[min(fit_start_idx, len(cycles)-1)])
+                    _ss_total_range = float(np.max(fluor_data) - np.min(fluor_data))
+                    _ss_window_range = float(np.max(fluor_data[fit_start_idx:]) - np.min(fluor_data[fit_start_idx:]))
+                    print(f"  [{sample_name}] smart-start: inflection=cycle {_ss_max_slope_cycle:.0f}, "
+                          f"fit_start=cycle {_ss_fit_start_cycle:.0f}, "
+                          f"found_peak={'_found_peak' in dir() and _found_peak}, "
+                          f"cbm={cycles_before_max}")
+                    print(f"    total_range={_ss_total_range:.0f}, window_range={_ss_window_range:.0f}, "
+                          f"ratio={_ss_window_range/_ss_total_range*100:.1f}%")
+                    # If the fit window captures <50% of the total range, the window
+                    # likely missed the sigmoid — flag it
+                    if _ss_window_range < 0.5 * _ss_total_range:
+                        print(f"    ⚠️  Window captures only {_ss_window_range/_ss_total_range*100:.1f}% "
+                              f"of total signal range — sigmoid may be excluded!")
+
                     # ── Background pre-estimation ──────────────────────────────────
                     # Use purely pre-window cycles for background regression to
                     # avoid amplification contamination.
@@ -2335,6 +2352,29 @@ if cycles is not None and fluorescence is not None:
                     # data where baseline SD is large due to instrument noise.
 
                     _F_range     = float(np.max(fluor_fit) - np.min(fluor_fit))
+
+                    # ── Safety: detect if smart-start missed the sigmoid ───────────
+                    # If the fit window captures < 50% of the total signal range,
+                    # the sigmoid is likely excluded.  Fall back to fitting from
+                    # the floor cycle onward so the exponential rise is included.
+                    _total_range = float(np.max(fluor_data) - np.min(fluor_data))
+                    if _total_range > 0 and _F_range < 0.5 * _total_range:
+                        print(f"    ⚠️  [{sample_name}] Smart-start window captures only "
+                              f"{_F_range/_total_range*100:.1f}% of signal range — "
+                              f"resetting fit_start to floor (cycle {float(cycles[_floor_idx]):.0f})")
+                        fit_start_idx = _floor_idx
+                        cycles_fit    = cycles[fit_start_idx:]
+                        fluor_fit     = fluor_data[fit_start_idx:]
+                        _F_range      = float(np.max(fluor_fit) - np.min(fluor_fit))
+                        # Recompute background from pre-window or first few cycles
+                        _bg_pre_start = _floor_idx
+                        _bg_c = cycles[_bg_pre_start:_bg_pre_start + 8]
+                        _bg_f = fluor_data[_bg_pre_start:_bg_pre_start + 8]
+                        if len(_bg_c) >= 2:
+                            _bg_coeffs    = np.polyfit(_bg_c, _bg_f, 1)
+                            _bg_slope_est = float(_bg_coeffs[0])
+                            _bg_int_est   = float(_bg_coeffs[1])
+
                     # Build symmetric bounds around the linear-regression values
                     # so that fix_background=True fixes them at the regression fit.
                     _slope_delta = max(abs(_bg_slope_est) * 0.40, _F_range * 0.002)
@@ -2360,6 +2400,13 @@ if cycles is not None and fluorescence is not None:
                     _non_bg_bounds = {k: v for k, v in (fit_bounds or {}).items()
                                       if k not in ('F_bg_slope', 'F_bg_intercept')}
                     _merged_bounds = {**_bg_bounds, **_non_bg_bounds}
+
+                    # Diagnostic: trace D0 bounds origin if they seem wrong
+                    if _merged_bounds['D0'][1] < 1.0:
+                        print(f"    ⚠️  [{sample_name}] D0 upper bound is {_merged_bounds['D0'][1]:.2e} "
+                              f"(< 1.0) — _F_range={_F_range:.0f}, "
+                              f"_bg_bounds_D0={_bg_bounds['D0']}, "
+                              f"_non_bg_has_D0={'D0' in _non_bg_bounds}")
 
                     params_batch = optimizer_batch.fit(
                         cycles_fit,
