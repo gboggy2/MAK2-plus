@@ -233,7 +233,7 @@ For each sample:
 
      Build channel-informed bounds:
        bg: prefer per-well estimate (+/-40%), fallback channel median (+/-300%)
-       k:  (max(0.05, prior_k*0.20), min(1.0, max(0.5, prior_k*5.0)))
+       k:  (max(0.01, prior_k*0.20), min(1.0, max(0.5, prior_k*5.0)))
        P0: (max(prior*0.05, F_range*0.01), max(prior*7.0, F_range*2.0))
        D0: (1e-15, F_range*10) initially, then (1e-8, F_range) after bg estimation
 

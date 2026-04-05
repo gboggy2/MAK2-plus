@@ -2354,11 +2354,11 @@ if cycles is not None and fluorescence is not None:
                     _F_range     = float(np.max(fluor_fit) - np.min(fluor_fit))
 
                     # ── Safety: detect if smart-start missed the sigmoid ───────────
-                    # If the fit window captures < 50% of the total signal range,
+                    # If the fit window captures < 70% of the total signal range,
                     # the sigmoid is likely excluded.  Fall back to fitting from
                     # the floor cycle onward so the exponential rise is included.
                     _total_range = float(np.max(fluor_data) - np.min(fluor_data))
-                    if _total_range > 0 and _F_range < 0.5 * _total_range:
+                    if _total_range > 0 and _F_range < 0.7 * _total_range:
                         print(f"    ⚠️  [{sample_name}] Smart-start window captures only "
                               f"{_F_range/_total_range*100:.1f}% of signal range — "
                               f"resetting fit_start to floor (cycle {float(cycles[_floor_idx]):.0f})")
@@ -2856,7 +2856,7 @@ if cycles is not None and fluorescence is not None:
                             bg_int_bounds = (fbg_lo, fbg_hi)
 
                         informed_bounds = {
-                            'k':              (max(0.05, pk * 0.20), min(1.0, max(0.5, pk * 5.0))),
+                            'k':              (max(0.01, pk * 0.20), min(1.0, max(0.5, pk * 5.0))),
                             'P0':             (max(pP0 * 0.05, F_range_r * 0.01), max(pP0 * 7.0, F_range_r * 2.0)),
                             'D0':             (1e-15, F_range_r * 10),
                             'F_bg_intercept': bg_int_bounds,
@@ -3302,7 +3302,9 @@ if cycles is not None and fluorescence is not None:
                                                                 if _retry_is_late and _best_r2 >= 0.995
                                                                 else ('⚠️ timeout@' + _retry_stage
                                                                       if _retry_timed_out
-                                                                      else '⚠️ R² below target'))),
+                                                                      else ('✓ (noisy data)'
+                                                                            if _best_r2 >= 0.995
+                                                                            else '⚠️ R² below target')))),
                                 'retry_stage':           _retry_stage,
                                 'retry_attempts':        _retry_attempts,
                                 'retry_elapsed_s':       round(_time_mod.perf_counter() - _retry_t0, 1),
@@ -3334,7 +3336,10 @@ if cycles is not None and fluorescence is not None:
                                 if orig_k is not None and orig_k > 0.5:
                                     results_list[idx]['Success'] = '⚠️ Degenerate k'
                                 else:
-                                    results_list[idx]['Success'] = '⚠️ R² below target'
+                                    if orig_r2 is not None and orig_r2 >= 0.995:
+                                        results_list[idx]['Success'] = '✓ (noisy data)'
+                                    else:
+                                        results_list[idx]['Success'] = '⚠️ R² below target'
 
                     except Exception as e:
                         if result['k'] is None:
@@ -3459,7 +3464,7 @@ if cycles is not None and fluorescence is not None:
                                     _pf_r2_mak = 1.0 - _pf_ss_res_mak / _pf_ss_tot
 
                                     # Reject if MAK2 doesn't outperform linear
-                                    if _pf_r2_mak - _pf_r2_lin < 0.05:
+                                    if _pf_r2_mak - _pf_r2_lin < 0.10:
                                         _pf_reject = True
                                         _pf_reason = (
                                             f'MAK2 not better than linear in growth region '

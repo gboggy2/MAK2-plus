@@ -243,7 +243,7 @@ class MAK2Optimizer:
 
                 default_bounds = {
                     'D0': (D0_lower, D0_upper),
-                    'k': (0.05, 1.2),  # Realistic qPCR range with some flexibility
+                    'k': (0.01, 1.2),  # Realistic qPCR range with some flexibility
                     'P0': (P0_lower, P0_upper),  # Data-driven bounds!
                     'F_bg_intercept': (
                         F_bg_est['intercept'] - F_bg_int_margin,  # Allow negative
@@ -319,7 +319,7 @@ class MAK2Optimizer:
                     pass  # heuristic failed, fall back to LHS
             # Ensure all required bounds are present
             if 'k' not in bounds:
-                bounds['k'] = (0.05, 1.2)  # Realistic qPCR range with some flexibility
+                bounds['k'] = (0.01, 1.2)  # Realistic qPCR range with some flexibility
             if 'P0' not in bounds:
                 # Set P0 bounds from maximum fluorescence
                 F_max = np.max(fluorescence_fit)
@@ -982,7 +982,7 @@ class MAK2Optimizer:
                     D0_new_upper = D0_old_upper * 2.0
                     D0_sample_range = (0.3, 0.7)
 
-                    k_new_lower = max(0.05, k_old_lower * 0.7)
+                    k_new_lower = max(0.01, k_old_lower * 0.7)
                     k_new_upper = k_old_upper
                     k_sample_range = (0.1, 0.5)
 
@@ -1065,7 +1065,7 @@ class MAK2Optimizer:
                     D0_sample_range = (0.3, 0.8)
 
                     # Sample k from very low range (2%-45%)
-                    k_new_lower = max(0.05, k_old_lower * 0.5)
+                    k_new_lower = max(0.01, k_old_lower * 0.5)
                     k_new_upper = k_old_upper
                     k_sample_range = (0.02, 0.45)
 
@@ -1114,7 +1114,7 @@ class MAK2Optimizer:
                     D0_new_lower = D0_old_lower
                     D0_new_upper = D0_old_upper * 3.0
                     D0_sample_range = (0.3, 0.8)
-                    k_new_lower = max(0.05, k_old_lower * 0.5)
+                    k_new_lower = max(0.01, k_old_lower * 0.5)
                     k_new_upper = k_old_upper
                     k_sample_range = (0.02, 0.45)
                     P0_new_lower = P0_old_lower
@@ -1271,7 +1271,7 @@ class MAK2Optimizer:
             if is_low_template:
                 # For low-template wells: k should be small (0.02-0.2)
                 # Don't increase k bounds, just reset to reasonable range
-                bounds['k'] = (0.05, 0.5)  # Keep k modest but physiologically realistic
+                bounds['k'] = (0.01, 0.5)  # Keep k modest but physiologically realistic
                 
                 # For P0: check if this is high-plateau sample
                 # If F_max > 5, keep P0 upper bound high enough
@@ -1430,7 +1430,7 @@ class MAK2Optimizer:
                 print(f"   Widening bounds for better exploration...")
                 fallback_bounds = dict(bounds)
                 fallback_bounds['D0'] = (bounds['D0'][0], bounds['D0'][1] * 10)
-                fallback_bounds['k'] = (max(0.05, bounds['k'][0] / 10), bounds['k'][1])
+                fallback_bounds['k'] = (max(0.01, bounds['k'][0] / 10), bounds['k'][1])
                 fallback_bounds['P0'] = (bounds['P0'][0], bounds['P0'][1] * 2)
                 print(f"   D0: [{fallback_bounds['D0'][0]:.2e}, {fallback_bounds['D0'][1]:.2e}]")
                 print(f"   k: [{fallback_bounds['k'][0]:.4f}, {fallback_bounds['k'][1]:.4f}]")
@@ -1559,7 +1559,7 @@ class MAK2Optimizer:
                 # Use widened bounds for DE (or even wider)
                 de_bounds_widened = dict(bounds)
                 de_bounds_widened['D0'] = (bounds['D0'][0], bounds['D0'][1] * 20)  # 20x for DE
-                de_bounds_widened['k'] = (max(0.05, bounds['k'][0] / 20), bounds['k'][1])     # 20x wider but floor at 0.05
+                de_bounds_widened['k'] = (max(0.01, bounds['k'][0] / 20), bounds['k'][1])     # 20x wider but floor at 0.01
                 de_bounds_widened['P0'] = (bounds['P0'][0], bounds['P0'][1] * 3)   # 3x wider
 
                 de_params, de_r2 = self._fit_with_differential_evolution(
