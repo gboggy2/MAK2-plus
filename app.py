@@ -136,6 +136,23 @@ def _clear_checkpoint():
     except OSError:
         pass
 
+def _clear_all():
+    """Nuclear reset: clear ALL session state, caches, and checkpoints."""
+    # 1. Clear in-memory results store (survives session resets)
+    _results_store.clear()
+    # 2. Clear disk caches
+    _clear_checkpoint()
+    try:
+        path = _results_cache_path()
+        if os.path.exists(path):
+            os.unlink(path)
+    except OSError:
+        pass
+    # 3. Clear ALL session state except Streamlit internals
+    for key in list(st.session_state.keys()):
+        if not key.startswith('_streamlit'):
+            del st.session_state[key]
+
 def _save_results_to_disk(results_df, results_list, all_samples, no_signal_samples, cycles, settings, no_signal_fluor=None):
     """Persist batch results to both in-memory store and disk."""
     try:
@@ -491,6 +508,10 @@ Based on [Boggy & Woolf (2010)](https://doi.org/10.1371/journal.pone.0012355) wi
 
 # Sidebar for data input
 st.sidebar.header("Data Input")
+
+if st.sidebar.button("🗑️ Clear All & Start Over", help="Clear all data, results, metadata, and caches"):
+    _clear_all()
+    st.rerun()
 
 # Initialize example data loader (once)
 if 'example_loader' not in st.session_state:
@@ -1777,6 +1798,12 @@ if cycles is not None and fluorescence is not None:
 
             st.subheader("🔄 Batch Fitting Results")
 
+            # Capture stdout from optimizer for diagnostic display
+            import io as _io_batch
+            _batch_captured = _io_batch.StringIO()
+            _batch_old_stdout = sys.stdout
+            sys.stdout = _batch_captured
+
             # ── Resume from checkpoint: restore all state ────────────────────────
             if _is_resuming and _resume_cp is not None:
                 from collections import OrderedDict as _OD
@@ -2356,6 +2383,43 @@ if cycles is not None and fluorescence is not None:
                         else float(cycles[-1])
 
                     metrics_batch = optimizer_batch.calculate_fit_metrics()
+
+                    # ── Diagnostic dump for catastrophic fits ────────────────
+                    # When R² < 0 the model is worse than predicting the mean.
+                    # Print everything needed to diagnose the root cause.
+                    _diag_r2 = metrics_batch.get('r_squared', 0)
+                    if _diag_r2 < 0:
+                        print(f"\n{'='*60}")
+                        print(f"🔴 CATASTROPHIC FIT: {sample_name}  R² = {_diag_r2:.4f}")
+                        print(f"{'='*60}")
+                        print(f"  fit window cycles : {float(cycles[fit_start_idx]):.0f} → {_fit_end_cycle:.0f}")
+                        print(f"  n_points (app)    : {len(cycles_fit)}")
+                        print(f"  n_points (optim)  : {len(optimizer_batch.cycles_fit)}")
+                        print(f"  cycles_fit range  : {float(optimizer_batch.cycles_fit[0]):.0f} → {float(optimizer_batch.cycles_fit[-1]):.0f}")
+                        print(f"  fluor_fit range   : {float(np.min(optimizer_batch.fluorescence_fit)):.2f} → {float(np.max(optimizer_batch.fluorescence_fit)):.2f}")
+                        print(f"  fixed background  : slope={_bg_slope_est:.6f}, intercept={_bg_int_est:.2f}")
+                        print(f"  bounds sent       : {_merged_bounds}")
+                        print(f"  result params     : D0={params_batch['D0']:.2e}, k={params_batch['k']:.4f}, P0={params_batch['P0']:.2e}")
+                        print(f"                      F_bg_int={params_batch['F_bg_intercept']:.2f}, F_bg_slope={params_batch['F_bg_slope']:.6f}")
+                        print(f"  tier              : {'T3-DE' if params_batch.get('de_used') else 'T2-LHS' if params_batch.get('fallback_succeeded') else 'T1-Fixed' if params_batch.get('used_fixed_background') else 'T1-Full'}")
+                        # Show what the model predicts vs actual data at a few points
+                        _diag_m = MAK2Model()
+                        _diag_pred = _diag_m.simulate_to_cycle(
+                            D0=params_batch['D0'], k=params_batch['k'], P0=params_batch['P0'],
+                            cycles=optimizer_batch.cycles_fit,
+                            F_bg_intercept=params_batch['F_bg_intercept'],
+                            F_bg_slope=params_batch['F_bg_slope'],
+                        )
+                        _diag_actual = optimizer_batch.fluorescence_fit
+                        _diag_cycles = optimizer_batch.cycles_fit
+                        print(f"  cycle | actual       | predicted     | residual")
+                        print(f"  ------+--------------+--------------+---------")
+                        _diag_step = max(1, len(_diag_cycles) // 8)
+                        for _di in range(0, len(_diag_cycles), _diag_step):
+                            print(f"  {_diag_cycles[_di]:5.0f} | {_diag_actual[_di]:12.2f} | {_diag_pred[_di]:12.2f} | {_diag_actual[_di] - _diag_pred[_di]:+.2f}")
+                        print(f"  SS_res = {float(np.sum((_diag_actual - _diag_pred)**2)):.2e}")
+                        print(f"  SS_tot = {float(np.sum((_diag_actual - np.mean(_diag_actual))**2)):.2e}")
+                        print(f"{'='*60}\n")
 
                     # Get Ct value: prefer instrument-reported CT, fall back to calculated
                     # Isolated in its own try/except so a Ct error can't kill the fit result
@@ -3420,6 +3484,11 @@ if cycles is not None and fluorescence is not None:
                     results_list[_pf_idx]['P0'] = None
                     results_list[_pf_idx]['Ct'] = None
 
+            # Restore stdout and save captured optimizer output
+            sys.stdout = _batch_old_stdout
+            _batch_debug = _batch_captured.getvalue()
+            st.session_state['batch_debug_output'] = _batch_debug
+
             status_text.text("✅ Batch fitting complete!")
             st.toast("Fitting complete — results saved!", icon="✅")
 
@@ -3520,6 +3589,11 @@ if cycles is not None and fluorescence is not None:
                 st.error(f"Error enriching results: {_build_err}")
 
           except Exception as _batch_fatal:
+            # Restore stdout if it was redirected
+            if sys.stdout is not _batch_old_stdout:
+                sys.stdout = _batch_old_stdout
+                _batch_debug = _batch_captured.getvalue()
+                st.session_state['batch_debug_output'] = _batch_debug
             import traceback as _tb_fatal
             st.error(f"❌ Batch fitting crashed: {_batch_fatal}")
             st.code(_tb_fatal.format_exc())
@@ -3752,6 +3826,26 @@ if (_has_incomplete_checkpoint
 
 if 'batch_results' in st.session_state:
     st.subheader("🔄 Batch Fitting Results")
+
+    # Show batch optimizer diagnostics (captured stdout)
+    if 'batch_debug_output' in st.session_state and st.session_state['batch_debug_output']:
+        # Filter to only show catastrophic-fit diagnostics + summary
+        _raw_debug = st.session_state['batch_debug_output']
+        # Extract CATASTROPHIC FIT blocks for prominent display
+        _catast_lines = []
+        _in_block = False
+        for _dl in _raw_debug.splitlines():
+            if 'CATASTROPHIC FIT' in _dl:
+                _in_block = True
+            if _in_block:
+                _catast_lines.append(_dl)
+                if _dl.startswith('====') and len(_catast_lines) > 2:
+                    _in_block = False
+        if _catast_lines:
+            with st.expander("🔴 Catastrophic Fit Diagnostics", expanded=True):
+                st.code('\n'.join(_catast_lines), language='text')
+        with st.expander("🐛 Full Optimizer Log", expanded=False):
+            st.code(_raw_debug[-50000:] if len(_raw_debug) > 50000 else _raw_debug, language='text')
 
     # Prominent download buttons at top of results
     try:

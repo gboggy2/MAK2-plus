@@ -502,11 +502,16 @@ class MAK2Optimizer:
 
             print(f"✅ Selected top {n_starts} LHS samples (from {n_lhs_samples} evaluated)")
 
-            if verbose:
-                print(f"\nTop {min(5, n_starts)} LHS starting points (by SSR):")
-                for i in range(min(5, n_starts)):
-                    ssr, idx, d0, k, p0 = lhs_scores[i]
-                    print(f"  Rank {i+1}: D0={d0:.2e}, k={k:.4f}, P0={p0:.4f}, SSR={ssr:.6f}")
+            # Always print top LHS — critical for diagnosing convergence failures
+            print(f"\nTop {min(5, n_starts)} LHS starting points (by SSR):")
+            for i in range(min(5, n_starts)):
+                ssr, idx, d0, k, p0 = lhs_scores[i]
+                print(f"  Rank {i+1}: D0={d0:.2e}, k={k:.4f}, P0={p0:.4f}, SSR={ssr:.6f}")
+            # Also show worst to verify spread
+            if len(lhs_scores) > 5:
+                worst_ssr = lhs_scores[-1][0]
+                best_ssr = lhs_scores[0][0]
+                print(f"  SSR spread: best={best_ssr:.2e}, worst={worst_ssr:.2e}, ratio={worst_ssr/max(best_ssr,1e-30):.1f}x")
 
             # Use the best ones for optimization
             D0_lhs = D0_lhs_best
