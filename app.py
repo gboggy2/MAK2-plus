@@ -3780,7 +3780,7 @@ if cycles is not None and fluorescence is not None:
                     # Skip for high-R² fits (≥ 0.999) — fit quality validates shape.
                     _sq_is_late = (
                         _sq_fe is not None
-                        and _sq_fe >= float(cycles[-1]) - 1
+                        and _sq_fe >= float(cycles[-1]) - min(max(1, cycles_after_max), 5)
                     )
                     _sq_r2_val = optimizer.metrics.get('r_squared', 0) if hasattr(optimizer, 'metrics') and optimizer.metrics else 0
                     _sq_fit_width = (_sq_fe - _sq_fs) if (_sq_fs is not None and _sq_fe is not None) else 0
