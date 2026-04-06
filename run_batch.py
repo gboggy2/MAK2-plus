@@ -34,7 +34,7 @@ from replicate_analysis import calculate_replicate_stats, parse_sample_groups, c
 from calibration import build_standard_curve, build_ct_standard_curve, apply_calibration, apply_ct_calibration
 
 # ── Configuration ───────��────────────────────────────��────────────────────────
-DATA_DIR = Path("/Users/boggy/Desktop/Desktop031424/Personal")
+DATA_DIR = Path("/Users/boggy/Desktop/Desktop031424/Personal/InputDataFiles")
 OUTPUT_DIR = DATA_DIR / "Results"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -1216,15 +1216,97 @@ def build_replicate_groups(results_list, sample_metadata, channels):
     return calculate_replicate_stats(grouped_df)
 
 
+def _make_scatter_series(ws, x_col, y_col, data_rows, title="Data",
+                         color="4472C4"):
+    """Create a scatter series with circle markers, no connecting line."""
+    from openpyxl.chart import Reference, Series as XlSeries
+    from openpyxl.chart.marker import Marker
+
+    x_vals = Reference(ws, min_col=x_col, min_row=2, max_row=data_rows + 1)
+    y_vals = Reference(ws, min_col=y_col, min_row=2, max_row=data_rows + 1)
+    series = XlSeries(y_vals, x_vals, title=title)
+    series.marker = Marker(symbol='circle', size=7)
+    series.marker.graphicalProperties.solidFill = color
+    series.graphicalProperties.line.noFill = True
+    return series
+
+
+def _style_axis(axis, title, num_fmt="General"):
+    """Configure an axis with visible labels and no gridlines."""
+    axis.title = title
+    axis.delete = False
+    axis.numFmt = num_fmt
+    axis.majorTickMark = "out"
+    axis.majorGridlines = None
+
+
+def _add_std_curve_d0_chart(ws, df, data_rows):
+    """Add D0 standard curve scatter chart with trendline to worksheet."""
+    from openpyxl.chart import ScatterChart
+    from openpyxl.chart.trendline import Trendline
+    from openpyxl.utils import get_column_letter
+
+    cols = list(df.columns)
+    x_col = cols.index('log10_D0') + 1 if 'log10_D0' in cols else None
+    y_col = cols.index('log10_Copies') + 1 if 'log10_Copies' in cols else None
+    if not (x_col and y_col):
+        return
+
+    chart = ScatterChart()
+    chart.title = "D0 Standard Curve (log-log)"
+    chart.legend.position = 'b'
+    _style_axis(chart.x_axis, "log10(D0)", "0.00")
+    _style_axis(chart.y_axis, "log10(Known Copies)", "0.00")
+    chart.width = 18
+    chart.height = 12
+
+    series = _make_scatter_series(ws, x_col, y_col, data_rows, "Standards")
+    series.trendline = Trendline(trendlineType='linear',
+                                 dispRSqr=True, dispEq=True)
+    chart.series.append(series)
+    ws.add_chart(chart, f"{get_column_letter(len(cols) + 2)}2")
+
+
+def _add_std_curve_ct_chart(ws, df, data_rows):
+    """Add Ct standard curve scatter chart with trendline to worksheet."""
+    from openpyxl.chart import ScatterChart
+    from openpyxl.chart.trendline import Trendline
+    from openpyxl.utils import get_column_letter
+
+    cols = list(df.columns)
+    x_col = cols.index('Ct') + 1 if 'Ct' in cols else None
+    y_col = cols.index('log10_Copies') + 1 if 'log10_Copies' in cols else None
+    if not (x_col and y_col):
+        return
+
+    chart = ScatterChart()
+    chart.title = "Ct Standard Curve"
+    chart.legend.position = 'b'
+    _style_axis(chart.x_axis, "Ct", "0.0")
+    _style_axis(chart.y_axis, "log10(Known Copies)", "0.00")
+    chart.width = 18
+    chart.height = 12
+
+    series = _make_scatter_series(ws, x_col, y_col, data_rows, "Standards")
+    series.trendline = Trendline(trendlineType='linear',
+                                 dispRSqr=True, dispEq=True)
+    chart.series.append(series)
+    ws.add_chart(chart, f"{get_column_letter(len(cols) + 2)}2")
+
+
 def build_excel(results_list, cycles, all_samples, no_signal_samples,
                 no_signal_fluor, sample_metadata, channels, batch_settings,
                 replicate_stats_df=None, precision_comparison_df=None,
-                std_curve_sheets=None):
-    """Build the Excel file matching the app's format exactly."""
-    from openpyxl.chart import ScatterChart, Reference, Series as XlSeries
+                std_curve_sheets=None, chart_sheets=None):
+    """Build the Excel file matching the app's format exactly.
 
+    chart_sheets: dict of {sheet_name: {data: DataFrame, summary: dict,
+                  chart_type: str}} for tabs with native Excel charts.
+    """
     if std_curve_sheets is None:
         std_curve_sheets = {}
+    if chart_sheets is None:
+        chart_sheets = {}
 
     # Build results DataFrame (excluding internal-only keys)
     # KEEP 'error' column — the app needs it to show FAIL status on reload
@@ -1264,7 +1346,7 @@ def build_excel(results_list, cycles, all_samples, no_signal_samples,
     if precision_comparison_df is not None and len(precision_comparison_df) > 0:
         extra_sheets['Precision Comparison'] = precision_comparison_df
 
-    # Standard curve sheets (variance, D0, Ct — per channel)
+    # Standard curve variance sheets (plain data, no chart)
     for sheet_name, df in std_curve_sheets.items():
         if df is not None and len(df) > 0:
             extra_sheets[sheet_name] = df
@@ -1321,10 +1403,43 @@ def build_excel(results_list, cycles, all_samples, no_signal_samples,
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine='openpyxl') as writer:
         results_df.to_excel(writer, sheet_name='Batch Results', index=False)
+
+        # Plain data sheets
         for sheet_name, df in extra_sheets.items():
             if df is not None and len(df) > 0:
                 safe_name = sheet_name[:31]
                 df.to_excel(writer, sheet_name=safe_name, index=False)
+
+        # Chart sheets: data + summary stats + native Excel scatter chart
+        for sheet_name, spec in chart_sheets.items():
+            safe_name = sheet_name[:31]
+            df = spec.get('data')
+            summary = spec.get('summary', {})
+            chart_type = spec.get('chart_type', '')
+
+            if df is None or len(df) == 0:
+                continue
+
+            df.to_excel(writer, sheet_name=safe_name, index=False)
+            ws = writer.sheets[safe_name]
+            data_rows = len(df)
+
+            # Write summary stats below data
+            summary_start_row = data_rows + 3  # leave a blank row
+            row = summary_start_row
+            ws.cell(row=row, column=1, value='--- Summary ---')
+            row += 1
+            for k, v in summary.items():
+                ws.cell(row=row, column=1, value=k)
+                ws.cell(row=row, column=2, value=v)
+                row += 1
+
+            # Create scatter chart based on chart_type
+            if chart_type == 'std_curve_d0':
+                _add_std_curve_d0_chart(ws, df, data_rows)
+            elif chart_type == 'std_curve_ct':
+                _add_std_curve_ct_chart(ws, df, data_rows)
+
     buf.seek(0)
     return buf.getvalue()
 
@@ -1501,7 +1616,8 @@ def process_plate(mc_file, meta_file, plate_name):
 
     # Standard curve calibration
     print("\nComputing standard curves...")
-    std_curve_sheets = {}
+    std_curve_sheets = {}   # variance sheets (plain data, no chart)
+    chart_sheets = {}       # D0/Ct sheets (data + summary + Excel chart)
     has_standards = (
         sample_metadata is not None
         and any(m.get('Task') == 'STANDARD' for m in sample_metadata.values())
@@ -1541,10 +1657,22 @@ def process_plate(mc_file, meta_file, plate_name):
             if calibration is not None:
                 print(f"  D0 standard curve{ch_label}: R²={calibration['r_squared']:.4f}, "
                       f"{calibration['n_standards']} wells, {calibration['n_concentrations']} levels")
-                # D0 standard curve data sheet
-                std_curve_sheets[f'Std Curve D0{ch_label}'] = calibration['per_point_data'].copy()
 
-                # Variance sheet
+                # D0 standard curve chart sheet (data + summary + Excel chart)
+                chart_sheets[f'Std Curve D0{ch_label}'] = {
+                    'data': calibration['per_point_data'].copy(),
+                    'summary': {
+                        'slope': calibration['slope'],
+                        'intercept': calibration['intercept'],
+                        'r_squared': calibration['r_squared'],
+                        'n_standards': calibration['n_standards'],
+                        'n_concentrations': calibration['n_concentrations'],
+                        'median_cf': calibration.get('median_cf', np.nan),
+                    },
+                    'chart_type': 'std_curve_d0',
+                }
+
+                # Variance sheet (plain data)
                 var_data = []
                 for copies_val, var_info in sorted(calibration['replicate_variance'].items(), reverse=True):
                     row = {
@@ -1575,7 +1703,20 @@ def process_plate(mc_file, meta_file, plate_name):
             if ct_calibration is not None:
                 print(f"  Ct standard curve{ch_label}: R²={ct_calibration['r_squared']:.4f}, "
                       f"efficiency={ct_calibration['efficiency']*100:.1f}%")
-                std_curve_sheets[f'Std Curve Ct{ch_label}'] = ct_calibration['per_point_data'].copy()
+
+                # Ct standard curve chart sheet (data + summary + Excel chart)
+                chart_sheets[f'Std Curve Ct{ch_label}'] = {
+                    'data': ct_calibration['per_point_data'].copy(),
+                    'summary': {
+                        'slope': ct_calibration['slope'],
+                        'intercept': ct_calibration['intercept'],
+                        'r_squared': ct_calibration['r_squared'],
+                        'efficiency': ct_calibration['efficiency'],
+                        'n_standards': ct_calibration['n_standards'],
+                        'n_concentrations': ct_calibration['n_concentrations'],
+                    },
+                    'chart_type': 'std_curve_ct',
+                }
 
                 if cal_ch is not None:
                     ch_mask_apply = results_df_cal['Channel'] == cal_ch
@@ -1616,7 +1757,8 @@ def process_plate(mc_file, meta_file, plate_name):
     excel_bytes = build_excel(
         results_list, cycles, all_samples, no_signal_samples,
         no_signal_fluor, sample_metadata, channels, batch_settings,
-        replicate_stats_df, precision_comparison_df, std_curve_sheets
+        replicate_stats_df, precision_comparison_df, std_curve_sheets,
+        chart_sheets
     )
 
     output_path = OUTPUT_DIR / f"{plate_name}_MAK2Plus_Results.xlsx"
