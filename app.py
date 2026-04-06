@@ -3418,8 +3418,21 @@ if cycles is not None and fluorescence is not None:
                 # late amplifier with exponential growth will have high R².
                 # Linear drift that happens to extend to the last cycle
                 # (triggering late-amp classification) must still be tested.
+                # Also skip for high-R² fits (≥ 0.999 with ≥ 10 cycle
+                # window) — the fit quality already validates genuine
+                # amplification.
                 _pf_late_bypass_2b = _pf_is_late and _pf_r2 is not None and _pf_r2 >= 0.995
+                _pf_fit_width_2b = (
+                    (_pf_r.get('fit_end_cycle') or 0)
+                    - (_pf_r.get('fit_start_cycle') or 0)
+                )
+                _pf_high_r2_2b = (
+                    _pf_r2 is not None
+                    and _pf_r2 >= 0.999
+                    and _pf_fit_width_2b >= 10
+                )
                 if (not _pf_reject and not _pf_late_bypass_2b
+                        and not _pf_high_r2_2b
                         and _pf_r.get('D0') is not None
                         and not (isinstance(_pf_r['D0'], float) and np.isnan(_pf_r['D0']))
                         and _pf_r.get('fluor_data') is not None):
