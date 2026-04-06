@@ -3413,26 +3413,13 @@ if cycles is not None and fluorescence is not None:
                 # In real amplification the pre-inflection region (fit_start
                 # to max-slope cycle) is exponential growth where a sigmoid
                 # massively outperforms a straight line.  In drift, both
-                # fit equally well.  Reject if MAK2 R² improvement < 0.01.
+                # fit equally well.  Reject if MAK2 R² improvement < 0.05.
                 # Skip for late amplifiers ONLY if R² >= 0.995 — a genuine
                 # late amplifier with exponential growth will have high R².
                 # Linear drift that happens to extend to the last cycle
                 # (triggering late-amp classification) must still be tested.
-                # Also skip for high-R² fits (≥ 0.999 with ≥ 10 cycle
-                # window) — the fit quality already validates genuine
-                # amplification.
                 _pf_late_bypass_2b = _pf_is_late and _pf_r2 is not None and _pf_r2 >= 0.995
-                _pf_fit_width_2b = (
-                    (_pf_r.get('fit_end_cycle') or 0)
-                    - (_pf_r.get('fit_start_cycle') or 0)
-                )
-                _pf_high_r2_2b = (
-                    _pf_r2 is not None
-                    and _pf_r2 >= 0.999
-                    and _pf_fit_width_2b >= 10
-                )
                 if (not _pf_reject and not _pf_late_bypass_2b
-                        and not _pf_high_r2_2b
                         and _pf_r.get('D0') is not None
                         and not (isinstance(_pf_r['D0'], float) and np.isnan(_pf_r['D0']))
                         and _pf_r.get('fluor_data') is not None):
@@ -3480,7 +3467,7 @@ if cycles is not None and fluorescence is not None:
                                     _pf_r2_mak = 1.0 - _pf_ss_res_mak / _pf_ss_tot
 
                                     # Reject if MAK2 doesn't outperform linear
-                                    if _pf_r2_mak - _pf_r2_lin < 0.10:
+                                    if _pf_r2_mak - _pf_r2_lin < 0.05:
                                         _pf_reject = True
                                         _pf_reason = (
                                             f'MAK2 not better than linear in growth region '

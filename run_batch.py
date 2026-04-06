@@ -1059,17 +1059,7 @@ def run_quality_gates(results_list, cycles):
 
         # Gate 2b: linear vs MAK2
         pf_late_bypass_2b = pf_is_late and pf_r2 is not None and pf_r2 >= 0.995
-        pf_fit_width_2b = (
-            (pf_r.get('fit_end_cycle') or 0)
-            - (pf_r.get('fit_start_cycle') or 0)
-        )
-        pf_high_r2_2b = (
-            pf_r2 is not None
-            and pf_r2 >= 0.999
-            and pf_fit_width_2b >= 10
-        )
         if (not pf_reject and not pf_late_bypass_2b
-                and not pf_high_r2_2b
                 and pf_r.get('D0') is not None
                 and not (isinstance(pf_r['D0'], float) and np.isnan(pf_r['D0']))
                 and pf_r.get('fluor_data') is not None):
@@ -1109,7 +1099,7 @@ def run_quality_gates(results_list, cycles):
                             pf_mak2_pre = pf_pred_win2b[pf_pre_mask]
                             pf_ss_res_mak = float(np.sum((pf_fluor_pre - pf_mak2_pre)**2))
                             pf_r2_mak = 1.0 - pf_ss_res_mak / pf_ss_tot
-                            if pf_r2_mak - pf_r2_lin < 0.10:
+                            if pf_r2_mak - pf_r2_lin < 0.05:
                                 pf_reject = True
                                 pf_reason = (
                                     f'MAK2 not better than linear in growth region '
