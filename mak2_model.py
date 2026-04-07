@@ -1072,13 +1072,34 @@ def estimate_MAK2_params_from_exponential(
     E = fit_info['efficiency']
     fitted_cycles = fit_info['fitted_cycles_efficiency']
 
+    # ── Prepare cycle-offset correction (applied to D0 bounds later) ───
+    # estimate_D0_bounds fits exponentials on *shifted* cycles (exp region
+    # starts at n=0), so D0_lower/D0_upper represent DNA at the start of
+    # the exponential region.  But the MAK2 model's simulate_to_cycle
+    # uses *unshifted* cycle numbers with cycle_offset=0, so its D0 is
+    # the DNA quantity at cycle 0.  For a well whose exponential region
+    # starts at actual cycle C, D0_model ≈ D0_shifted / 2^C.
+    # Without this correction, late amplifiers (C ≈ 20-30) have D0 bounds
+    # that are millions of times too high.
+    # NOTE: The correction is deferred until after k bounds are computed,
+    # because the k_upper formula was calibrated against shifted-space D0.
+    _exp_start = float(fit_info.get('exp_cycles_lower', [cycles[0]])[0])
+    _first_cycle = float(cycles[0])
+    _cycle_shift = _exp_start - _first_cycle
+    _d0_scale_down = 1.0
+    if _cycle_shift > 0 and E > 1.0:
+        _d0_scale_down = 2.0 ** _cycle_shift
+        if verbose:
+            print(f"  Cycle-offset: exp starts at cycle {_exp_start:.0f}, "
+                  f"shift={_cycle_shift:.0f}, scale={_d0_scale_down:.2e} (deferred)")
+
     if verbose:
         print(f"\nExponential Fit Results:")
         print(f"  D0 = {D0_eff:.2e}")
         print(f"  Efficiency E = {E:.4f}")
         print(f"  Background: {F_bg_est['intercept']:.4f} + {F_bg_est['slope']:.6f} × n")
     
-    # Step 2: D0 estimate is direct
+    # Step 2: D0 estimate (cycle-offset correction applied later)
     D0_estimate = D0_eff
     
     # Step 3: Solve for k analytically
@@ -1157,8 +1178,23 @@ def estimate_MAK2_params_from_exponential(
         k_lower = 0.05
         k_upper = 1.2  # Fallback if k_estimate unavailable
 
+    # ── Apply deferred D0 cycle-offset correction ───────────────────
+    # Now that k bounds are computed (using shifted-space D0), apply the
+    # correction so D0 bounds match the MAK2 model's cycle-0 reference.
+    if _d0_scale_down > 1.0:
+        D0_lower /= _d0_scale_down
+        D0_upper /= _d0_scale_down
+        D0_estimate /= _d0_scale_down
+        D0_lower = max(D0_lower, 1e-18)
+        D0_upper = max(D0_upper, D0_lower * 10)
+        D0_estimate = max(D0_estimate, D0_lower)
+        estimates['D0'] = D0_estimate
+        if verbose:
+            print(f"  D0 cycle-offset correction applied (÷{_d0_scale_down:.2e}):")
+            print(f"    Bounds: [{D0_lower:.2e}, {D0_upper:.2e}], estimate: {D0_estimate:.2e}")
+
     bounds = {
-        'D0': (D0_lower, D0_upper),  # Use bounds from both exponential fits (already have 10× margins)
+        'D0': (D0_lower, D0_upper),  # Cycle-offset–corrected bounds
         'k': (k_lower, k_upper),  # Fully data-driven k bounds
         'P0': (P0_estimate * 0.5, P0_estimate * 2),  # Tight: 0.5x to 2x of F_max
         'F_bg_intercept': (
@@ -1171,15 +1207,18 @@ def estimate_MAK2_params_from_exponential(
         )
     }
 
-    # For late-baseline samples, narrow k range to prevent oscillation
-    # When baseline extends to cycle 21+, optimizer tends to oscillate between
-    # k too low (0.05) and k too high (1.2+). Empirically, k~0.2-0.8 works better.
+    # For late-baseline samples, cap k_upper to prevent oscillation.
+    # When baseline extends to cycle 21+, optimizer tends to oscillate with
+    # very high k (1.2+).  Capping the upper bound at 0.85 helps.
+    # IMPORTANT: Do NOT raise k_lower — very late amplifiers (like Rutledge
+    # X6 wells) can have k as low as 0.10, and the data-driven k_lower
+    # computed above (max(0.01, k_estimate/2)) is already appropriate.
     baseline_end_cycle = fit_info.get('baseline_end_cycle', 0)
     if baseline_end_cycle >= 21:
         old_k_bounds = bounds['k']
-        bounds['k'] = (0.15, 0.85)  # Narrower, more moderate range
+        bounds['k'] = (old_k_bounds[0], min(old_k_bounds[1], 0.85))  # Only cap upper
         if verbose:
-            print(f"    → Narrowing k bounds for late baseline: {old_k_bounds} → {bounds['k']}")
+            print(f"    → Capping k upper for late baseline: {old_k_bounds} → {bounds['k']}")
 
     # Note: We don't constrain P0 based on plateau here because:
     # 1. Plateau = P0/(1+k*P0) + F_bg_intercept depends on both P0 and k
