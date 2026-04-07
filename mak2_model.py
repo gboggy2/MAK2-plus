@@ -1084,8 +1084,11 @@ def estimate_MAK2_params_from_exponential(
     # NOTE: The correction is deferred until after k bounds are computed,
     # because the k_upper formula was calibrated against shifted-space D0.
     _exp_start = float(fit_info.get('exp_cycles_lower', [cycles[0]])[0])
-    _first_cycle = float(cycles[0])
-    _cycle_shift = _exp_start - _first_cycle
+    # MAK2 model's D0 is at cycle 0 (simulate_to_cycle uses cycle_offset=0),
+    # so the shift is from cycle 0 to the exponential region start — NOT from
+    # the first data cycle.  When the app passes a truncated fit window
+    # (e.g. cycles 23-45), cycles[0]=23, but D0 still refers to cycle 0.
+    _cycle_shift = _exp_start   # shift from model's cycle 0
     _d0_scale_down = 1.0
     if _cycle_shift > 0 and E > 1.0:
         _d0_scale_down = 2.0 ** _cycle_shift
