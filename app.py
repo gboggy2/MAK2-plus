@@ -4616,6 +4616,19 @@ if 'batch_results' in st.session_state:
             st.info(f"Applied D0_single = {_d0s_global:.3e}  →  CF = {_cf:.3e} copies/D0")
             st.session_state['batch_results'] = results_df
 
+    # ── Sync Copies_D0 back to batch_results_list (used by visualizations) ──
+    if 'Copies_D0' in results_df.columns:
+        _sync_list = st.session_state.get('batch_results_list', [])
+        if _sync_list:
+            _sample_to_copies = dict(
+                zip(results_df['Sample'], results_df['Copies_D0'])
+            )
+            for _rl_item in _sync_list:
+                _sn = _rl_item.get('Sample', '')
+                if _sn in _sample_to_copies:
+                    _rl_item['Copies_D0'] = _sample_to_copies[_sn]
+            st.session_state['batch_results_list'] = _sync_list
+
     # CSV export (always available immediately)
     csv = results_df.to_csv(index=False)
     st.download_button(
