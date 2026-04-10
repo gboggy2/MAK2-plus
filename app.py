@@ -1481,7 +1481,7 @@ if cycles is not None and fluorescence is not None:
     st.sidebar.subheader("Copy Number Conversion")
     calibration_method = st.sidebar.radio(
         "Calibration method",
-        ["Auto-detect standards", "Limited dilution", "Manual CF", "None"],
+        ["Auto-detect standards", "Limited dilution", "Manual CF", "Single-copy D0", "None"],
         index=0,
         help="Choose how to convert D0 to copy numbers."
     )
@@ -1489,6 +1489,7 @@ if cycles is not None and fluorescence is not None:
         "Auto-detect standards": "auto",
         "Limited dilution": "limited_dilution",
         "Manual CF": "manual_cf",
+        "Single-copy D0": "d0_single",
         "None": "none",
     }[calibration_method]
 
@@ -1567,6 +1568,41 @@ if cycles is not None and fluorescence is not None:
             st.session_state['manual_conversion_factor'] = manual_cf
         else:
             st.session_state.pop('manual_conversion_factor', None)
+
+    elif calibration_method == "Single-copy D0":
+        st.session_state.pop('manual_conversion_factor', None)
+        _all_targets_sidebar = st.session_state.get('all_targets', [])
+        if _all_targets_sidebar:
+            st.sidebar.caption(
+                "Enter D0_single for each target. Leave at 0 to skip that target."
+            )
+            _d0s_per_target = {}
+            for _tgt in _all_targets_sidebar:
+                _prev = st.session_state.get('d0_single_per_target', {}).get(_tgt, 0.0)
+                _val = st.sidebar.number_input(
+                    f"D0_single — {_tgt}",
+                    min_value=0.0,
+                    value=float(_prev),
+                    format="%.3e",
+                    help=f"D0 for a single copy of {_tgt}. Copies = D0 / D0_single.",
+                    key=f"d0_single_{_tgt}",
+                )
+                _d0s_per_target[_tgt] = _val
+            st.session_state['d0_single_per_target'] = _d0s_per_target
+            st.session_state.pop('d0_single_value', None)
+        else:
+            _d0s_val = st.sidebar.number_input(
+                "D0 for single copy",
+                min_value=0.0,
+                value=float(st.session_state.get('d0_single_value', 0.0)),
+                format="%.3e",
+                help="D0 value corresponding to exactly 1 copy. Copies = D0 / D0_single.",
+            )
+            if _d0s_val > 0:
+                st.session_state['d0_single_value'] = _d0s_val
+            else:
+                st.session_state.pop('d0_single_value', None)
+            st.session_state.pop('d0_single_per_target', None)
 
     else:  # None
         st.session_state.pop('manual_conversion_factor', None)
@@ -3919,6 +3955,30 @@ if 'batch_results' in st.session_state:
             if _df is not None and len(_df) > 0:
                 _xl_extra[_sheet_name] = _df
 
+        # Copies sheet(s) — only rows where Copies_D0 was calculated
+        if 'Copies_D0' in _xl_results_top.columns:
+            _copies_base_cols = ['Sample', 'D0', 'Copies_D0', 'R2']
+            if 'Target' in _xl_results_top.columns:
+                _copies_base_cols.insert(1, 'Target')
+            if 'Channel' in _xl_results_top.columns:
+                _copies_base_cols.insert(1, 'Channel')
+            _copies_all = _xl_results_top[
+                _xl_results_top['Copies_D0'].notna()
+            ][_copies_base_cols].copy()
+            _copies_all.insert(
+                _copies_all.columns.get_loc('Copies_D0') + 1,
+                'D0_single (used)',
+                _copies_all['D0'] / _copies_all['Copies_D0'],
+            )
+            if 'Target' in _copies_all.columns and _copies_all['Target'].nunique() > 1:
+                # One sheet per target that had copies calculated
+                for _cp_tgt in _copies_all['Target'].unique():
+                    _cp_df = _copies_all[_copies_all['Target'] == _cp_tgt].copy()
+                    _sheet_nm = f"Copies {_cp_tgt}"[:31]  # Excel 31-char sheet name limit
+                    _xl_extra[_sheet_nm] = _cp_df
+            elif len(_copies_all) > 0:
+                _xl_extra['Copies'] = _copies_all
+
         # Per-channel standard curve variance sheets
         _xl_cal_channels = st.session_state.get('_std_curve_channels', [None])
         for _xl_ch in _xl_cal_channels:
@@ -4440,6 +4500,42 @@ if 'batch_results' in st.session_state:
         results_df = apply_calibration(results_df, manual_cf=manual_cf_val)
         st.session_state['batch_results'] = results_df
         st.info(f"No standards detected. Applied fallback manual CF: {manual_cf_val:.2e} copies/D0")
+
+    elif cal_method == 'd0_single':
+        _d0s_per_target = st.session_state.get('d0_single_per_target', {})
+        _d0s_global = st.session_state.get('d0_single_value')
+        _has_targets_col = 'Target' in results_df.columns
+
+        if _has_targets_col and _d0s_per_target:
+            # Per-target application — only targets with a positive D0_single get copies
+            _any_applied = False
+            for _tgt, _d0s in _d0s_per_target.items():
+                if _d0s and _d0s > 0:
+                    _tgt_mask = results_df['Target'] == _tgt
+                    if _tgt_mask.any():
+                        _cf = 1.0 / _d0s
+                        _tgt_cal = apply_calibration(
+                            results_df[_tgt_mask].copy(), manual_cf=_cf
+                        )
+                        results_df.loc[_tgt_mask, 'Copies_D0'] = _tgt_cal['Copies_D0']
+                        _any_applied = True
+            if _any_applied:
+                st.markdown("---")
+                st.subheader("📐 Copy Number Conversion (Single-copy D0)")
+                _applied_targets = [t for t, v in _d0s_per_target.items() if v and v > 0]
+                st.info(
+                    f"Applied D0_single calibration for: "
+                    + ", ".join(f"**{t}** (D0_single = {_d0s_per_target[t]:.3e})"
+                                for t in _applied_targets)
+                )
+                st.session_state['batch_results'] = results_df
+        elif _d0s_global and _d0s_global > 0:
+            _cf = 1.0 / _d0s_global
+            results_df = apply_calibration(results_df, manual_cf=_cf)
+            st.markdown("---")
+            st.subheader("📐 Copy Number Conversion (Single-copy D0)")
+            st.info(f"Applied D0_single = {_d0s_global:.3e}  →  CF = {_cf:.3e} copies/D0")
+            st.session_state['batch_results'] = results_df
 
     # CSV export (always available immediately)
     csv = results_df.to_csv(index=False)
@@ -5165,11 +5261,24 @@ if 'batch_results_list' in st.session_state and 'batch_all_samples' in st.sessio
 
         # Show parameters if available
         if _has_fit_params:
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("D₀", f"{selected_result['D0']:.2e}")
-            col2.metric("k", f"{selected_result['k']:.6f}")
-            col3.metric("P₀", f"{selected_result['P0']:.2e}")
-            col4.metric("R²", f"{selected_result['R2']:.4f}")
+            _copies_val = selected_result.get('Copies_D0')
+            _show_copies = (
+                _copies_val is not None
+                and not (isinstance(_copies_val, float) and np.isnan(_copies_val))
+            )
+            if _show_copies:
+                col1, col2, col3, col4, col5 = st.columns(5)
+                col1.metric("D₀", f"{selected_result['D0']:.2e}")
+                col2.metric("k", f"{selected_result['k']:.6f}")
+                col3.metric("P₀", f"{selected_result['P0']:.2e}")
+                col4.metric("R²", f"{selected_result['R2']:.4f}")
+                col5.metric("Copies", f"{_copies_val:.2e}")
+            else:
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("D₀", f"{selected_result['D0']:.2e}")
+                col2.metric("k", f"{selected_result['k']:.6f}")
+                col3.metric("P₀", f"{selected_result['P0']:.2e}")
+                col4.metric("R²", f"{selected_result['R2']:.4f}")
 
             _bl_meta_vis = selected_result.get('bl_end_meta')
             _bl_est_vis  = selected_result.get('bl_end_est')
