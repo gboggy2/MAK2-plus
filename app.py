@@ -3916,6 +3916,85 @@ if (_has_incomplete_checkpoint
 # the file uploader loses its reference during a long computation.
 # ============================================================================
 
+# ── Standalone Copy-Number Conversion sidebar ──────────────────────────────
+# Rendered when batch_results exist but the main sidebar (inside the
+# if-cycles block) was NOT shown — e.g., after "Load Previous Results".
+if 'batch_results' in st.session_state and cycles is None:
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Copy Number Conversion")
+    _standalone_cal = st.sidebar.radio(
+        "Calibration method",
+        ["Single-copy D0", "Manual CF", "None"],
+        index=0,
+        help="Choose how to convert D0 to copy numbers.",
+        key="standalone_cal_method",
+    )
+    st.session_state['calibration_method'] = {
+        "Single-copy D0": "d0_single",
+        "Manual CF": "manual_cf",
+        "None": "none",
+    }[_standalone_cal]
+
+    if _standalone_cal == "Single-copy D0":
+        st.session_state.pop('manual_conversion_factor', None)
+        # Check for targets in loaded results
+        _loaded_results = st.session_state.get('batch_results')
+        _loaded_targets = []
+        if _loaded_results is not None and 'Target' in _loaded_results.columns:
+            _loaded_targets = sorted(_loaded_results['Target'].dropna().unique().tolist())
+
+        if _loaded_targets:
+            st.sidebar.caption(
+                "Enter D0_single for each target. Leave at 0 to skip."
+            )
+            _d0s_per_target = {}
+            for _tgt in _loaded_targets:
+                _prev = st.session_state.get('d0_single_per_target', {}).get(_tgt, 0.0)
+                _val = st.sidebar.number_input(
+                    f"D0_single — {_tgt}",
+                    min_value=0.0,
+                    value=float(_prev),
+                    format="%.3e",
+                    help=f"D0 for a single copy of {_tgt}. Copies = D0 / D0_single.",
+                    key=f"d0_single_standalone_{_tgt}",
+                )
+                _d0s_per_target[_tgt] = _val
+            st.session_state['d0_single_per_target'] = _d0s_per_target
+            st.session_state.pop('d0_single_value', None)
+        else:
+            _d0s_val = st.sidebar.number_input(
+                "D0 for single copy",
+                min_value=0.0,
+                value=float(st.session_state.get('d0_single_value', 0.0)),
+                format="%.3e",
+                help="D0 value corresponding to exactly 1 copy. Copies = D0 / D0_single.",
+                key="d0_single_standalone_global",
+            )
+            if _d0s_val > 0:
+                st.session_state['d0_single_value'] = _d0s_val
+            else:
+                st.session_state.pop('d0_single_value', None)
+            st.session_state.pop('d0_single_per_target', None)
+
+    elif _standalone_cal == "Manual CF":
+        _manual_cf = st.sidebar.number_input(
+            "Manual conversion factor (copies/D0)",
+            min_value=0.0,
+            value=0.0,
+            format="%.2e",
+            help="Enter a known copies-per-D0-unit conversion factor.",
+            key="manual_cf_standalone",
+        )
+        if _manual_cf > 0:
+            st.session_state['manual_conversion_factor'] = _manual_cf
+        else:
+            st.session_state.pop('manual_conversion_factor', None)
+
+    else:  # None
+        st.session_state.pop('manual_conversion_factor', None)
+        st.session_state.pop('d0_single_value', None)
+        st.session_state.pop('d0_single_per_target', None)
+
 if 'batch_results' in st.session_state:
     st.subheader("🔄 Batch Fitting Results")
 
