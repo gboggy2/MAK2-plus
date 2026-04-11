@@ -4028,6 +4028,7 @@ if 'batch_results' in st.session_state:
             ('_replicate_stats_df',      'Replicate Statistics'),
             ('_precision_comparison_df', 'Precision Comparison'),
             ('_limited_dilution_df',     'Limited Dilution'),
+            ('_d0_single_calibration_df', 'D0_single Calibration'),
         ]
         for _ss_key, _sheet_name in _xl_keys:
             _df = st.session_state.get(_ss_key)
@@ -4585,36 +4586,117 @@ if 'batch_results' in st.session_state:
         _d0s_global = st.session_state.get('d0_single_value')
         _has_targets_col = 'Target' in results_df.columns
 
+        # Build list of (target_name_or_None, d0_single_value) to apply
+        _d0s_to_apply = []
         if _has_targets_col and _d0s_per_target:
-            # Per-target application — only targets with a positive D0_single get copies
-            _any_applied = False
             for _tgt, _d0s in _d0s_per_target.items():
                 if _d0s and _d0s > 0:
+                    _d0s_to_apply.append((_tgt, _d0s))
+        elif _d0s_global and _d0s_global > 0:
+            _d0s_to_apply.append((None, _d0s_global))
+
+        if _d0s_to_apply:
+            # Apply calibration
+            for _tgt, _d0s in _d0s_to_apply:
+                _cf = 1.0 / _d0s
+                if _tgt is not None:
                     _tgt_mask = results_df['Target'] == _tgt
                     if _tgt_mask.any():
-                        _cf = 1.0 / _d0s
                         _tgt_cal = apply_calibration(
                             results_df[_tgt_mask].copy(), manual_cf=_cf
                         )
                         results_df.loc[_tgt_mask, 'Copies_D0'] = _tgt_cal['Copies_D0']
-                        _any_applied = True
-            if _any_applied:
-                st.markdown("---")
-                st.subheader("📐 Copy Number Conversion (Single-copy D0)")
-                _applied_targets = [t for t, v in _d0s_per_target.items() if v and v > 0]
-                st.info(
-                    f"Applied D0_single calibration for: "
-                    + ", ".join(f"**{t}** (D0_single = {_d0s_per_target[t]:.3e})"
-                                for t in _applied_targets)
-                )
-                st.session_state['batch_results'] = results_df
-        elif _d0s_global and _d0s_global > 0:
-            _cf = 1.0 / _d0s_global
-            results_df = apply_calibration(results_df, manual_cf=_cf)
-            st.markdown("---")
-            st.subheader("📐 Copy Number Conversion (Single-copy D0)")
-            st.info(f"Applied D0_single = {_d0s_global:.3e}  →  CF = {_cf:.3e} copies/D0")
+                else:
+                    results_df = apply_calibration(results_df, manual_cf=_cf)
             st.session_state['batch_results'] = results_df
+
+            # ── Display calibration summary ──────────────────────────
+            st.markdown("---")
+            st.subheader("📐 Single-copy D0 Calibration")
+
+            # Per-target summary table
+            _cal_rows = []
+            for _tgt, _d0s in _d0s_to_apply:
+                _cf = 1.0 / _d0s
+                if _tgt is not None:
+                    _mask = (results_df['Target'] == _tgt) & results_df['Copies_D0'].notna()
+                else:
+                    _mask = results_df['Copies_D0'].notna()
+                _copies_vals = results_df.loc[_mask, 'Copies_D0']
+                _d0_vals = results_df.loc[_mask, 'D0']
+                _row = {
+                    'Target': _tgt or '(all)',
+                    'D0_single': _d0s,
+                    'CF (1/D0_single)': _cf,
+                    'N samples': int(_mask.sum()),
+                    'Copies (mean)': _copies_vals.mean() if len(_copies_vals) else np.nan,
+                    'Copies (median)': _copies_vals.median() if len(_copies_vals) else np.nan,
+                    'Copies (min)': _copies_vals.min() if len(_copies_vals) else np.nan,
+                    'Copies (max)': _copies_vals.max() if len(_copies_vals) else np.nan,
+                }
+                _cal_rows.append(_row)
+
+            _cal_summary_df = pd.DataFrame(_cal_rows)
+            st.markdown("**Calibration: copies = D0 / D0_single**")
+
+            # Metrics row
+            for _tgt, _d0s in _d0s_to_apply:
+                _label = f" — {_tgt}" if _tgt else ""
+                _mask = (
+                    (results_df['Target'] == _tgt) if _tgt is not None
+                    else results_df['Copies_D0'].notna()
+                ) & results_df['Copies_D0'].notna()
+                _n = int(_mask.sum())
+                _med = results_df.loc[_mask, 'Copies_D0'].median() if _n else np.nan
+                m1, m2, m3 = st.columns(3)
+                m1.metric(f"D0_single{_label}", f"{_d0s:.3e}")
+                m2.metric("Samples calibrated", f"{_n}")
+                m3.metric("Median copies", f"{_med:.2e}" if not np.isnan(_med) else "—")
+
+            # Scatter plot: D0 vs Copies
+            import plotly.graph_objects as go
+            _plot_mask = results_df['Copies_D0'].notna() & (results_df['D0'] > 0)
+            if _plot_mask.any():
+                _fig_d0s = go.Figure()
+                if _has_targets_col:
+                    for _tgt, _d0s in _d0s_to_apply:
+                        _t_mask = _plot_mask & (results_df['Target'] == _tgt)
+                        if _t_mask.any():
+                            _fig_d0s.add_trace(go.Scatter(
+                                x=results_df.loc[_t_mask, 'D0'],
+                                y=results_df.loc[_t_mask, 'Copies_D0'],
+                                mode='markers',
+                                name=_tgt or '(all)',
+                                text=results_df.loc[_t_mask, 'Sample'],
+                                hovertemplate=(
+                                    '%{text}<br>D0 = %{x:.2e}<br>'
+                                    'Copies = %{y:.2e}<extra></extra>'
+                                ),
+                            ))
+                else:
+                    _fig_d0s.add_trace(go.Scatter(
+                        x=results_df.loc[_plot_mask, 'D0'],
+                        y=results_df.loc[_plot_mask, 'Copies_D0'],
+                        mode='markers',
+                        name='Copies',
+                        text=results_df.loc[_plot_mask, 'Sample'],
+                        hovertemplate=(
+                            '%{text}<br>D0 = %{x:.2e}<br>'
+                            'Copies = %{y:.2e}<extra></extra>'
+                        ),
+                    ))
+                _fig_d0s.update_layout(
+                    title="D0 vs Estimated Copies",
+                    xaxis_title="D0 (fluorescence units)",
+                    yaxis_title="Copies",
+                    xaxis_type="log",
+                    yaxis_type="log",
+                    height=400,
+                )
+                st.plotly_chart(_fig_d0s, use_container_width=True)
+
+            # Store calibration summary for Excel export
+            st.session_state['_d0_single_calibration_df'] = _cal_summary_df
 
     # ── Sync Copies_D0 back to batch_results_list (used by visualizations) ──
     if 'Copies_D0' in results_df.columns:
