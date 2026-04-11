@@ -4265,7 +4265,6 @@ if 'batch_results' in st.session_state:
     cal_method = st.session_state.get('calibration_method', 'auto')
 
     has_standards = (
-        cal_method == 'auto' and
         sample_metadata is not None and
         any(m.get('Task') == 'STANDARD' for m in sample_metadata.values())
     )
@@ -4314,6 +4313,40 @@ if 'batch_results' in st.session_state:
             _any_cal_succeeded = True
 
             _ch_label = f" ({_cal_ch})" if _cal_ch else ""
+
+            # ── Enrich standard curve data with D0_single predicted copies ──
+            _d0s_for_std = None
+            _d0s_per_tgt = st.session_state.get('d0_single_per_target', {})
+            _d0s_global_v = st.session_state.get('d0_single_value')
+            if cal_method == 'd0_single':
+                if _d0s_per_tgt:
+                    # For standard curve, find the target that has standards
+                    _std_targets_set = set()
+                    for _mk, _mv in (sample_metadata or {}).items():
+                        if _mv.get('Task') == 'STANDARD':
+                            _std_targets_set.add(_mv.get('_target', ''))
+                    for _st_tgt in _std_targets_set:
+                        if _d0s_per_tgt.get(_st_tgt, 0) > 0:
+                            _d0s_for_std = _d0s_per_tgt[_st_tgt]
+                            break
+                elif _d0s_global_v and _d0s_global_v > 0:
+                    _d0s_for_std = _d0s_global_v
+
+            if _d0s_for_std and _d0s_for_std > 0:
+                if calibration is not None:
+                    _ppd = calibration['per_point_data']
+                    _ppd['Predicted_Copies'] = _ppd['D0'] / _d0s_for_std
+                    _ppd['log10_Predicted'] = np.log10(_ppd['Predicted_Copies'])
+                if ct_calibration is not None:
+                    _ct_ppd = ct_calibration['per_point_data']
+                    if 'D0' not in _ct_ppd.columns:
+                        # Ct per_point_data may not have D0; look it up from results
+                        _ct_d0_map = dict(zip(results_df['Sample'], results_df['D0']))
+                        _ct_ppd['D0'] = _ct_ppd['Well'].map(_ct_d0_map)
+                    _valid_d0 = _ct_ppd['D0'].notna() & (_ct_ppd['D0'] > 0)
+                    _ct_ppd.loc[_valid_d0, 'Predicted_Copies'] = (
+                        _ct_ppd.loc[_valid_d0, 'D0'] / _d0s_for_std
+                    )
 
             # Determine side-by-side layout
             both_succeeded = calibration is not None and ct_calibration is not None
@@ -4423,6 +4456,11 @@ if 'batch_results' in st.session_state:
                             'SD D0': f"{var_info['sd_D0']:.4e}" if not np.isnan(var_info['sd_D0']) else '-',
                             'D0 CV%': f"{var_info['cv_D0_pct']:.1f}" if not np.isnan(var_info['cv_D0_pct']) else '-',
                         }
+                        if _d0s_for_std and _d0s_for_std > 0:
+                            _pred_copies = var_info['mean_D0'] / _d0s_for_std
+                            row['Predicted Copies'] = f"{_pred_copies:.2e}"
+                            _ratio = _pred_copies / copies_val if copies_val > 0 else np.nan
+                            row['Pred/Known'] = f"{_ratio:.2f}" if not np.isnan(_ratio) else '-'
                         if ct_calibration is not None:
                             ct_var = ct_calibration['replicate_variance'].get(copies_val)
                             if ct_var:
@@ -4437,54 +4475,56 @@ if 'batch_results' in st.session_state:
                     _var_key_suffix = f"_{_cal_ch}" if _cal_ch else ""
                     st.session_state[f'_std_curve_variance_df{_var_key_suffix}'] = _var_df
 
-            # ── Apply calibration for this channel ─────────────────
-            if _cal_ch is not None:
-                _ch_mask = results_df['Channel'] == _cal_ch
-                if calibration is not None:
-                    cal_subset = apply_calibration(results_df[_ch_mask].copy(), calibration=calibration)
-                    results_df.loc[_ch_mask, 'Copies_D0'] = cal_subset['Copies_D0']
-                if ct_calibration is not None:
-                    ct_subset = apply_ct_calibration(results_df[_ch_mask].copy(), ct_calibration)
-                    results_df.loc[_ch_mask, 'Copies_Ct'] = ct_subset['Copies_Ct']
-            else:
-                # Single-channel or Target-based handling
-                if 'Target' in results_df.columns:
-                    std_targets = set()
-                    for key, meta in (sample_metadata or {}).items():
-                        if meta.get('Task') == 'STANDARD':
-                            std_targets.add(meta.get('_target', ''))
-                    if std_targets and len(std_targets) == 1:
-                        cal_target = list(std_targets)[0]
-                        mask = results_df['Target'] == cal_target
-                        if calibration is not None:
-                            cal_subset = apply_calibration(results_df[mask].copy(), calibration=calibration)
-                            results_df.loc[mask, 'Copies_D0'] = cal_subset['Copies_D0']
-                        if ct_calibration is not None:
-                            ct_subset = apply_ct_calibration(results_df[mask].copy(), ct_calibration)
-                            results_df.loc[mask, 'Copies_Ct'] = ct_subset['Copies_Ct']
-                        other_targets = [t for t in results_df['Target'].unique() if t != cal_target]
-                        if other_targets:
-                            st.info(f"ℹ️ Other targets ({', '.join(other_targets)}) do not have standards — no copy numbers assigned.")
+            # ── Apply calibration for this channel (only when auto mode) ──
+            if cal_method == 'auto':
+                if _cal_ch is not None:
+                    _ch_mask = results_df['Channel'] == _cal_ch
+                    if calibration is not None:
+                        cal_subset = apply_calibration(results_df[_ch_mask].copy(), calibration=calibration)
+                        results_df.loc[_ch_mask, 'Copies_D0'] = cal_subset['Copies_D0']
+                    if ct_calibration is not None:
+                        ct_subset = apply_ct_calibration(results_df[_ch_mask].copy(), ct_calibration)
+                        results_df.loc[_ch_mask, 'Copies_Ct'] = ct_subset['Copies_Ct']
+                else:
+                    # Single-channel or Target-based handling
+                    if 'Target' in results_df.columns:
+                        std_targets = set()
+                        for key, meta in (sample_metadata or {}).items():
+                            if meta.get('Task') == 'STANDARD':
+                                std_targets.add(meta.get('_target', ''))
+                        if std_targets and len(std_targets) == 1:
+                            cal_target = list(std_targets)[0]
+                            mask = results_df['Target'] == cal_target
+                            if calibration is not None:
+                                cal_subset = apply_calibration(results_df[mask].copy(), calibration=calibration)
+                                results_df.loc[mask, 'Copies_D0'] = cal_subset['Copies_D0']
+                            if ct_calibration is not None:
+                                ct_subset = apply_ct_calibration(results_df[mask].copy(), ct_calibration)
+                                results_df.loc[mask, 'Copies_Ct'] = ct_subset['Copies_Ct']
+                            other_targets = [t for t in results_df['Target'].unique() if t != cal_target]
+                            if other_targets:
+                                st.info(f"ℹ️ Other targets ({', '.join(other_targets)}) do not have standards — no copy numbers assigned.")
+                        else:
+                            if calibration is not None:
+                                results_df = apply_calibration(results_df, calibration=calibration)
+                            if ct_calibration is not None:
+                                results_df = apply_ct_calibration(results_df, ct_calibration)
                     else:
                         if calibration is not None:
                             results_df = apply_calibration(results_df, calibration=calibration)
                         if ct_calibration is not None:
                             results_df = apply_ct_calibration(results_df, ct_calibration)
-                else:
-                    if calibration is not None:
-                        results_df = apply_calibration(results_df, calibration=calibration)
-                    if ct_calibration is not None:
-                        results_df = apply_ct_calibration(results_df, ct_calibration)
 
         if not _any_cal_succeeded:
             st.warning("Could not build standard curve (need ≥ 2 concentration levels with successful fits)")
-            if manual_cf_val and manual_cf_val > 0:
+            if cal_method == 'auto' and manual_cf_val and manual_cf_val > 0:
                 results_df = apply_calibration(results_df, manual_cf=manual_cf_val)
                 st.info(f"Using manual conversion factor: {manual_cf_val:.2e} copies/D0")
 
-        st.session_state['batch_results'] = results_df
+        if cal_method == 'auto':
+            st.session_state['batch_results'] = results_df
 
-    elif cal_method == 'limited_dilution' and len(ld_wells) >= 3:
+    if cal_method == 'limited_dilution' and len(ld_wells) >= 3:
         st.markdown("---")
         st.subheader("📐 Limited Dilution Calibration")
 
