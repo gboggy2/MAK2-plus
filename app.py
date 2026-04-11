@@ -4028,7 +4028,6 @@ if 'batch_results' in st.session_state:
             ('_replicate_stats_df',      'Replicate Statistics'),
             ('_precision_comparison_df', 'Precision Comparison'),
             ('_limited_dilution_df',     'Limited Dilution'),
-            ('_d0_single_calibration_df', 'D0_single Calibration'),
         ]
         for _ss_key, _sheet_name in _xl_keys:
             _df = st.session_state.get(_ss_key)
@@ -4059,32 +4058,33 @@ if 'batch_results' in st.session_state:
             elif len(_copies_all) > 0:
                 _xl_extra['Copies'] = _copies_all
 
-        # Per-channel standard curve variance sheets
-        _xl_cal_channels = st.session_state.get('_std_curve_channels', [None])
-        for _xl_ch in _xl_cal_channels:
-            _ch_sfx = f"_{_xl_ch}" if _xl_ch else ""
-            _ch_label = f" ({_xl_ch})" if _xl_ch else ""
-            _var_df_ch = st.session_state.get(f'_std_curve_variance_df{_ch_sfx}')
-            if _var_df_ch is not None and len(_var_df_ch) > 0:
-                _xl_extra[f'Std Curve Variance{_ch_label}'] = _var_df_ch
+        # Per-channel/target standard curve variance sheets
+        _xl_grp_keys = st.session_state.get('_std_curve_group_keys', [None])
+        for _xl_gk in _xl_grp_keys:
+            _gk_sfx = f"_{_xl_gk}" if _xl_gk else ""
+            _gk_label = f" ({_xl_gk})" if _xl_gk else ""
+            _var_df_gk = st.session_state.get(f'_std_curve_variance_df{_gk_sfx}')
+            if _var_df_gk is not None and len(_var_df_gk) > 0:
+                _sheet_nm = f'Std Curve Variance{_gk_label}'[:31]
+                _xl_extra[_sheet_nm] = _var_df_gk
 
         # Gather chart sheets (data + summary + native Excel chart)
-        # Per-channel D0 and Ct standard curve sheets
+        # Per-channel/target D0 and Ct standard curve sheets
         _xl_charts = {}
-        for _xl_ch in _xl_cal_channels:
-            _ch_sfx = f"_{_xl_ch}" if _xl_ch else ""
-            _ch_label = f" ({_xl_ch})" if _xl_ch else ""
-            _d0_df = st.session_state.get(f'_std_curve_d0_df{_ch_sfx}')
-            _d0_sum = st.session_state.get(f'_std_curve_d0_summary{_ch_sfx}')
+        for _xl_gk in _xl_grp_keys:
+            _gk_sfx = f"_{_xl_gk}" if _xl_gk else ""
+            _gk_label = f" ({_xl_gk})" if _xl_gk else ""
+            _d0_df = st.session_state.get(f'_std_curve_d0_df{_gk_sfx}')
+            _d0_sum = st.session_state.get(f'_std_curve_d0_summary{_gk_sfx}')
             if _d0_df is not None and len(_d0_df) > 0:
-                _xl_charts[f'Std Curve D0{_ch_label}'] = {
+                _xl_charts[f'Std Curve D0{_gk_label}'[:31]] = {
                     'data': _d0_df, 'summary': _d0_sum or {},
                     'chart_type': 'std_curve_d0',
                 }
-            _ct_df = st.session_state.get(f'_std_curve_ct_df{_ch_sfx}')
-            _ct_sum = st.session_state.get(f'_std_curve_ct_summary{_ch_sfx}')
+            _ct_df = st.session_state.get(f'_std_curve_ct_df{_gk_sfx}')
+            _ct_sum = st.session_state.get(f'_std_curve_ct_summary{_gk_sfx}')
             if _ct_df is not None and len(_ct_df) > 0:
-                _xl_charts[f'Std Curve Ct{_ch_label}'] = {
+                _xl_charts[f'Std Curve Ct{_gk_label}'[:31]] = {
                     'data': _ct_df, 'summary': _ct_sum or {},
                     'chart_type': 'std_curve_ct',
                 }
@@ -4287,47 +4287,78 @@ if 'batch_results' in st.session_state:
                 results_df.insert(0, 'Channel', _derived_ch)
         _has_multi_ch = 'Channel' in results_df.columns and results_df['Channel'].nunique() > 1
         _cal_channels = list(results_df['Channel'].unique()) if _has_multi_ch else [None]
+
+        # Also detect per-target standard curves for multiplexed data
+        _has_multi_tgt = (
+            'Target' in results_df.columns
+            and results_df['Target'].nunique() > 1
+            and not _has_multi_ch  # targets and channels are mutually exclusive groupings
+        )
+
+        # Build iteration list: (channel_or_None, target_or_None) pairs
+        if _has_multi_tgt:
+            # Per-target: find which targets have standards
+            _tgt_with_stds = set()
+            for _mk, _mv in (sample_metadata or {}).items():
+                if _mv.get('Task') == 'STANDARD':
+                    _tgt_with_stds.add(_mv.get('_target', ''))
+            # Also check results_df directly
+            if 'Task' in results_df.columns and 'Target' in results_df.columns:
+                _std_rows = results_df[results_df['Task'] == 'STANDARD']
+                _tgt_with_stds.update(_std_rows['Target'].dropna().unique())
+            _cal_groups = [(None, t) for t in sorted(_tgt_with_stds) if t]
+        else:
+            _cal_groups = [(_ch, None) for _ch in _cal_channels]
+
         st.session_state['_std_curve_channels'] = _cal_channels
+        # Store all group keys (channels or targets) for Excel export lookup
+        _all_grp_keys = [(_cal_ch or _cal_tgt) for _cal_ch, _cal_tgt in _cal_groups]
+        st.session_state['_std_curve_group_keys'] = _all_grp_keys
 
         _any_cal_succeeded = False
-        _per_ch_cals = {}  # channel → (calibration, ct_calibration)
+        _per_ch_cals = {}  # channel/target → (calibration, ct_calibration)
 
-        for _cal_ch in _cal_channels:
-            # Filter results and metadata to this channel
+        for _cal_ch, _cal_tgt in _cal_groups:
+            # Filter results and metadata to this channel or target
             if _cal_ch is not None:
                 _ch_mask = results_df['Channel'] == _cal_ch
                 _ch_df = results_df[_ch_mask].copy()
-                # Filter sample_metadata to keys starting with this channel
                 _ch_meta = {k: v for k, v in (sample_metadata or {}).items()
                             if k.startswith(f"{_cal_ch}_")}
+            elif _cal_tgt is not None:
+                _ch_mask = results_df['Target'] == _cal_tgt
+                _ch_df = results_df[_ch_mask].copy()
+                # Filter metadata to keys belonging to this target
+                _ch_meta = {k: v for k, v in (sample_metadata or {}).items()
+                            if v.get('_target') == _cal_tgt
+                            or k.startswith(f"{_cal_tgt}::")}
             else:
                 _ch_df = results_df
                 _ch_meta = sample_metadata
 
             calibration = build_standard_curve(_ch_df, _ch_meta)
             ct_calibration = build_ct_standard_curve(_ch_df, _ch_meta)
-            _per_ch_cals[_cal_ch] = (calibration, ct_calibration)
+            _grp_key = _cal_ch or _cal_tgt
+            _per_ch_cals[_grp_key] = (calibration, ct_calibration)
 
             if calibration is None and ct_calibration is None:
                 continue
             _any_cal_succeeded = True
 
-            _ch_label = f" ({_cal_ch})" if _cal_ch else ""
+            _ch_label = f" ({_cal_ch})" if _cal_ch else (f" ({_cal_tgt})" if _cal_tgt else "")
 
             # ── Enrich standard curve data with D0_single predicted copies ──
             _d0s_for_std = None
             _d0s_per_tgt = st.session_state.get('d0_single_per_target', {})
             _d0s_global_v = st.session_state.get('d0_single_value')
             if cal_method == 'd0_single':
-                if _d0s_per_tgt:
-                    # For standard curve, find the target that has standards
-                    _std_targets_set = set()
-                    for _mk, _mv in (sample_metadata or {}).items():
-                        if _mv.get('Task') == 'STANDARD':
-                            _std_targets_set.add(_mv.get('_target', ''))
-                    for _st_tgt in _std_targets_set:
-                        if _d0s_per_tgt.get(_st_tgt, 0) > 0:
-                            _d0s_for_std = _d0s_per_tgt[_st_tgt]
+                if _cal_tgt and _d0s_per_tgt.get(_cal_tgt, 0) > 0:
+                    _d0s_for_std = _d0s_per_tgt[_cal_tgt]
+                elif _d0s_per_tgt:
+                    # Fallback: find any matching target
+                    for _st_tgt, _st_val in _d0s_per_tgt.items():
+                        if _st_val and _st_val > 0:
+                            _d0s_for_std = _st_val
                             break
                 elif _d0s_global_v and _d0s_global_v > 0:
                     _d0s_for_std = _d0s_global_v
@@ -4387,10 +4418,37 @@ if 'batch_results' in st.session_state:
                         st.warning(w)
 
                     fig_cal = plot_calibration(calibration, channel_label=_ch_label)
+
+                    # Add predicted copies from D0_single if available
+                    _ppd = calibration['per_point_data']
+                    if 'Predicted_Copies' in _ppd.columns and _d0s_for_std:
+                        import plotly.graph_objects as go
+                        fig_cal.add_trace(go.Scatter(
+                            x=_ppd['log10_D0'],
+                            y=_ppd['log10_Predicted'],
+                            mode='markers',
+                            name='D0_single predicted',
+                            marker=dict(size=10, color='red', symbol='x',
+                                        line=dict(width=2)),
+                            hovertemplate=(
+                                'Well: %{customdata[0]}<br>'
+                                'D0: %{customdata[1]:.4e}<br>'
+                                'Known: %{customdata[2]:.2e}<br>'
+                                'Predicted: %{customdata[3]:.2e}'
+                                '<extra></extra>'
+                            ),
+                            customdata=_ppd[['Well', 'D0', 'Known_Copies', 'Predicted_Copies']].values,
+                        ))
+                        fig_cal.update_layout(
+                            title=dict(text=(
+                                fig_cal.layout.title.text or ''
+                            ) + f'<br><sub>D0_single = {_d0s_for_std:.3e}</sub>'),
+                        )
+
                     st.plotly_chart(fig_cal, use_container_width=True)
 
-                    # Store D0 standard curve data for Excel export (per-channel)
-                    _d0_key_suffix = f"_{_cal_ch}" if _cal_ch else ""
+                    # Store D0 standard curve data for Excel export
+                    _d0_key_suffix = f"_{_grp_key}" if _grp_key else ""
                     st.session_state[f'_std_curve_d0_df{_d0_key_suffix}'] = calibration['per_point_data'].copy()
                     st.session_state[f'_std_curve_d0_summary{_d0_key_suffix}'] = {
                         'slope': calibration['slope'],
@@ -4430,8 +4488,8 @@ if 'batch_results' in st.session_state:
                     fig_ct = plot_ct_calibration(ct_calibration, channel_label=_ch_label)
                     st.plotly_chart(fig_ct, use_container_width=True)
 
-                    # Store Ct standard curve data for Excel export (per-channel)
-                    _ct_key_suffix = f"_{_cal_ch}" if _cal_ch else ""
+                    # Store Ct standard curve data for Excel export
+                    _ct_key_suffix = f"_{_grp_key}" if _grp_key else ""
                     st.session_state[f'_std_curve_ct_df{_ct_key_suffix}'] = ct_calibration['per_point_data'].copy()
                     st.session_state[f'_std_curve_ct_summary{_ct_key_suffix}'] = {
                         'slope': ct_calibration['slope'],
@@ -4470,50 +4528,33 @@ if 'batch_results' in st.session_state:
                         var_data.append(row)
                 _var_df = pd.DataFrame(var_data)
                 st.dataframe(_var_df, use_container_width=True)
-                # Store for Excel export (per-channel)
+                # Store for Excel export
                 if len(_var_df) > 0:
-                    _var_key_suffix = f"_{_cal_ch}" if _cal_ch else ""
+                    _var_key_suffix = f"_{_grp_key}" if _grp_key else ""
                     st.session_state[f'_std_curve_variance_df{_var_key_suffix}'] = _var_df
 
-            # ── Apply calibration for this channel (only when auto mode) ──
+            # ── Apply calibration (only when auto mode) ──
             if cal_method == 'auto':
+                # Apply to the appropriate subset (channel, target, or all)
                 if _cal_ch is not None:
-                    _ch_mask = results_df['Channel'] == _cal_ch
-                    if calibration is not None:
-                        cal_subset = apply_calibration(results_df[_ch_mask].copy(), calibration=calibration)
-                        results_df.loc[_ch_mask, 'Copies_D0'] = cal_subset['Copies_D0']
-                    if ct_calibration is not None:
-                        ct_subset = apply_ct_calibration(results_df[_ch_mask].copy(), ct_calibration)
-                        results_df.loc[_ch_mask, 'Copies_Ct'] = ct_subset['Copies_Ct']
+                    _apply_mask = results_df['Channel'] == _cal_ch
+                elif _cal_tgt is not None:
+                    _apply_mask = results_df['Target'] == _cal_tgt
                 else:
-                    # Single-channel or Target-based handling
-                    if 'Target' in results_df.columns:
-                        std_targets = set()
-                        for key, meta in (sample_metadata or {}).items():
-                            if meta.get('Task') == 'STANDARD':
-                                std_targets.add(meta.get('_target', ''))
-                        if std_targets and len(std_targets) == 1:
-                            cal_target = list(std_targets)[0]
-                            mask = results_df['Target'] == cal_target
-                            if calibration is not None:
-                                cal_subset = apply_calibration(results_df[mask].copy(), calibration=calibration)
-                                results_df.loc[mask, 'Copies_D0'] = cal_subset['Copies_D0']
-                            if ct_calibration is not None:
-                                ct_subset = apply_ct_calibration(results_df[mask].copy(), ct_calibration)
-                                results_df.loc[mask, 'Copies_Ct'] = ct_subset['Copies_Ct']
-                            other_targets = [t for t in results_df['Target'].unique() if t != cal_target]
-                            if other_targets:
-                                st.info(f"ℹ️ Other targets ({', '.join(other_targets)}) do not have standards — no copy numbers assigned.")
-                        else:
-                            if calibration is not None:
-                                results_df = apply_calibration(results_df, calibration=calibration)
-                            if ct_calibration is not None:
-                                results_df = apply_ct_calibration(results_df, ct_calibration)
-                    else:
-                        if calibration is not None:
-                            results_df = apply_calibration(results_df, calibration=calibration)
-                        if ct_calibration is not None:
-                            results_df = apply_ct_calibration(results_df, ct_calibration)
+                    _apply_mask = None  # apply to all
+
+                if _apply_mask is not None:
+                    if calibration is not None:
+                        cal_subset = apply_calibration(results_df[_apply_mask].copy(), calibration=calibration)
+                        results_df.loc[_apply_mask, 'Copies_D0'] = cal_subset['Copies_D0']
+                    if ct_calibration is not None:
+                        ct_subset = apply_ct_calibration(results_df[_apply_mask].copy(), ct_calibration)
+                        results_df.loc[_apply_mask, 'Copies_Ct'] = ct_subset['Copies_Ct']
+                else:
+                    if calibration is not None:
+                        results_df = apply_calibration(results_df, calibration=calibration)
+                    if ct_calibration is not None:
+                        results_df = apply_ct_calibration(results_df, ct_calibration)
 
         if not _any_cal_succeeded:
             st.warning("Could not build standard curve (need ≥ 2 concentration levels with successful fits)")
@@ -4649,94 +4690,6 @@ if 'batch_results' in st.session_state:
                 else:
                     results_df = apply_calibration(results_df, manual_cf=_cf)
             st.session_state['batch_results'] = results_df
-
-            # ── Display calibration summary ──────────────────────────
-            st.markdown("---")
-            st.subheader("📐 Single-copy D0 Calibration")
-
-            # Per-target summary table
-            _cal_rows = []
-            for _tgt, _d0s in _d0s_to_apply:
-                _cf = 1.0 / _d0s
-                if _tgt is not None:
-                    _mask = (results_df['Target'] == _tgt) & results_df['Copies_D0'].notna()
-                else:
-                    _mask = results_df['Copies_D0'].notna()
-                _copies_vals = results_df.loc[_mask, 'Copies_D0']
-                _d0_vals = results_df.loc[_mask, 'D0']
-                _row = {
-                    'Target': _tgt or '(all)',
-                    'D0_single': _d0s,
-                    'CF (1/D0_single)': _cf,
-                    'N samples': int(_mask.sum()),
-                    'Copies (mean)': _copies_vals.mean() if len(_copies_vals) else np.nan,
-                    'Copies (median)': _copies_vals.median() if len(_copies_vals) else np.nan,
-                    'Copies (min)': _copies_vals.min() if len(_copies_vals) else np.nan,
-                    'Copies (max)': _copies_vals.max() if len(_copies_vals) else np.nan,
-                }
-                _cal_rows.append(_row)
-
-            _cal_summary_df = pd.DataFrame(_cal_rows)
-            st.markdown("**Calibration: copies = D0 / D0_single**")
-
-            # Metrics row
-            for _tgt, _d0s in _d0s_to_apply:
-                _label = f" — {_tgt}" if _tgt else ""
-                _mask = (
-                    (results_df['Target'] == _tgt) if _tgt is not None
-                    else results_df['Copies_D0'].notna()
-                ) & results_df['Copies_D0'].notna()
-                _n = int(_mask.sum())
-                _med = results_df.loc[_mask, 'Copies_D0'].median() if _n else np.nan
-                m1, m2, m3 = st.columns(3)
-                m1.metric(f"D0_single{_label}", f"{_d0s:.3e}")
-                m2.metric("Samples calibrated", f"{_n}")
-                m3.metric("Median copies", f"{_med:.2e}" if not np.isnan(_med) else "—")
-
-            # Scatter plot: D0 vs Copies
-            import plotly.graph_objects as go
-            _plot_mask = results_df['Copies_D0'].notna() & (results_df['D0'] > 0)
-            if _plot_mask.any():
-                _fig_d0s = go.Figure()
-                if _has_targets_col:
-                    for _tgt, _d0s in _d0s_to_apply:
-                        _t_mask = _plot_mask & (results_df['Target'] == _tgt)
-                        if _t_mask.any():
-                            _fig_d0s.add_trace(go.Scatter(
-                                x=results_df.loc[_t_mask, 'D0'],
-                                y=results_df.loc[_t_mask, 'Copies_D0'],
-                                mode='markers',
-                                name=_tgt or '(all)',
-                                text=results_df.loc[_t_mask, 'Sample'],
-                                hovertemplate=(
-                                    '%{text}<br>D0 = %{x:.2e}<br>'
-                                    'Copies = %{y:.2e}<extra></extra>'
-                                ),
-                            ))
-                else:
-                    _fig_d0s.add_trace(go.Scatter(
-                        x=results_df.loc[_plot_mask, 'D0'],
-                        y=results_df.loc[_plot_mask, 'Copies_D0'],
-                        mode='markers',
-                        name='Copies',
-                        text=results_df.loc[_plot_mask, 'Sample'],
-                        hovertemplate=(
-                            '%{text}<br>D0 = %{x:.2e}<br>'
-                            'Copies = %{y:.2e}<extra></extra>'
-                        ),
-                    ))
-                _fig_d0s.update_layout(
-                    title="D0 vs Estimated Copies",
-                    xaxis_title="D0 (fluorescence units)",
-                    yaxis_title="Copies",
-                    xaxis_type="log",
-                    yaxis_type="log",
-                    height=400,
-                )
-                st.plotly_chart(_fig_d0s, use_container_width=True)
-
-            # Store calibration summary for Excel export
-            st.session_state['_d0_single_calibration_df'] = _cal_summary_df
 
     # ── Sync Copies_D0 back to batch_results_list (used by visualizations) ──
     if 'Copies_D0' in results_df.columns:
