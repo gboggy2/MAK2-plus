@@ -67,8 +67,7 @@ class MAK2Model:
         cycles = np.arange(n_cycles)
         D = np.zeros(n_cycles)
         P = np.zeros(n_cycles)
-        F = np.zeros(n_cycles)
-        
+
         # Set initial conditions
         D[0] = D0
         P[0] = P0
@@ -568,17 +567,6 @@ def estimate_D0_bounds(
     # Store baseline_end_cycle for late-baseline detection (used for k bounds constraint)
     baseline_end_cycle = baseline_cycles_final[-1]
 
-    # Find first cycle with real signal (for information only)
-    min_signal_threshold = max(0.001, F_min + 0.01 * F_range)
-    real_signal_idx = np.where(fluorescence > min_signal_threshold)[0]
-    
-    if len(real_signal_idx) > 0:
-        first_signal_cycle = real_signal_idx[0]
-        print(f"  First cycle with real signal (>{min_signal_threshold:.4f}): cycle {first_signal_cycle}")
-    else:
-        first_signal_cycle = 0
-        print(f"  Warning: No cycles above threshold {min_signal_threshold:.4f}")
-    
     # ── Find the exponential region by scanning from the LAST cycle ──────
     # The inflection (max slope) of the S-curve is the boundary between
     # exponential growth and primer-depletion plateau.  Searching from the
@@ -661,9 +649,7 @@ def estimate_D0_bounds(
     cycle_offset = cycles[exp_region_lower[0]]
     cycles_lower_shifted = cycles_lower - cycle_offset
     cycles_upper_shifted = cycles_upper - cycle_offset
-    
-    F_min = fluorescence.min()
-    
+
     try:
         # Model 1: Perfect doubling (lower bound)
         # F = (F_bg_intercept + F_bg_slope * n) + D0 * 2^n
@@ -859,8 +845,7 @@ def estimate_D0_bounds(
             )
         except Exception as e:
             k_estimate = None
-            if verbose:
-                print(f"  Warning: k estimation failed ({str(e)})")
+            print(f"  Warning: k estimation failed ({str(e)})")
 
         # Store fit info for visualization
         fit_info = {
@@ -1255,38 +1240,3 @@ def estimate_MAK2_params_from_exponential(
     return estimates, bounds
 
 
-if __name__ == "__main__":
-    # Example usage
-    model = MAK2Model()
-    
-    # Simulate with typical parameters
-    D0 = 100  # Initial template molecules
-    k = 0.5   # PCR constant
-    P0 = 1e6  # Initial primer concentration
-    n_cycles = 40
-    
-    cycles, D, F = model.simulate_cycles(
-        D0=D0,
-        k=k,
-        P0=P0,
-        n_cycles=n_cycles,
-        F_bg_intercept=0.1,
-        F_bg_slope=0.001
-    )
-    
-    print("MAK2 Model Simulation")
-    print(f"D0 = {D0}, k = {k}, P0 = {P0}")
-    print(f"\nFirst 10 cycles:")
-    print("Cycle\tDNA\tFluorescence")
-    for i in range(10):
-        print(f"{i}\t{D[i]:.2f}\t{F[i]:.4f}")
-    
-    # Calculate efficiency
-    efficiency = calculate_amplification_efficiency(D)
-    print(f"\nAmplification efficiency (first 10 cycles):")
-    for i in range(10):
-        print(f"Cycle {i+1}: {efficiency[i]:.4f}")
-    
-    # Find truncation point
-    trunc_cycle = find_truncation_cycle(F)
-    print(f"\nTruncation cycle (max slope increase): {trunc_cycle}")
