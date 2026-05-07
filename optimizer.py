@@ -1,6 +1,111 @@
-"""
-Optimizer for fitting MAK2 model to qPCR data.
-Uses adaptive multi-start Levenberg-Marquardt optimization.
+"""Tiered MAK2 fitter with escalation, fallback, and quality gates.
+
+This module turns a single per-well fluorescence array into fitted
+``(D0, k, P0, F_bg_intercept, F_bg_slope)`` parameters by walking
+through a sequence of optimisation strategies — cheaper / more
+constrained at the top, slower / more exhaustive at the bottom —
+and stopping at the first one that produces a fit clearing the R²
+threshold.
+
+Why a tier system instead of one optimisation method?
+=====================================================
+
+The MAK2 loss surface has shallow local minima around the true
+optimum and a few sharp wrong basins (e.g. background-absorbs-D0
+solutions that look great on R² but quantify nonsense). No single
+optimiser handles every well well:
+
+- **Trust Region Reflective (TRF)** is fast and well-behaved when
+  given a reasonable starting point — it's perfect for "easy" wells
+  with strong signal and clear sigmoid shape.
+- **Latin Hypercube Sampling + TRF** rescues "hard" wells by seeding
+  TRF from many corners of the parameter box, reducing the chance of
+  getting stuck in a local minimum.
+- **Differential Evolution** is the heavy hitter — global stochastic
+  search that ignores starting points entirely, used only when LHS
+  also fails to find a good fit.
+
+Doing all three on every well would be wasteful (DE alone is ~10×
+slower than TRF). The tier system tries the cheap option first and
+escalates only when needed.
+
+Tier overview
+=============
+
+The tiers are tagged in ``optimal_params['tier']`` so downstream
+code (``run_batch.run_pass1``) can record which tier produced each
+well's fit:
+
+  - ``T1-Full``     — TRF with all 5 parameters free, single attempt.
+  - ``T1-Fixed``    — TRF with background pinned to the per-well
+                       pre-estimate (``fix_background=True``). Avoids
+                       background-absorbs-D0 failure mode.
+  - ``T1.5``        — TRF retry with adjusted bounds when the first
+                       attempt's residuals show specific failure
+                       patterns (k-stuck-at-bound, residuals-elbow,
+                       etc.). Includes the well-specific pattern
+                       blocks (X6.R4.2, X5.R3.1, …) that were tuned
+                       against problematic Rutledge-dataset wells.
+  - ``T2-LHS``      — Latin Hypercube multi-start: 3D LHS samples
+                       (D0, k, P0) with background pinned, fed as
+                       initial guesses to TRF.
+  - ``T2.5``        — 5D LHS fallback: LHS samples include
+                       background, background no longer pinned.
+                       Last resort before DE.
+  - ``T3-DE``       — Scipy ``differential_evolution`` with the
+                       full 5D parameter box. Slow but global.
+  - ``T4``          — Plateau-overshoot refit (post-fit correction
+                       when the model exceeds the data plateau).
+
+See ``fit()`` for the per-tier orchestration logic.
+
+Quality gates
+=============
+
+After a fit clears the R² threshold, several gates check whether
+the fit is *meaningful* (not just well-shaped):
+
+  - **R² floor** (Gate 0): R² ≥ 0.999, relaxed to 0.997 for
+    late amplifiers (where the fit window includes the last data
+    cycle and there's less plateau information).
+  - **Fit window width** (Gate 2): ≥ 12 cycles. Narrow windows
+    don't constrain the sigmoid enough.
+  - **Sigmoid vs linear** (Gate 2b): the MAK2 R² must beat a pure
+    linear fit on the same window by ≥ 0.04. Catches the case where
+    the optimiser produced a high-R² monotone non-sigmoid fit.
+  - **Sigmoid shape** (Gate 3): the fitted curve's second derivative
+    must change sign in-window — confirms there's an inflection.
+  - **Plateau overshoot** (Tier 4): the fitted plateau height must
+    not exceed the data plateau by more than a small tolerance.
+
+Background separation (why ``fix_background`` exists)
+=====================================================
+
+Without baseline pinning, a wrong D0 can be hidden by a
+correspondingly wrong background — the fit's R² stays high but the
+quantification answer is meaningless. The baseline is therefore
+estimated separately from the kinetic parameters via two-stage
+fitting (see ``mak2_model.pre_estimate_background``) and pinned in
+during the optimisation. ``fix_background=True`` is the production
+default; ``fix_background=False`` is mostly for diagnostic A/B
+comparison.
+
+Public API
+==========
+
+  - ``calculate_r2`` — top-level R² helper used by tier-internal code.
+  - ``MAK2Optimizer.fit`` — the only entry point you usually call.
+  - ``MAK2Optimizer.calculate_fit_metrics`` — R²/RMSE/AIC/BIC/SSR
+    on the fit window (called by callers after ``fit()``).
+  - ``MAK2Optimizer.predict`` — model prediction at arbitrary cycles.
+  - ``MAK2Optimizer.calculate_ct`` — threshold-cycle from the
+    fitted curve.
+  - ``MAK2Optimizer.check_plateau_overshoot`` — Tier 4 detection
+    helper, also called externally by Tier 4 refit logic.
+
+See ``mak2_model.py`` for the underlying biochemical model and
+``CLAUDE.md``'s "Phase 1 Per-well Pipeline Unification" note for
+the long-term plan to extract the orchestration around this fitter.
 """
 
 # VERSION: 2.0.0 - LHS + Noise + Stuck Detection
@@ -63,32 +168,60 @@ def _derive_seed(offset: int, attempt: int = 0) -> Optional[int]:
 
 
 def calculate_r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """Calculate R² coefficient of determination."""
+    """Compute R² (coefficient of determination) for fitted-vs-observed arrays.
+
+    Standard formula: ``R² = 1 - SS_res / SS_tot``. Returns 0 when
+    ``SS_tot`` is zero (constant data) — the alternative would be
+    NaN, but downstream tier-escalation code interprets 0 as "fit
+    isn't useful, escalate" which is the correct outcome anyway.
+    """
     ss_res = np.sum((y_true - y_pred)**2)
     ss_tot = np.sum((y_true - np.mean(y_true))**2)
     return 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
 
 
 class MAK2Optimizer:
+    """Tiered MAK2 fitter with retry escalation and quality gates.
+
+    Composes a ``MAK2Model`` (the forward simulator) with the multi-tier
+    optimisation strategy described in this module's docstring. The
+    class is instantiated per-fit because it accumulates per-fit state
+    (``optimal_params``, ``cycles_fit``, ``tier_log``, etc.) that
+    callers read after ``fit()`` returns; do not share one instance
+    across concurrent fits.
+
+    Typical usage::
+
+        opt = MAK2Optimizer()
+        params = opt.fit(cycles, fluorescence, fixed_background_values=...)
+        metrics = opt.calculate_fit_metrics()
+        ct_info = opt.calculate_ct(method='threshold')
+
+    State that ``fit()`` populates on the instance (read by callers
+    after fit returns):
+
+      - ``optimal_params``: the best ``{D0, k, P0, F_bg_intercept,
+        F_bg_slope}`` parameter dict, plus tier-tagging metadata.
+      - ``cycles_fit`` / ``fluorescence_fit``: the (possibly
+        truncated) cycle / fluor arrays the fit was actually run on.
+        Saved so ``calculate_fit_metrics``, ``predict``, and
+        ``calculate_ct`` can reuse them without the caller passing
+        them back in.
+      - ``metrics``: R²/RMSE/AIC/BIC/SSR computed at fit-end.
+      - ``n_attempts``: how many TRF attempts were used.
+      - ``tier_log``: list of per-tier timing/improvement dicts —
+        feeds the offline benchmarking in ``benchmark_tiers.py``.
     """
-    Fits MAK2 model parameters to qPCR data using adaptive multi-start
-    Trust Region Reflective (TRF) optimization.
-    
-    The optimizer automatically retries with different initial guesses until
-    a good fit (R² ≥ threshold) is achieved, or max attempts is reached.
-    
-    TRF is a robust bounded optimization method similar to Levenberg-Marquardt
-    but with support for parameter bounds.
-    """
-    
+
     def __init__(self, model: Optional[MAK2Model] = None):
-        """
-        Initialize optimizer.
-        
-        Parameters
-        ----------
-        model : MAK2Model, optional
-            MAK2 model instance (creates new one if not provided)
+        """Construct an optimizer holding a forward-simulator instance.
+
+        Args:
+            model: A ``MAK2Model`` instance to use for forward
+                simulation. Optional; a fresh one is created if not
+                supplied. Sharing a single ``MAK2Model`` across many
+                ``MAK2Optimizer`` instances is fine — the model is
+                stateless.
         """
         self.model = model or MAK2Model()
         self.optimal_params = None
@@ -96,8 +229,10 @@ class MAK2Optimizer:
         self.fluorescence_fit = None
         self.metrics = None
         self.n_attempts = None
-        self.tier_log = []  # Records per-tier timing and improvement data
-        self._skip_overshoot_refit = False  # Set True to prevent recursive refit
+        self.tier_log = []  # one dict per tier: timing, R², improvement, etc.
+        # Set True to prevent the Tier 4 plateau-overshoot refit from
+        # recursing — the refit itself calls fit() internally.
+        self._skip_overshoot_refit = False
     
     def fit(
         self,
@@ -114,42 +249,93 @@ class MAK2Optimizer:
         fixed_background_values: Optional[Dict[str, float]] = None,  # Exact bg values to fix
         disabled_tiers: Optional[Set[str]] = None  # For ablation testing
     ) -> Dict[str, float]:
-        """
-        Fit MAK2 model to qPCR data using adaptive multi-start optimization.
+        """Run the full tiered MAK2 fit and return the best parameters.
 
-        The optimizer tries different random initial guesses until R² ≥ r2_threshold
-        or max_attempts is reached. Most good curves fit well on the first attempt.
+        This is the only method most callers need. It internally
+        walks the tier escalation described in the module docstring,
+        stopping at the first tier whose result clears the R²
+        threshold and the quality gates. Side-effects (per-instance
+        state populated for downstream calls): see the class
+        docstring's "State that ``fit()`` populates" section.
 
-        Parameters
-        ----------
-        cycles : np.ndarray
-            Cycle numbers
-        fluorescence : np.ndarray
-            Fluorescence measurements
-        cycles_after_max : int
-            Cutoff = cycle at max slope + this value (default: 3)
-        auto_truncate : bool
-            Apply automatic truncation (default: True)
-        truncate_cycle : int, optional
-            Manual truncation cycle (overrides auto_truncate)
-        bounds : dict, optional
-            Parameter bounds as {'param': (min, max)}
-            If not provided, uses data-driven bounds from exponential fits
-        max_attempts : int
-            Maximum optimization attempts (default: 5)
-        r2_threshold : float
-            Stop when R² exceeds this value (default: 0.999)
-        verbose : bool
-            Print fitting progress (default: False)
-        fix_background : bool
-            Fix background with adaptive fallback (default: True)
-            - True: Try fixed background first, fallback to 5-param if R² < 0.995
-            - False: Always fit all 5 parameters including background
+        Pipeline:
 
-        Returns
-        -------
-        params : dict
-            Fitted parameters: D0, k, P0, F_bg_intercept, F_bg_slope
+          1. **Truncate** the input array if ``auto_truncate`` (default)
+             — cuts off cycles past the inflection + ``cycles_after_max``,
+             so the fit doesn't get distracted by the noisy tail.
+          2. **Compute bounds.** Either uses caller-supplied
+             ``bounds`` or runs ``estimate_MAK2_params_from_exponential``
+             on the truncated window to derive data-driven box bounds.
+          3. **Pin background** if ``fix_background`` (default). Reads
+             ``fixed_background_values`` if supplied (caller-known
+             baseline regression), else uses the analytical estimates.
+          4. **Tier 1 / 1.5** — TRF with the chosen bounds, with
+             pattern-based retry if the residuals show known failure
+             shapes.
+          5. **Tier 2 / 2.5** — LHS-seeded TRF (3D then 5D fallback).
+          6. **Tier 3** — Differential Evolution.
+          7. **Tier 4** — Plateau-overshoot refit if the chosen fit
+             exceeds the data plateau.
+          8. **Quality gates** post-fit (R² floor, window width,
+             sigmoid-vs-linear discriminator, sigmoid-shape check).
+
+        Args:
+            cycles: Per-cycle cycle-number array.
+            fluorescence: Per-cycle fluorescence array (same length
+                as ``cycles``). Raw RFU or normalised Rn — the model
+                is scale-aware via the data-driven bounds.
+            cycles_after_max: Truncation offset past the inflection
+                cycle. Default 3 includes a few plateau cycles for
+                P0 estimation but excludes the bulk of the noisy
+                tail.
+            auto_truncate: When True, apply automatic truncation via
+                ``find_slope_threshold_cycle``. When False, the fit
+                uses every cycle (only safe if the input is already
+                truncated by the caller).
+            truncate_cycle: Manual truncation cycle (override). When
+                set, ``auto_truncate`` is ignored.
+            bounds: Caller-supplied parameter bounds dict. Keys are
+                ``D0``, ``k``, ``P0``, ``F_bg_intercept``,
+                ``F_bg_slope``; values are ``(lo, hi)`` tuples. Any
+                missing parameter gets data-driven bounds. When
+                ``None``, every bound is derived.
+            max_attempts: Cap on TRF retry attempts. Default 10. Most
+                wells finish in 1–2 attempts; the cap matters only
+                for difficult wells.
+            r2_threshold: Stop-early R² for tier escalation. Default
+                0.999 — qPCR fits with R² > 0.999 are essentially
+                noise-limited and not worth further optimisation.
+            verbose: Print per-attempt diagnostic information.
+                Production callers (``run_batch.run_pass1``) pass
+                False to keep the log readable.
+            fix_background: When True (production default), pins
+                background to the per-well pre-estimate so the
+                kinetic optimiser can't trade D0 against background.
+                When False, fits all 5 parameters jointly.
+            fixed_background_values: Exact background to pin when
+                ``fix_background=True``. Comes from the caller's own
+                ``pre_estimate_background`` regression on the
+                metadata baseline window. Falls back to the
+                analytical estimate when ``None``.
+            disabled_tiers: Set of tier-name strings to skip. Used
+                only for ablation testing in ``benchmark_tiers.py``;
+                production callers don't pass this.
+
+        Returns:
+            Dict with the fitted parameters and tier-tagging metadata.
+            Keys include ``D0``, ``k``, ``P0``, ``F_bg_intercept``,
+            ``F_bg_slope``, plus internal flags like ``de_used``,
+            ``fallback_succeeded``, ``used_fixed_background`` that
+            tell ``run_pass1`` which tier produced the result.
+
+        Raises:
+            ValueError: If ``truncate_cycle`` is before all data,
+                or if computed bounds are invalid (e.g. the
+                pre-existing k-bounds bug for some Boggy wells —
+                see the spawned bug-fix task).
+            RuntimeError: If every tier and every attempt failed —
+                rare in practice, indicates either a pathological
+                well or a bug in the upstream bounds derivation.
         """
         
         # Apply truncation
@@ -827,12 +1013,29 @@ class MAK2Optimizer:
             'improved': True,
         })
 
-        # --- Tier 1.5: Residual Pattern Analysis ---
+        # ── Tier 1.5: Residual-pattern-driven retry ──────────────────────────
+        # When Tier 1 produces a fit that's "good but not great" (R² below the
+        # threshold but above ~0.99), the residual pattern often points at a
+        # specific failure mode — k stuck at the lower bound, plateau
+        # overshoot, baseline elbow, etc. Each pattern is matched against
+        # a tuned bounds adjustment; the optimizer then re-runs Tier 1 with
+        # the corrected bounds.
+        #
+        # IMPORTANT — Phase 1 review candidate: many of the pattern blocks
+        # below are tagged with comments referencing specific Rutledge wells
+        # (X6.R4.2, X6.R2.1, X6.R5.4, X5.R1.4 …). The actual `if` conditions
+        # test residual *shape*, not literal sample names — but the comments
+        # honestly record that the heuristics were tuned against those wells.
+        # During Phase 1 unification, this block should be reviewed: do the
+        # patterns generalise to other instruments / chemistries, or are they
+        # overfit to the qpcR R-package fixtures? See CLAUDE.md.
         _tier1_5_start = time.perf_counter()
         _tier1_5_fired = False
 
-        # Analyze residual patterns to guide adaptive retry strategy
-        # Different residual patterns indicate different problems requiring different fixes
+        # Tier 1.5 only runs when Tier 1 actually produced a parameter set
+        # that didn't clear the R² threshold AND the per-fit deadline hasn't
+        # expired. Disabled-tiers checking is for ablation testing in
+        # benchmark_tiers.py.
         if (best_params is not None and best_r2 < r2_threshold
                 and 'tier1.5' not in disabled_tiers
                 and time.perf_counter() < self._fit_deadline):
@@ -1279,12 +1482,23 @@ class MAK2Optimizer:
             'improved': _tier1_5_fired and _tier1_5_r2_after > (self.tier_log[-1]['r2_after'] if self.tier_log else 0),
         })
 
-        # --- Tier 2: SSR Retry with Adjusted Bounds ---
+        # ── Tier 2: LHS-seeded multi-start retry ─────────────────────────────
+        # Tier 1.5's pattern-driven retry handled "wrong basin" failures from
+        # the analytical starting point. Tier 2 handles the orthogonal
+        # failure mode: the optimizer landed in the right region but a poor
+        # basin within it. The mitigation is brute-force initial-guess
+        # diversity — Latin Hypercube Sampling spreads N starting points
+        # uniformly across the parameter box, each is fed to TRF, and the
+        # best result wins.
+        #
+        # Activation criterion: SSR > 1% of the squared signal range. This
+        # catches fits that are technically in the right basin (R² maybe
+        # 0.998) but have a long-tail residual structure suggesting a
+        # nearby better minimum exists.
         _tier2_start = time.perf_counter()
         _tier2_fired = False
         _tier2_r2_before = best_r2
 
-        # Automatic retry if SSR too high (likely local minimum)
         F_max = np.max(fluorescence_fit)
         F_min = np.min(fluorescence_fit)
         F_range = F_max - F_min
@@ -1578,16 +1792,26 @@ class MAK2Optimizer:
             'improved': _tier2_5_fired and _tier2_5_r2_after > _tier2_5_r2_before,
         })
 
-        # --- Tier 3: Differential Evolution ---
+        # ── Tier 3: Differential Evolution (global stochastic search) ────────
+        # When LHS-seeded TRF still hasn't cleared 0.999, the local-minimum
+        # problem is severe enough to need a method that ignores starting
+        # points entirely. scipy's differential_evolution is a global
+        # population-based stochastic optimiser — it maintains a population
+        # of candidate parameter vectors and evolves them via mutation +
+        # crossover. Slow (~1-3 s per well, 5-10× the cost of TRF) but
+        # finds basins TRF simply can't reach from any single starting
+        # point.
+        #
+        # Activation gate: R² in [0.95, 0.999). Below 0.95 the curve is
+        # almost certainly non-amplifying or pathological — DE wastes
+        # seconds and still fails. Above 0.999 the fit is already done.
+        # The 0.95 floor was chosen empirically; setting it lower made
+        # batch mode unacceptably slow without meaningfully recovering
+        # additional wells.
         _tier3_start = time.perf_counter()
         _tier3_fired = False
         _tier3_r2_before = self.metrics['r_squared']
 
-        # TIER 3: DIFFERENTIAL EVOLUTION for near-miss samples
-        # Only fire when R² is close enough (≥ 0.95) that DE has a realistic
-        # chance of reaching 0.999.  Below 0.95, the curve is too far gone
-        # (likely non-amplifying or degenerate) — spending 2+ seconds on DE
-        # per well adds up fast in batch mode with no benefit.
         if (0.95 <= self.metrics['r_squared'] < 0.999
                 and 'tier3' not in disabled_tiers
                 and time.perf_counter() < self._fit_deadline):
@@ -1633,15 +1857,24 @@ class MAK2Optimizer:
             'improved': _tier3_fired and _tier3_r2_after > _tier3_r2_before,
         })
 
-        # ============================================================================
-        # TIER 4: PLATEAU OVERSHOOT CHECK & REFIT
-        # ============================================================================
+        # ── Tier 4: Plateau-overshoot post-fit correction ────────────────────
+        # All previous tiers optimise R² unconditionally. But a fit can have
+        # excellent R² and still be wrong about P0 — specifically, if the
+        # fitted plateau height exceeds the observed plateau, the model is
+        # claiming "more primer was available than the data shows," which
+        # propagates into a too-low D0 estimate via the k * P0 coupling.
+        # Tier 4 detects this overshoot and re-fits with a P0 upper bound
+        # capped at the current fitted P0, allowing the optimiser to find
+        # a slightly worse-R² but more physically correct fit.
+        #
+        # The refit recursively calls fit() with a fresh optimizer instance.
+        # _skip_overshoot_refit guards against infinite recursion: the
+        # nested fit sees the flag set and returns its result directly
+        # without entering Tier 4 again.
         _tier4_start = time.perf_counter()
         _tier4_fired = False
         _tier4_r2_before = self.metrics['r_squared']
 
-        # Check if model overshoots the observed maximum (suggests P0 too high)
-        # Uses full fit() pipeline on a new optimizer with P0 upper bound constrained
         if self._skip_overshoot_refit:
             # Log Tier 4 as skipped (recursion guard)
             self.tier_log.append({
@@ -1765,30 +1998,50 @@ class MAK2Optimizer:
         bounds: Dict[str, Tuple[float, float]],
         verbose: bool = False
     ) -> Tuple[Dict[str, float], float]:
-        """
-        Fit MAK2 model using Differential Evolution global optimizer.
+        """Run scipy Differential Evolution on the MAK2 loss surface.
 
-        DE is a robust global optimization algorithm that explores the parameter
-        space more thoroughly than local methods. It's slower but can escape
-        local minima that trap gradient-based optimizers.
+        DE is a global stochastic optimiser — it maintains a population
+        of candidate parameter vectors and evolves them through
+        mutation + crossover, ignoring gradient information entirely.
+        Unlike TRF (which needs a starting guess and may converge to
+        a nearby local minimum), DE explores the whole parameter box
+        and reliably finds the global minimum, at the cost of being
+        ~5-10× slower per call. Used only by Tier 3, when LHS-seeded
+        TRF has failed to clear the R² threshold.
 
-        Parameters
-        ----------
-        cycles : np.ndarray
-            Cycle numbers
-        fluorescence : np.ndarray
-            Fluorescence measurements
-        bounds : Dict[str, Tuple[float, float]]
-            Parameter bounds dictionary
-        verbose : bool
-            Print progress messages
+        Implementation notes worth knowing:
 
-        Returns
-        -------
-        params : Dict[str, float]
-            Best parameters found
-        r2 : float
-            R² value for best fit
+        - **D0 is optimised in log10 space** for the same reason the
+          rest of the engine works in log space: D0 spans 6+ orders of
+          magnitude across a dilution series and DE's mutation step
+          works in fixed-magnitude jumps that are hopeless on a
+          linear scale.
+        - **strategy='best2bin'** + **popsize=30**: empirically more
+          robust on noisy qPCR loss surfaces than the scipy default
+          ('best1bin', popsize=15). The 5-parameter problem with
+          this popsize gives 150 candidates per generation.
+        - **polish=True** runs L-BFGS-B on DE's best solution at
+          convergence, so the final answer matches gradient-method
+          precision (rather than DE's coarser stochastic resolution).
+        - **workers=1**: single-threaded. Multi-process workers would
+          require the objective function to be picklable, which it
+          isn't (closure over ``self.model``).
+
+        Args:
+            cycles: Cycle numbers (already truncated by caller).
+            fluorescence: Per-cycle fluorescence (same length as
+                ``cycles``).
+            bounds: Parameter box. Keys are ``D0``, ``k``, ``P0``,
+                ``F_bg_intercept``, ``F_bg_slope``; values are
+                ``(lo, hi)`` tuples. ``D0`` bounds get log10'd
+                internally.
+            verbose: Print convergence diagnostics.
+
+        Returns:
+            ``(params, r2)`` where ``params`` is a 5-key dict
+            (no tier-tagging metadata; that's added by the caller)
+            and ``r2`` is the R² of the best DE solution against the
+            input fluorescence.
         """
         if verbose:
             print("   Running Differential Evolution...")
@@ -1875,26 +2128,52 @@ class MAK2Optimizer:
         use_uniform_weighting: bool = False,
         plateau_weight_multiplier: float = 1.0
     ) -> Tuple[Dict[str, float], float]:
-        """
-        Single fitting attempt with random initial guess or LHS samples.
-        
-        Parameters
-        ----------
-        cycles : np.ndarray
-            Cycle numbers
-        fluorescence : np.ndarray
-            Fluorescence values
-        bounds : dict
-            Parameter bounds
-        seed : int
-            Random seed for reproducibility
-            
-        Returns
-        -------
-        params : dict
-            Fitted parameters
-        r2 : float
-            R² of fit
+        """One TRF fit attempt with a configurable starting-point strategy.
+
+        The actual workhorse of the multi-start strategy. Called many
+        times per ``fit()``: once per Tier 1 attempt, once per Tier 1.5
+        pattern retry, once per LHS sample in Tier 2 / 2.5. Each call
+        runs a single ``scipy.optimize.curve_fit`` with Trust Region
+        Reflective (TRF) — a bounded variant of Levenberg-Marquardt.
+
+        Three starting-point modes (selected via constructor of the
+        call site, not via this method's args):
+
+        1. **Analytical-seeded** (``seed=1`` and analytical estimates
+           available): use the analytical D0/k/P0 estimates as the
+           starting point with ±20% jitter (±50% on k). Plus a
+           safeguard: if the analytical k estimate is near a bound,
+           jitter is biased toward the centre of the box to avoid
+           starting in a region the optimiser can't search out of.
+        2. **LHS-seeded** (``lhs_D0`` / ``lhs_k`` / ``lhs_P0``
+           supplied): use the caller's LHS sample as the starting
+           point. Background uses a uniform sample.
+        3. **Pure random** (other seeds, no LHS): all five parameters
+           drawn from uniform within their bounds. The escape hatch
+           when both above strategies have failed.
+
+        Args:
+            cycles: Truncated cycle array.
+            fluorescence: Truncated fluorescence array.
+            bounds: 5-key parameter box.
+            seed: Per-attempt seed (or ``None`` for fresh entropy).
+                When 1, triggers the analytical-seeded mode.
+                Higher integers trigger random-init mode.
+            lhs_D0, lhs_k, lhs_P0: When provided, override the
+                random init for those parameters. Used by Tier 2's
+                LHS multi-start.
+            use_uniform_weighting: When True, residuals are weighted
+                uniformly. When False (default), the plateau region
+                gets up to ``plateau_weight_multiplier``× more weight,
+                helping the optimiser pin P0 down via the plateau
+                level rather than letting plateau noise pull k/D0.
+            plateau_weight_multiplier: Cap on the plateau weight.
+                Default 1.0 (i.e. uniform — the optimiser was tuned
+                this way; higher values consistently degraded D0
+                accuracy in benchmarks).
+
+        Returns:
+            ``(params, r2)`` 5-key parameter dict + R² value.
         """
         np.random.seed(seed)
         
@@ -2140,14 +2419,35 @@ class MAK2Optimizer:
         return params, r2
     
     def calculate_fit_metrics(self) -> Dict[str, float]:
-        """
-        Calculate fit quality metrics.
-        
-        Returns
-        -------
-        metrics : dict
-            r_squared, rmse, mae, mape, nrmse, ssr, aic, bic, reduced_chi_sq,
-            n_points, n_params, dof
+        """Compute the standard suite of fit-quality metrics on the fit window.
+
+        Reads the per-instance ``cycles_fit`` / ``fluorescence_fit`` /
+        ``optimal_params`` set by ``fit()``, predicts fluorescence,
+        and returns R²/RMSE/MAE/MAPE/NRMSE/SSR/AIC/BIC/χ²_reduced.
+
+        The reason this is a separate method (rather than always
+        rolled into ``fit()``): callers sometimes mutate
+        ``cycles_fit`` / ``fluorescence_fit`` between fit and metrics
+        (e.g. ``run_batch.compute_ct`` swaps them temporarily to a
+        ROX-normalised version). Recomputing the metrics on the
+        post-mutation arrays would be wrong; instead the caller
+        snapshots the original metrics by calling this method
+        before the swap.
+
+        Note: AIC and BIC use ``k=5`` (the model's parameter count);
+        this is correct only when all 5 parameters were free during
+        the fit. With ``fix_background=True`` (production default)
+        the *effective* parameter count is 3, but we report k=5 for
+        consistency across modes — the relative AIC/BIC numbers are
+        what's interpretable in practice anyway.
+
+        Returns:
+            Dict with keys ``r_squared``, ``rmse``, ``mae``,
+            ``mape``, ``nrmse``, ``ssr``, ``aic``, ``bic``,
+            ``reduced_chi_sq``, ``n_points``, ``n_params``, ``dof``.
+
+        Raises:
+            ValueError: If ``fit()`` hasn't been run yet.
         """
         if self.optimal_params is None:
             raise ValueError("No fitted parameters. Run fit() first.")
@@ -2212,20 +2512,27 @@ class MAK2Optimizer:
         cycles: np.ndarray,
         params: Optional[Dict[str, float]] = None
     ) -> np.ndarray:
-        """
-        Predict fluorescence at given cycles using fitted parameters.
-        
-        Parameters
-        ----------
-        cycles : np.ndarray
-            Cycle numbers to predict
-        params : dict, optional
-            Parameters to use (default: use fitted parameters)
-            
-        Returns
-        -------
-        fluorescence : np.ndarray
-            Predicted fluorescence values
+        """Predict fluorescence at arbitrary cycle numbers using fitted parameters.
+
+        Thin wrapper over ``MAK2Model.simulate_to_cycle`` that pulls
+        the parameters from the optimizer's stored ``optimal_params``
+        when the caller doesn't override them.
+
+        Args:
+            cycles: Cycle numbers to evaluate. Need not match the
+                fit window — common patterns include predicting on
+                the *full* curve to overlay against raw data, or on
+                an extended grid for a smooth plot line.
+            params: Optional parameter override. When ``None``
+                (typical), uses the optimizer's fitted
+                ``optimal_params``.
+
+        Returns:
+            Predicted fluorescence array (same length as ``cycles``).
+
+        Raises:
+            ValueError: If ``params`` is None and ``fit()`` hasn't
+                been run yet.
         """
         if params is None:
             if self.optimal_params is None:
@@ -2248,27 +2555,36 @@ class MAK2Optimizer:
         overshoot_threshold: float = 0.05,
         verbose: bool = False
     ) -> Tuple[bool, float]:
-        """
-        Check if model overshoots the observed fluorescence maximum.
+        """Detect whether the fit's plateau height exceeds the observed plateau.
 
-        Compares background-corrected signal maximums to detect when the model
-        predicts unrealistically high plateau fluorescence. This can indicate
-        P0 (initial primer concentration) is too high.
+        Why this gate exists: a fit can have excellent R² and still be
+        wrong if it claims a higher plateau than the data actually
+        shows. Plateau height is set in MAK2 by ``k * P0``, and the
+        optimiser can trade those off against each other in ways that
+        leave the early-cycle exponential portion well-fit while
+        wildly inflating P0. The downstream consequence is too-low
+        D0 (because ``D0`` and ``P0`` are inversely correlated for a
+        fixed exponential portion), which propagates into the
+        absolute-quantification answer.
 
-        Parameters
-        ----------
-        overshoot_threshold : float
-            Maximum allowed overshoot ratio (default: 0.05 = 5%)
-            overshoot_ratio = max_predicted / max_observed - 1
-        verbose : bool
-            Print diagnostic information
+        The check is on background-*subtracted* signal magnitudes,
+        not raw fluorescence — otherwise the comparison is dominated
+        by background offset and tells us nothing about plateau.
 
-        Returns
-        -------
-        overshoots : bool
-            True if model overshoots beyond threshold
-        overshoot_ratio : float
-            Actual overshoot ratio (0 = perfect, >0 = overshoot)
+        Args:
+            overshoot_threshold: Maximum tolerated overshoot ratio.
+                Default 0.05 (5%). The Tier 4 caller passes 0.0
+                (any overshoot triggers a refit); other callers can
+                relax it.
+            verbose: Print diagnostic info.
+
+        Returns:
+            ``(overshoots, ratio)``. ``ratio`` is
+            ``(max_predicted - max_observed) / max_observed`` after
+            baseline subtraction; positive = overshoot.
+
+        Raises:
+            ValueError: If ``fit()`` hasn't been run yet.
         """
         if self.cycles_fit is None or self.fluorescence_fit is None:
             raise ValueError("No fitted data available. Run fit() first.")
@@ -2329,35 +2645,62 @@ class MAK2Optimizer:
         threshold: Optional[float] = None,
         baseline_cycles: Optional[Tuple[int, int]] = None
     ) -> Dict[str, float]:
-        """
-        Calculate Ct (threshold cycle) using standard methods.
+        """Compute Ct (threshold cycle) from the stored fit, instrument-equivalent.
 
-        This provides instrument-equivalent Ct values for comparison
-        with traditional qPCR analysis software.
+        Why this is in the optimizer (not a separate utility): the
+        Ct calculation operates on the same per-well state the
+        optimizer holds (``cycles_fit``, ``fluorescence_fit``) plus
+        a separate baseline regression. Keeping it here lets
+        ``run_batch.compute_ct`` swap a ROX-normalised
+        ``fluorescence_fit`` in temporarily and call this method to
+        get a ROX-aware Ct without re-running the kinetic fit.
 
-        Parameters
-        ----------
-        method : str
-            Ct calculation method:
-            - 'threshold': Fixed fluorescence threshold (default, most common)
-            - 'second_derivative': Maximum second derivative (inflection point)
-            - 'regression': Linear regression on log-phase
-        threshold : float, optional
-            Fluorescence threshold for 'threshold' method.
-            If None, auto-calculated as baseline_mean + 10*baseline_SD
-        baseline_cycles : tuple, optional
-            (start, end) cycles for baseline calculation.
-            If None, uses first 25% of data
+        Three methods (``method`` arg):
 
-        Returns
-        -------
-        results : dict
-            Dictionary containing:
-            - 'ct': Ct value
-            - 'method': Method used
-            - 'threshold': Threshold used (for threshold method)
-            - 'baseline_mean': Baseline mean fluorescence
-            - 'baseline_sd': Baseline standard deviation
+        - ``'threshold'`` (default, instrument-standard): find the
+          first cycle where ΔRn (background-subtracted fluorescence)
+          crosses ``threshold``. Linearly interpolates between
+          cycles for sub-cycle precision.
+        - ``'second_derivative'``: find the cycle of maximum second
+          derivative (the inflection point). Method-of-record on
+          some instruments; less common in industry today.
+        - ``'regression'``: log-linear fit on the exponential phase,
+          back-extrapolated to the threshold. Mostly historical.
+
+        The baseline regression matters: a constant-mean
+        subtraction leaves residual slope in ΔRn which makes the
+        threshold cross early in sloping-baseline wells. We fit a
+        line through the baseline window and subtract it (the
+        same approach instrument firmware uses).
+
+        Auto-detection: if the input fluorescence already looks
+        baseline-subtracted (mean < 0.1 in early cycles, or any
+        negative values), the baseline subtraction step is skipped.
+        Important for ABI Multicomponent data that's been
+        pre-processed.
+
+        Args:
+            method: One of ``'threshold'``, ``'second_derivative'``,
+                ``'regression'``.
+            threshold: Fluorescence threshold for the threshold
+                method. ``None`` triggers auto-calculation as
+                ``baseline_mean + 10 * baseline_SD``.
+            baseline_cycles: ``(start, end)`` index pair for the
+                baseline window. ``None`` uses the first 15% of
+                cycles. ``run_batch.compute_ct`` passes the
+                instrument metadata's ``Baseline Start``/``End``
+                here so the Ct matches the instrument's calculation.
+
+        Returns:
+            Dict with ``ct`` (the Ct value), ``method`` (the method
+            used), ``threshold`` (the threshold actually used),
+            ``baseline_mean`` / ``baseline_sd`` /
+            ``baseline_slope`` / ``baseline_intercept`` (the fitted
+            baseline regression — passed back to the caller for
+            recording in the result table).
+
+        Raises:
+            ValueError: If ``fit()`` hasn't been run yet.
         """
         if self.cycles_fit is None or self.fluorescence_fit is None:
             raise ValueError("No fitted data available. Run fit() first.")
