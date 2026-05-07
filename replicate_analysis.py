@@ -6,7 +6,7 @@ Provides statistical comparison between Ct and D0 quantification methods.
 
 import numpy as np
 import pandas as pd
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 from scipy.stats import linregress
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -182,7 +182,6 @@ def analyze_dilution_series(
 
     # Extract values as numpy float arrays
     dilution_values = np.array(grouped['Dilution'].values, dtype=float)
-    log_dilution = np.log2(dilution_values)  # For plotting
     log10_dilution = np.log10(dilution_values)
     ct_values = np.array(grouped['Ct_Mean'].values, dtype=float)
 
