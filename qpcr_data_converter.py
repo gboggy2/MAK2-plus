@@ -1,14 +1,35 @@
-"""
-qPCR Data Converter - Handle various instrument export formats
+"""qPCR file-format parsers.
 
-Supports multiple formats:
-- Simple format: Column 1 = cycles, other columns = samples
-- Wide format: Rows = cycles, columns = wells/samples
-- Plate reader format: Multi-sheet or sectioned data
-- CFX format: Bio-Rad CFX Manager exports
-- QuantStudio format: Applied Biosystems exports (Excel)
-- ABI CSV format: Applied Biosystems CSV exports with [Section] headers
-  (Multicomponent, Amplification Data)
+Reads the half-dozen file shapes that real qPCR instruments produce
+and emits the same canonical pair: a ``cycles`` array and a
+``samples`` dict from sample name to fluorescence array. The
+downstream pipeline (``run_batch.py``, the Streamlit app) is then
+format-agnostic.
+
+Supported formats:
+
+- **Simple CSV** — Column 1 = cycle numbers, other columns =
+  fluorescence per sample. The most common output of academic /
+  open-source tools (qpcR R package, MIQE-compliant exports).
+- **Wide format** — Rows = cycles, columns = wells/samples. Common
+  CSV export from generic plate readers.
+- **CFX (Bio-Rad CFX Manager)** — `Cycle` column at column 0, then
+  per-well columns.
+- **QuantStudio (Applied Biosystems)** — Multi-sheet XLSX export
+  with a separate Sample Setup sheet for the well-to-sample map.
+- **ABI multicomponent CSV** — Sectioned CSV with ``[Sample Setup]``,
+  ``[Multicomponent Data]``, ``[Amplification Data]``, ``[Results]``
+  blocks. The richest format — preserves per-channel fluorescence,
+  ROX passive reference, and instrument metadata.
+
+Format detection is heuristic (column names, presence of section
+headers); see ``detect_format``.
+
+Two top-level entry points are exposed:
+- ``QPCRDataConverter`` class — full API, allows re-use of the same
+  configured converter across many files.
+- ``load_abi_results_csv`` — module-level helper for the Results-CSV
+  metadata extract used by ``run_batch.py``.
 
 Author: Greg Boggy, PhD
 Date: January 28, 2026
@@ -24,24 +45,36 @@ import pandas as pd
 
 
 class QPCRDataConverter:
+    """Format-detect and parse qPCR data files into a canonical shape.
+
+    Holds light parser configuration (offset behaviour) plus diagnostic
+    state from the most recent ``load_from_file`` call (detected
+    format, sample count, cycle count). The class can be re-used
+    across multiple files.
+
+    Canonical output of every parse method:
+
+    - ``cycles`` (np.ndarray): cycle numbers, typically 1..N.
+    - ``samples`` (Dict[str, np.ndarray]): well/sample name → per-cycle
+      fluorescence array.
+    - ``metadata`` (Dict): format-specific extras (channels list,
+      passive reference, sample names, sample setup table, etc.).
+      Keyed lookups are stable across formats; absent keys mean the
+      format doesn't carry that information.
     """
-    Convert various qPCR instrument data formats to MAK2+ standard format.
-    
-    Standard format:
-    - cycles: np.ndarray of cycle numbers
-    - samples: Dict[str, np.ndarray] mapping sample names to fluorescence values
-    """
-    
+
     def __init__(self, add_offset: bool = True, offset_value: float = 1e-5):
-        """
-        Initialize converter.
-        
-        Parameters
-        ----------
-        add_offset : bool
-            Add small offset to avoid zeros (important for log transforms)
-        offset_value : float
-            Value to add if add_offset=True
+        """Configure parsing behaviour.
+
+        Args:
+            add_offset: When True, add ``offset_value`` to every
+                fluorescence point. Some downstream code (and the
+                MAK2 model) takes log of fluorescence in places; the
+                offset prevents log(0) when an instrument reports a
+                literal 0.0 baseline. Default True.
+            offset_value: Magnitude of the offset. Default 1e-5,
+                small enough to be invisible against any real signal
+                but non-zero everywhere.
         """
         self.add_offset = add_offset
         self.offset_value = offset_value
@@ -50,18 +83,29 @@ class QPCRDataConverter:
         self.n_cycles = 0
         
     def detect_format(self, df: pd.DataFrame) -> str:
-        """
-        Auto-detect the qPCR data format.
-        
-        Parameters
-        ----------
-        df : pd.DataFrame
-            Raw data from file
-            
-        Returns
-        -------
-        str
-            Format type: 'simple', 'wide', 'cfx', 'quantstudio', etc.
+        """Heuristically classify a parsed DataFrame as one of the supported formats.
+
+        Detection order matters — checks are tried in priority sequence
+        and the first match wins:
+
+        1. ``'simple'``: column 0 looks like cycle numbers
+           (sequential integers starting near 1).
+        2. ``'wide'``: every column name matches a well-position
+           regex (``A1``-``H12``, ``Well_N``, ``Sample_N``).
+        3. ``'cfx'``: presence of ``Well`` and ``Cq`` columns
+           (Bio-Rad convention).
+        4. ``'quantstudio'``: presence of ``Well Position`` or
+           ``Target Name`` columns (Applied Biosystems convention).
+
+        Falls back to ``'simple'`` if nothing matches — the simple
+        parser is the most permissive and will give a useful error
+        if it then fails on bad data.
+
+        Args:
+            df: Raw DataFrame from ``pd.read_csv`` / ``pd.read_excel``.
+
+        Returns:
+            One of ``'simple'``, ``'wide'``, ``'cfx'``, ``'quantstudio'``.
         """
         # Check for simple format (col 0 = cycles, others = samples)
         if df.shape[1] >= 2:
@@ -86,7 +130,13 @@ class QPCRDataConverter:
         return 'simple'
     
     def _is_cycle_column(self, col: pd.Series) -> bool:
-        """Check if a column contains cycle numbers."""
+        """Heuristic test: does this column look like sequential cycle numbers?
+
+        Three checks: <10% NaN after numeric coercion, first value
+        in [0, 2] (some files index from 0, most from 1), and a mean
+        cycle-to-cycle increment in [0.8, 1.2] (handles any small
+        repeat-cycle artefacts).
+        """
         try:
             # Try to convert to numeric
             numeric_col = pd.to_numeric(col, errors='coerce')
@@ -110,31 +160,42 @@ class QPCRDataConverter:
             return False
     
     def load_from_file(
-        self, 
+        self,
         filepath: Union[str, Path, io.BytesIO]
     ) -> Tuple[np.ndarray, Dict[str, np.ndarray], Dict]:
-        """
-        Load qPCR data from file and convert to standard format.
-        
-        Parameters
-        ----------
-        filepath : str, Path, or BytesIO
-            Path to data file or uploaded file buffer
-            
-        Returns
-        -------
-        cycles : np.ndarray
-            Cycle numbers
-        samples : Dict[str, np.ndarray]
-            Dictionary mapping sample names to fluorescence values
-        metadata : Dict
-            Information about the loaded data
-            May contain 'extra_info' with target information for multiplexed data
-            
-        Raises
-        ------
-        ValueError
-            If file cannot be parsed or doesn't contain valid qPCR data
+        """Top-level dispatch: load any supported qPCR file into canonical form.
+
+        The decision tree (in order):
+
+        1. If input is a ``BytesIO`` (e.g. Streamlit upload), try
+           the ABI sectioned-CSV parser first (fastest reject for
+           non-ABI data), then the QuantStudio multi-sheet XLSX
+           parser, then a generic CSV/Excel read.
+        2. If input is a ``.csv`` path, try ABI sectioned-CSV then
+           generic CSV.
+        3. Otherwise (Excel path), try QuantStudio multi-sheet,
+           then generic Excel (openpyxl, fallback to xlrd).
+
+        For multi-target QuantStudio files (``has_targets=True``),
+        the function returns ``cycles=array, samples={}`` and sets
+        ``metadata['requires_target_selection']=True`` so the UI can
+        prompt the user to pick a target before re-loading.
+
+        The configured ``offset_value`` is added to all fluorescence
+        arrays unless ``add_offset=False``.
+
+        Args:
+            filepath: Path string, ``Path``, or in-memory ``BytesIO``.
+
+        Returns:
+            ``(cycles, samples, metadata)`` triple. ``metadata`` always
+            contains ``format``, ``n_samples``, ``n_cycles``,
+            ``sample_names``, ``cycle_range``; format-specific keys
+            (``extra_info``, ``requires_target_selection``) appear
+            when relevant.
+
+        Raises:
+            ValueError: If the file cannot be parsed by any path.
         """
         extra_info = None
         
@@ -347,13 +408,23 @@ class QPCRDataConverter:
         return cycles, samples, metadata
     
     def _convert_simple_format(self, df: pd.DataFrame) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
-        """
-        Convert simple format: Column 0 = cycles, others = samples.
-        
-        Example:
-        Cycle | Sample_1 | Sample_2
-        1     | 0.12     | 0.15
-        2     | 0.18     | 0.22
+        """Parse a simple-format DataFrame: column 0 cycles, other columns samples.
+
+        Example::
+
+            Cycle | Sample_1 | Sample_2
+            1     | 0.12     | 0.15
+            2     | 0.18     | 0.22
+
+        Skips columns with >10% NaN entries (likely metadata or
+        comment columns mixed into the data); within accepted
+        columns, missing values are linearly interpolated and
+        backward/forward-filled at the edges to give the optimizer a
+        contiguous array.
+
+        Raises:
+            ValueError: If fewer than 10 valid cycle rows are found,
+                or if every fluorescence column was rejected.
         """
         # Try to convert first column to numeric, coercing errors
         cycles = pd.to_numeric(df.iloc[:, 0], errors='coerce')
@@ -392,13 +463,14 @@ class QPCRDataConverter:
         return cycles, samples
     
     def _convert_wide_format(self, df: pd.DataFrame) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
-        """
-        Convert wide format: All columns are samples, rows are cycles.
-        
-        Example:
-        A1   | A2   | A3
-        0.12 | 0.15 | 0.11
-        0.18 | 0.22 | 0.17
+        """Parse a wide-format DataFrame: every column a sample, rows are cycles.
+
+        Cycle numbers are not stored in the file; they're synthesised
+        as ``1, 2, ..., len(df)``. Example::
+
+            A1   | A2   | A3
+            0.12 | 0.15 | 0.11
+            0.18 | 0.22 | 0.17
         """
         # Generate cycle numbers
         cycles = np.arange(1, len(df) + 1)
@@ -411,10 +483,13 @@ class QPCRDataConverter:
         return cycles, samples
     
     def _convert_cfx_format(self, df: pd.DataFrame) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
-        """
-        Convert Bio-Rad CFX format.
-        
-        Expected columns: Well, Cycle, Fluorescence (or similar)
+        """Parse Bio-Rad CFX Manager export.
+
+        Long-format DataFrame with one row per (well, cycle) pair;
+        groupby-pivots into the canonical (cycles, samples) shape.
+        Fluorescence column name is autodetected by case-insensitive
+        substring match against ``fluor`` or ``rfu``; falls back to
+        the third column.
         """
         # Find fluorescence column (might be named differently)
         fluor_cols = [c for c in df.columns if 'fluor' in c.lower() or 'rfu' in c.lower()]
@@ -436,10 +511,13 @@ class QPCRDataConverter:
         return cycles, samples
     
     def _convert_quantstudio_format(self, df: pd.DataFrame) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
-        """
-        Convert Applied Biosystems QuantStudio format.
-        
-        Expected columns: Well Position, Cycle, ΔRn (or similar)
+        """Parse Applied Biosystems QuantStudio export (single-sheet variant).
+
+        Long-format DataFrame keyed by ``Well Position`` (or ``Well``)
+        and ``Cycle`` (or ``Cycle Number``). Fluorescence column
+        autodetected by ``rn`` / ``fluor`` substring; falls back to
+        the last column. For multi-sheet QuantStudio Excel files,
+        ``_try_quantstudio_multisheet`` does the heavier work first.
         """
         # Find fluorescence column
         well_col = 'Well Position' if 'Well Position' in df.columns else 'Well'
@@ -463,23 +541,25 @@ class QPCRDataConverter:
         return cycles, samples
     
     def _parse_sample_setup(self, xls: pd.ExcelFile) -> Optional[pd.DataFrame]:
-        """
-        Parse Sample Setup sheet for well metadata (Sample Name, Task, Quantity).
+        """Parse the Sample Setup sheet from a QuantStudio multi-sheet export.
 
-        QuantStudio exports include a "Sample Setup" sheet with metadata about each well,
-        including sample names, task types (UNKNOWN, STANDARD, NTC), and known quantities
-        for standards. The header row position varies (typically around row 46).
+        Recovers per-well metadata: ``Sample Name``, ``Task`` (UNKNOWN /
+        STANDARD / NTC), ``Quantity`` (the known copy number for
+        standards). This metadata feeds the calibration step
+        downstream (see ``calibration.build_standard_curve``).
 
-        Parameters
-        ----------
-        xls : pd.ExcelFile
-            Open Excel file handle
+        The header row position varies between QuantStudio versions
+        (typically around row 46), so we scan the first 60 rows for
+        the canonical column names rather than assuming a fixed
+        offset. Tolerates the trailing-space sheet name variant
+        ("Sample Setup ").
 
-        Returns
-        -------
-        pd.DataFrame or None
-            DataFrame with columns like Well, Well Position, Sample Name, Target Name,
-            Task, Quantity. Returns None if sheet not found or unparseable.
+        Args:
+            xls: An open ``pd.ExcelFile`` handle.
+
+        Returns:
+            DataFrame with the relevant subset of columns, or
+            ``None`` if the sheet is absent or doesn't parse.
         """
         setup_sheets = ['Sample Setup', 'Sample Setup ']  # trailing space variant
         for sheet in setup_sheets:
@@ -516,17 +596,24 @@ class QPCRDataConverter:
         return None
 
     def _parse_results_sheet(self, xls: pd.ExcelFile) -> Optional[pd.DataFrame]:
-        """
-        Parse Results sheet for instrument-reported CT values and thresholds.
+        """Parse the Results sheet from a QuantStudio multi-sheet export.
 
-        QuantStudio exports include a "Results" sheet with per-well CT, Ct Threshold,
-        and other analysis results. The header row position varies.
+        Recovers the instrument's own per-well analysis: ``CT`` and
+        ``Ct Threshold``. The Streamlit app uses these as the
+        comparison baseline against the MAK2-fit Ct (so the user can
+        sanity-check that the fit isn't wildly disagreeing with the
+        instrument).
 
-        Returns
-        -------
-        pd.DataFrame or None
-            DataFrame with columns like Well Position, Target Name, CT, Ct Threshold.
-            Returns None if sheet not found or unparseable.
+        Same dynamic header-row scan as ``_parse_sample_setup`` —
+        the row number isn't fixed across QuantStudio versions.
+
+        Args:
+            xls: An open ``pd.ExcelFile`` handle.
+
+        Returns:
+            DataFrame with ``Well Position``, ``Target Name``, ``CT``,
+            ``Ct Threshold`` columns, or ``None`` if absent or
+            unparseable.
         """
         results_sheets = ['Results', 'Results ']
         for sheet in results_sheets:
@@ -559,18 +646,36 @@ class QPCRDataConverter:
         return None
 
     def _try_quantstudio_multisheet(self, filepath: Union[str, Path, io.BytesIO]) -> Tuple[np.ndarray, Dict[str, np.ndarray], Optional[Dict]]:
-        """
-        Try to read QuantStudio format from multi-sheet Excel file.
+        """Parse a QuantStudio multi-sheet XLSX export.
 
-        Looks for "Amplification Data" sheet and skips header rows.
-        Also reads "Sample Setup" sheet for well metadata (Sample Name, Task, Quantity).
+        Three sheets get read together because they're complementary:
 
-        Returns
-        -------
-        cycles : np.ndarray
-        samples : Dict[str, np.ndarray]
-        extra_info : Dict
-            Contains 'targets' for multiplexed data and 'sample_setup' for well metadata
+        - **Amplification Data**: per-(well, cycle) fluorescence
+          (``Rn`` and/or ``Delta_Rn``). The numeric source of truth.
+        - **Sample Setup**: per-well metadata (sample name, task,
+          known quantity). Needed for downstream calibration.
+        - **Results**: instrument-computed CT and threshold. Used
+          as a sanity-check baseline.
+
+        Multiplexed plates carry a ``Target`` column. When present,
+        this method does NOT pivot the data — instead it stashes the
+        raw long-form DataFrame in ``extra_info['raw_df']`` and sets
+        ``has_targets=True`` so the UI can offer a target selector
+        before the actual per-target pivot is done by
+        ``filter_by_target``.
+
+        Args:
+            filepath: Excel file path or BytesIO.
+
+        Returns:
+            ``(cycles, samples, extra_info)``. For single-target
+            plates, ``samples`` is the canonical per-well dict; for
+            multiplexed plates, ``samples`` is empty and
+            ``extra_info`` carries the raw data plus the target list.
+
+        Raises:
+            ValueError: If no recognisable amplification sheet is
+                present.
         """
         try:
             # Check if it's an Excel file with multiple sheets
@@ -676,8 +781,20 @@ class QPCRDataConverter:
         section_df: pd.DataFrame,
         header_meta: Dict[str, str]
     ) -> Tuple[np.ndarray, Dict[str, np.ndarray], Dict]:
-        """
-        Convert a parsed ABI CSV section into the standard load_from_file() return format.
+        """Wrap a parsed ABI section into the canonical ``load_from_file`` return.
+
+        Two paths depending on which section was found:
+
+        - **Multicomponent**: rich format with per-channel
+          fluorescence + a passive reference dye. Returns
+          ``samples={}`` and stashes the per-channel data in
+          ``metadata['extra_info']`` so the UI can offer a channel
+          selector before the actual fit. Sets
+          ``requires_channel_selection=True``.
+        - **Amplification Data** (or other single-channel section):
+          single-channel ΔRn data. Returns the canonical samples
+          dict directly, ready to fit. Sets
+          ``requires_channel_selection=False``.
         """
         if section_name == 'Multicomponent':
             cycles, samples_by_channel, dye_columns, passive_reference = \
@@ -742,24 +859,41 @@ class QPCRDataConverter:
         self,
         filepath: Union[str, Path, io.BytesIO]
     ) -> Tuple[str, pd.DataFrame, Dict[str, str]]:
-        """
-        Try to parse an Applied Biosystems CSV export with #-comment headers
-        and [Section Name] markers.
+        """Detect and split an ABI sectioned CSV into header + chosen section.
 
-        Returns
-        -------
-        section_name : str
-            Name of the section used (e.g. 'Multicomponent', 'Amplification Data')
-        section_df : pd.DataFrame
-            Parsed data for that section
-        header_meta : Dict[str, str]
-            Key-value pairs from the # comment header lines
-            (e.g. {'Passive Reference': 'ROX', 'Instrument Type': '7500 Fast System'})
+        ABI CSVs look like::
 
-        Raises
-        ------
-        ValueError
-            If the file does not look like an ABI CSV or contains no usable section
+            # Instrument Type: 7500 Fast System
+            # Passive Reference: ROX
+            # ...
+            [Sample Setup]
+            <CSV rows>
+            [Multicomponent]
+            <CSV rows>
+            [Amplification Data]
+            <CSV rows>
+            [Results]
+            <CSV rows>
+
+        This method:
+          1. Parses the ``#`` comment block into a metadata dict.
+          2. Splits the body into sections by ``[Name]`` markers.
+          3. Picks the highest-priority section for fitting:
+             ``Multicomponent`` > ``Amplification Data`` > ``Raw Data``
+             (Multicomponent preferred because it preserves all
+             channels including the ROX passive reference, which the
+             pipeline uses for normalization).
+          4. Parses the chosen section as a CSV.
+
+        Args:
+            filepath: Path or BytesIO.
+
+        Returns:
+            ``(section_name, section_df, header_meta)``.
+
+        Raises:
+            ValueError: If the file has no ``#`` headers (not ABI) or
+                no ``[Section]`` markers.
         """
         # Read raw lines
         if isinstance(filepath, io.BytesIO):
@@ -838,17 +972,38 @@ class QPCRDataConverter:
         section_df: pd.DataFrame,
         header_meta: Dict[str, str]
     ) -> Tuple[np.ndarray, Dict[str, Dict[str, np.ndarray]], List[str], Optional[str]]:
-        """
-        Parse a [Multicomponent] section DataFrame.
+        """Pivot the ``[Multicomponent]`` section into per-channel per-well arrays.
 
-        Returns
-        -------
-        cycles : np.ndarray
-        samples_by_channel : Dict[channel_name → Dict[well_pos → np.ndarray]]
-        dye_columns : List[str]
-            All dye channel names found (including passive reference)
-        passive_reference : str or None
-            Name of the passive reference dye (e.g. 'ROX'), or None
+        Layout of the input section: long-format with ``Well Position``,
+        ``Cycle Number``, and one column per dye channel (FAM, JOE,
+        ROX, …). This function pivots it into nested dicts keyed by
+        channel and then by well position.
+
+        Notable handling:
+
+        - **Cycle deduplication.** Some ABI instruments append
+          post-amplification reads (melt curve, dissociation) at the
+          same cycle numbers. We keep only the first occurrence of
+          each cycle so that downstream code sees the amplification
+          phase only.
+        - **Passive reference identification.** Read from the
+          ``Passive Reference`` header field (typically ``ROX``);
+          downstream code uses it to ROX-normalise per-channel data.
+
+        Args:
+            section_df: Parsed DataFrame from
+                ``_try_abi_csv``.
+            header_meta: Header metadata dict.
+
+        Returns:
+            ``(cycles, samples_by_channel, dye_columns, passive_reference)``.
+            ``samples_by_channel`` is keyed by channel name then by
+            well position. ``passive_reference`` may be ``None`` if
+            the header doesn't declare one.
+
+        Raises:
+            ValueError: If required columns (cycle, well, any dye)
+                are missing.
         """
         # Identify structural columns
         non_dye = {'Well', 'Well Position', 'Stage Number', 'Step Number', 'Cycle Number',
@@ -926,13 +1081,13 @@ class QPCRDataConverter:
         section_df: pd.DataFrame,
         header_meta: Dict[str, str]
     ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
-        """
-        Parse an [Amplification Data] section DataFrame (single ΔRn channel).
+        """Pivot the ``[Amplification Data]`` section into per-well arrays.
 
-        Returns
-        -------
-        cycles : np.ndarray
-        samples : Dict[well_pos → np.ndarray]
+        Single-channel cousin of ``_parse_abi_multicomponent``.
+        Long-format DataFrame with ``Well Position``, ``Cycle Number``,
+        and a ``ΔRn`` (or similar) value column. Used when the ABI
+        export doesn't contain a Multicomponent section (older
+        instruments or single-channel workflows).
         """
         # Find cycle column
         cycle_col = None
@@ -992,24 +1147,30 @@ class QPCRDataConverter:
         channel_name: str,
         normalize_by_reference: bool = False
     ) -> Tuple[np.ndarray, Dict[str, np.ndarray], None]:
-        """
-        Extract samples for a single dye channel from ABI Multicomponent data.
+        """Extract one channel's per-well data from a Multicomponent load.
 
-        Parameters
-        ----------
-        extra_info : Dict
-            extra_info dict returned by load_from_file() when requires_channel_selection=True
-        channel_name : str
-            Dye channel to extract (e.g. 'FAM', 'JOE')
-        normalize_by_reference : bool
-            If True, divide fluorescence by the passive reference channel (e.g. ROX)
-            to correct for well-to-well volume variation
+        Optionally divides by the passive-reference channel (ROX) to
+        correct for well-to-well loading volume variation. ROX
+        normalisation is the conventional first-line correction on
+        ABI instruments — without it, well-volume differences
+        propagate into the D0 estimates as systematic per-well bias.
 
-        Returns
-        -------
-        cycles : np.ndarray
-        samples : Dict[str, np.ndarray]
-        None
+        Args:
+            extra_info: ``extra_info`` dict from ``load_from_file``
+                when ``requires_channel_selection`` was True.
+            channel_name: Dye to extract (e.g. ``'FAM'``, ``'JOE'``).
+            normalize_by_reference: When True, divide the chosen
+                channel by the passive reference (default False
+                because the per-well pipeline does its own
+                channel-aware normalisation downstream).
+
+        Returns:
+            ``(cycles, samples, None)`` — third element is unused
+            but preserved for API compatibility with other parsers.
+
+        Raises:
+            ValueError: If ``extra_info`` lacks channel data or if
+                ``channel_name`` isn't present.
         """
         if not extra_info or not extra_info.get('has_channels'):
             raise ValueError("No channel information available in extra_info")
@@ -1037,18 +1198,20 @@ class QPCRDataConverter:
         return cycles, samples, None
 
     def get_sample_info(self, samples: Dict[str, np.ndarray]) -> pd.DataFrame:
-        """
-        Generate summary information about loaded samples.
-        
-        Parameters
-        ----------
-        samples : Dict[str, np.ndarray]
-            Sample dictionary from load_from_file
-            
-        Returns
-        -------
-        pd.DataFrame
-            Summary with columns: Sample, Min, Max, Mean, Detectable
+        """One-row-per-sample summary table for sanity checks.
+
+        Quick visual triage before fitting: the ``Detectable`` column
+        flags wells where ``max < 2 * min`` (i.e. less than a 2× signal
+        range — almost certainly a flat NTC or failed well). Doesn't
+        do the heavy lifting that ``data_processing.detect_no_signal_samples``
+        does; this is just a sanity print.
+
+        Args:
+            samples: Sample dict from any ``load_from_file`` path.
+
+        Returns:
+            DataFrame with ``Sample``, ``Min``, ``Max``, ``Mean``,
+            ``Detectable`` columns.
         """
         info = []
         for name, fluor in samples.items():
@@ -1067,27 +1230,30 @@ class QPCRDataConverter:
         extra_info: Dict,
         target_name: str
     ) -> Tuple[np.ndarray, Dict[str, np.ndarray], Optional[Dict]]:
-        """
-        Filter multiplexed qPCR data by target name.
+        """Pivot one target's data out of a multiplexed QuantStudio plate.
 
-        Parameters
-        ----------
-        extra_info : Dict
-            Extra info dict from _try_quantstudio_multisheet containing raw_df
-            and optionally sample_setup DataFrame
-        target_name : str
-            Target name to filter for
+        For multiplexed plates, ``_try_quantstudio_multisheet`` defers
+        the pivot until the user has chosen a target. This method
+        does that pivot and bundles the per-well sample metadata
+        (Sample Name, Task, Quantity from Sample Setup; instrument
+        CT from Results) so downstream code can run a complete
+        analysis on this single target.
 
-        Returns
-        -------
-        cycles : np.ndarray
-            Cycle numbers
-        samples : Dict[str, np.ndarray]
-            Samples for the selected target only
-        sample_metadata : Dict or None
-            Per-well metadata dict keyed by well position, e.g.:
-            {'A1': {'Sample Name': 'Patient_1', 'Task': 'UNKNOWN', 'Quantity': NaN}, ...}
-            None if Sample Setup sheet was not available.
+        Args:
+            extra_info: ``extra_info`` dict from the deferred
+                multi-sheet load (must have ``has_targets=True``).
+            target_name: Target to pivot.
+
+        Returns:
+            ``(cycles, samples, sample_metadata)``. ``sample_metadata``
+            is ``{well_pos: {field: value, ...}}`` with NaN values
+            normalised to ``None`` for cleaner downstream handling;
+            it's ``None`` when neither Sample Setup nor Results
+            sheets were parseable.
+
+        Raises:
+            ValueError: If ``extra_info`` lacks target data or no
+                rows match ``target_name``.
         """
         if not extra_info or not extra_info.get('has_targets'):
             raise ValueError("No target information available")
@@ -1163,19 +1329,18 @@ class QPCRDataConverter:
         self,
         extra_info: Dict,
     ) -> Dict[str, Tuple[np.ndarray, Dict[str, np.ndarray], Optional[Dict]]]:
-        """
-        Filter multiplexed qPCR data for ALL targets at once.
+        """Pivot every target's data out of a multiplexed plate at once.
 
-        Parameters
-        ----------
-        extra_info : Dict
-            Extra info dict from _try_quantstudio_multisheet.
+        Args:
+            extra_info: ``extra_info`` dict from
+                ``_try_quantstudio_multisheet``.
 
-        Returns
-        -------
-        dict
-            Keyed by target name, values are (cycles, samples, sample_metadata)
-            tuples — same as filter_by_target() returns for each target.
+        Returns:
+            Dict keyed by target name; each value is the
+            ``(cycles, samples, sample_metadata)`` triple that
+            ``filter_by_target`` would return for that target.
+            Convenience wrapper for callers that want every target
+            at once (e.g. ``app.py`` channel iteration).
         """
         if not extra_info or not extra_info.get('has_targets'):
             raise ValueError("No target information available")
@@ -1188,22 +1353,41 @@ class QPCRDataConverter:
         return result
 
 def load_abi_results_csv(file) -> Dict:
-    """
-    Parse an ABI results CSV (exported from QuantStudio / StepOnePlus results table).
+    """Parse the per-well metadata CSV exported alongside an ABI plate.
 
-    The file has columns:
-        Well, Sample Name, Target Name, Task, Reporter, Quencher,
-        C_ (Ct), C_ Mean, C_ SD, Quantity, ...,
-        Ct Threshold, Baseline Start, Baseline End,
-        HIGHSD, NOAMP, EXPFAIL
+    The Results CSV (separate from the Multicomponent CSV that holds
+    fluorescence) carries per-well metadata that drives several
+    pipeline behaviours:
 
-    Returns
-    -------
-    dict with keys:
-        'well_meta'           : {f"{Reporter}_{Well}": per-well dict}
-        'sample_metadata'     : same dict — drop-in for st.session_state.sample_metadata
-        'channel_thresholds'  : {'FAM': 0.1, 'JOE': 0.04, ...}
-        'n_wells'             : int
+    - ``Sample Name`` / ``Target Name`` / ``Task`` / ``Quantity``:
+      identify standards for ``calibration.build_standard_curve``.
+    - ``Baseline Start`` / ``Baseline End``: define the per-well
+      baseline window used by ``pre_estimate_background``.
+    - ``Ct Threshold``: the per-channel Ct threshold the instrument
+      computed; used as the threshold value for the MAK2-fitted Ct
+      so the MAK2 Ct is comparable to the instrument's number.
+    - ``HIGHSD`` / ``NOAMP`` / ``EXPFAIL``: the instrument's quality
+      flags, surfaced in the Status column for cross-reference.
+    - The Ct column is labelled ``C_`` in ABI exports (with
+      fallbacks for ``CT``/``Ct``/``Cq``/``Cp``).
+
+    Args:
+        file: Either a path/string or a file-like object with a
+            ``read`` method (e.g. a Streamlit upload).
+
+    Returns:
+        Dict with:
+
+        - ``'well_meta'`` / ``'sample_metadata'`` (same dict —
+          aliased for legacy callers): keyed by ``f"{Reporter}_{Well}"``,
+          each value is a per-well dict including the metadata
+          fields above.
+        - ``'channel_thresholds'``: per-channel median Ct threshold,
+          e.g. ``{'FAM': 0.1, 'JOE': 0.04}``.
+        - ``'n_wells'``: total wells parsed.
+
+    Raises:
+        ValueError: If the CSV lacks ``Well`` or ``Reporter`` columns.
     """
     if hasattr(file, 'read'):
         content = file.read()
