@@ -14,7 +14,6 @@ Output:
 """
 
 import sys
-import os
 import time
 import io
 import traceback
@@ -30,7 +29,7 @@ from mak2_model import MAK2Model, estimate_MAK2_params_from_exponential
 from optimizer import MAK2Optimizer
 from data_processing import detect_no_signal_samples, estimate_baseline_end
 from qpcr_data_converter import QPCRDataConverter, load_abi_results_csv
-from replicate_analysis import calculate_replicate_stats, parse_sample_groups, compare_precision
+from replicate_analysis import calculate_replicate_stats, compare_precision
 from calibration import build_standard_curve, build_ct_standard_curve, apply_calibration, apply_ct_calibration
 
 # ── Configuration ───────��────────────────────────────��────────────────────────
@@ -328,15 +327,13 @@ def run_pass1(all_samples_to_fit, cycles, sample_metadata, rox_by_well,
             # Smart start
             floor_idx = int(np.searchsorted(cycles, FIRST_FIT_CYCLE))
 
-            # Baseline end from metadata
-            meta_bl_end = None
+            # Baseline-end cycle from metadata (recorded in result dict as bl_end_meta)
             meta_bl_end_cycle = None
             if sample_metadata:
                 wm = sample_metadata.get(sample_name, {})
                 meta_bl_end_val = wm.get('Baseline End', None)
                 if meta_bl_end_val is not None:
                     try:
-                        meta_bl_end = int(np.searchsorted(cycles, float(meta_bl_end_val)))
                         meta_bl_end_cycle = float(meta_bl_end_val)
                     except (ValueError, TypeError):
                         pass
@@ -350,16 +347,6 @@ def run_pass1(all_samples_to_fit, cycles, sample_metadata, rox_by_well,
                 fluor_for_bl = fluor_data
             est_bl_end_idx = estimate_baseline_end(cycles, fluor_for_bl, first_cycle_idx=floor_idx)
             est_bl_end_cycle = float(cycles[min(est_bl_end_idx, len(cycles) - 1)])
-
-            # Baseline end anchor
-            LATE_CEIL = int(len(cycles) * 0.85)
-            if meta_bl_end is not None:
-                if est_bl_end_idx < LATE_CEIL:
-                    baseline_end_idx = max(meta_bl_end, est_bl_end_idx)
-                else:
-                    baseline_end_idx = meta_bl_end
-            else:
-                baseline_end_idx = est_bl_end_idx
 
             fit_start_idx, max_slope_idx = smart_start(
                 fluor_data, cycles, floor_idx, CYCLES_BEFORE_MAX
@@ -690,15 +677,13 @@ def run_pass2(results_list, cycles, sample_metadata, rox_by_well,
             # Smart start for retry
             r_floor = int(np.searchsorted(cycles, FIRST_FIT_CYCLE))
 
-            # Metadata baseline end
-            r_meta_bl_end = None
+            # Metadata baseline-end cycle (recorded in result dict as bl_end_meta)
             r_meta_bl_end_cycle = None
             if sample_metadata:
                 r_wm = sample_metadata.get(sample_name, {})
                 r_meta_bl_end_val = r_wm.get('Baseline End', None)
                 if r_meta_bl_end_val is not None:
                     try:
-                        r_meta_bl_end = int(np.searchsorted(cycles, float(r_meta_bl_end_val)))
                         r_meta_bl_end_cycle = float(r_meta_bl_end_val)
                     except (ValueError, TypeError):
                         pass
@@ -712,15 +697,6 @@ def run_pass2(results_list, cycles, sample_metadata, rox_by_well,
                 fluor_for_bl = fluor_data
             r_est_bl_end_idx = estimate_baseline_end(cycles, fluor_for_bl, first_cycle_idx=r_floor)
             r_est_bl_end_cycle = float(cycles[min(r_est_bl_end_idx, len(cycles) - 1)])
-
-            r_LATE_CEIL = int(len(cycles) * 0.85)
-            if r_meta_bl_end is not None:
-                if r_est_bl_end_idx < r_LATE_CEIL:
-                    r_baseline_end_idx = max(r_meta_bl_end, r_est_bl_end_idx)
-                else:
-                    r_baseline_end_idx = r_meta_bl_end
-            else:
-                r_baseline_end_idx = r_est_bl_end_idx
 
             retry_start_idx, r_max_slope_idx = smart_start(
                 fluor_data, cycles, r_floor, CYCLES_BEFORE_MAX
