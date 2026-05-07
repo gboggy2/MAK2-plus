@@ -1,8 +1,76 @@
-"""
-MAK2 Model with Primer Depletion
-A mechanistic model of PCR for qPCR data fitting.
+"""MAK2 mechanistic PCR model with primer depletion.
 
-Based on Boggy & Woolf (2010) with extensions for primer depletion.
+This module implements the forward simulator and the analytical
+parameter-estimation pipeline for the MAK2 model of qPCR amplification
+described in Boggy & Woolf (2010), PLoS ONE 5(8):e12355, with an
+extension that explicitly tracks primer depletion across cycles.
+
+The MAK2 model — at a glance
+----------------------------
+For cycle ``n``, given DNA fluorescence ``D[n-1]`` and primer pool
+``P[n-1]``:
+
+    k_eff      = k * P[n-1]                       # effective per-cycle rate
+    D[n]       = D[n-1] + k_eff * ln(1 + D[n-1] / k_eff)
+    P[n]       = max(0, P[n-1] - (D[n] - D[n-1])) # primers consumed = DNA produced
+    F[n]       = D[n] + F_bg_intercept + F_bg_slope * n
+
+The closed-form per-cycle update is the Michaelis–Menten-like solution
+to the differential equation d[D]/dt = k * P * D / (D + k*P), which
+captures *why* qPCR curves are sigmoid: when D is small relative to
+k*P (early cycles) the rate is approximately k*P*D/(k*P) = D, giving
+exponential growth; when D becomes large compared to k*P (after
+primer depletion) the rate saturates at k*P, producing the plateau.
+The single parameter ``k`` (units of inverse primer concentration)
+encodes how aggressively primers are consumed; small k means primers
+are abundant relative to template and the curve looks nearly
+exponential, large k means depletion dominates and the plateau
+arrives quickly.
+
+Why this matters vs. Ct-based methods
+-------------------------------------
+Ct (cycle-threshold) quantification is essentially a calibration
+trick: it locates a fixed-fluorescence threshold and reads off the
+cycle number, then converts to copies via a standard curve from
+known dilutions. It works, but it requires that standard curve and
+it implicitly assumes every well has the same amplification
+efficiency. The MAK2 model is mechanistic — fitting it directly
+yields D0 (initial template fluorescence), which is proportional to
+the absolute number of starting copies. With one well-characterised
+"D0_single" calibration constant (template molecules per fluorescence
+unit), the same fit gives absolute quantification on any plate
+without per-experiment standard curves.
+
+Parameterisation choices that bite you if you don't know about them
+-------------------------------------------------------------------
+- ``D0`` is in **fluorescence units**, not molecules. The original
+  Boggy & Woolf formulation factored the unobservable
+  fluorophore-per-template scale out as ``F_scale``; here we fold it
+  into D0 directly so D0 is observable. Convert to copies post-hoc
+  by dividing by ``D0_single``.
+- ``D0`` is fit in **log10 space** by the optimizer (see
+  ``optimizer.py``). Linear-space optimization fails because D0
+  spans 6+ orders of magnitude across a dilution series; gradient-
+  based optimizers can't navigate that landscape without log
+  transformation.
+- The **background** (``F_bg_intercept``, ``F_bg_slope``) is fit
+  separately from the kinetic parameters via two-stage estimation:
+  first the pre-amplification cycles are linearly regressed (see
+  ``pre_estimate_background``), then those values are passed in as
+  near-fixed constants. Letting the optimizer fit background jointly
+  with D0/k/P0 leads to the background "absorbing" a wrong D0 — the
+  fit looks fine on R² but the kinetic parameters are wildly off.
+
+Public API
+----------
+``MAK2Model.simulate_cycles``        — forward simulation, fixed-grid output
+``MAK2Model.simulate_to_cycle``      — forward simulation, irregular cycles
+``calculate_amplification_efficiency``
+``find_slope_threshold_cycle``       — locate inflection (max-slope) cycle
+``pre_estimate_background``          — linear regression on a baseline window
+``estimate_D0_bounds``               — exponential-fit-based D0 bounds for the optimizer
+``estimate_k_from_exponential``      — analytic k from observed efficiency
+``estimate_MAK2_params_from_exponential`` — full data-driven prior for the optimizer
 """
 
 import numpy as np
@@ -10,16 +78,30 @@ from typing import Tuple, Optional
 
 
 class MAK2Model:
+    """Forward simulator for the MAK2 mechanistic PCR model.
+
+    Holds no state; the class exists as a namespace so the simulator can
+    be passed around as a single object (see ``optimizer.MAK2Optimizer``,
+    which composes one). Each method takes the kinetic parameters
+    explicitly and returns a new array — calling the same instance
+    repeatedly with different parameters is the normal use pattern.
+
+    The two simulation methods differ only in how the output cycle grid
+    is specified:
+
+    - ``simulate_cycles`` returns the full ``[0, n_cycles)`` grid.
+    - ``simulate_to_cycle`` returns predictions at an arbitrary array
+      of (possibly non-integer, possibly truncated) cycle numbers and
+      supports a ``cycle_offset`` for late-amplifying wells.
+
+    See the module docstring for a description of the underlying
+    biochemical model.
     """
-    Implements the MAK2 mechanistic PCR model with primer depletion.
-    
-    The model tracks:
-    - DNA concentration at each cycle
-    - Primer depletion across cycles
-    - Background fluorescence (linear model)
-    """
-    
+
     def __init__(self):
+        # No instance state — kinetic parameters are method arguments.
+        # Kept as a class so callers can hold a single ``model`` reference
+        # (see ``MAK2Optimizer.__init__``).
         pass
     
     def simulate_cycles(
@@ -31,79 +113,100 @@ class MAK2Model:
         F_bg_intercept: float = 0.0,
         F_bg_slope: float = 0.0
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Run the MAK2 forward simulator on the cycle grid ``[0, n_cycles)``.
+
+        Iterates the per-cycle update rule (see module docstring) and
+        adds a linear background, returning DNA-only fluorescence and
+        total fluorescence separately so the caller can plot or
+        diagnose them independently.
+
+        Args:
+            D0: Initial DNA fluorescence at cycle 0, in instrument
+                fluorescence units (RFU after baseline subtraction, or
+                Rn after ROX normalization). NOT a molecule count — the
+                fluorophore-per-template scale is folded in. Convert to
+                copies by dividing by the calibration constant
+                ``D0_single``.
+            k: MAK2 rate constant. Has units of inverse primer
+                concentration (matches ``P0``'s units). Encodes the
+                trade-off between exponential growth and primer
+                depletion. Typical fitted values: 0.05 – 1.5.
+            P0: Initial primer pool, in the same fluorescence units as
+                ``D0``. The optimizer fits this jointly with k; the
+                product ``k * P0`` controls the plateau height.
+            n_cycles: Number of cycles to simulate.
+            F_bg_intercept: Background fluorescence at cycle 0
+                (instrument optical baseline + dye fluorescence).
+            F_bg_slope: Per-cycle drift, typically from photobleaching
+                or dye degradation. Usually small.
+
+        Returns:
+            A 3-tuple ``(cycles, D, F)``:
+
+            - ``cycles``: integer cycle numbers ``0, 1, ..., n_cycles-1``.
+            - ``D``: DNA-only fluorescence at each cycle (no background).
+            - ``F``: total observed fluorescence (``D`` + linear background).
         """
-        Simulate PCR for n_cycles using the MAK2 model with primer depletion.
-        
-        Note: D0 is now in FLUORESCENCE UNITS (not molecules), representing
-        the initial fluorescence contribution from template DNA. This combines
-        the previous D0 (molecules) × F_scale into a single observable parameter.
-        
-        Parameters
-        ----------
-        D0 : float
-            Initial DNA fluorescence (fluorescence units, not molecules)
-            This is the directly observable quantity = template × fluorophore_per_template
-        k : float
-            PCR characteristic constant (k_a / 2k_b)
-        P0 : float
-            Initial primer concentration (in same units as D0)
-        n_cycles : int
-            Number of PCR cycles to simulate
-        F_bg_intercept : float
-            Background fluorescence intercept
-        F_bg_slope : float
-            Background fluorescence slope (per cycle)
-            
-        Returns
-        -------
-        cycles : np.ndarray
-            Array of cycle numbers (0, 1, 2, ..., n_cycles-1)
-        D : np.ndarray
-            DNA fluorescence at each cycle
-        F : np.ndarray
-            Total fluorescence (DNA signal + background) at each cycle
-        """
-        # Initialize arrays
+        # Pre-allocate the cycle, DNA, and primer arrays. We iterate one
+        # cycle at a time because the MAK2 update is a recurrence — there
+        # is no closed-form for D[n] given D[0], k, P0 (unlike pure
+        # exponential growth).
         cycles = np.arange(n_cycles)
         D = np.zeros(n_cycles)
         P = np.zeros(n_cycles)
 
-        # Set initial conditions
         D[0] = D0
         P[0] = P0
-        
-        # Simulate each cycle
+
         for n in range(1, n_cycles):
-            # Calculate effective rate constant for this cycle
+            # ``k_eff`` is the effective per-cycle rate constant. As the
+            # primer pool ``P[n-1]`` depletes, k_eff shrinks, which is
+            # what bends the exponential into a plateau.
             k_eff = k * P[n-1]
-            
-            # Prevent division by zero or negative log arguments
+
+            # Defensive guards: a depleted primer pool, exhausted DNA,
+            # or a numerically pathological combination would put us
+            # outside the domain of the analytical MAK2 update. In
+            # those cases freeze the state — the cycle made no usable
+            # progress.
             if k_eff <= 0 or D[n-1] <= 0:
                 D[n] = D[n-1]
                 P[n] = P[n-1]
                 continue
-            
-            # MAK2 equation with primer concentration
-            # D_n = D_{n-1} + k_eff * ln(1 + D_{n-1} / k_eff)
+
+            # The MAK2 per-cycle update rule:
+            #     D[n] = D[n-1] + k_eff * ln(1 + D[n-1] / k_eff)
+            # When D[n-1] << k_eff (early cycles, plenty of primer):
+            #     ln(1 + x) ≈ x, so D[n] ≈ 2 * D[n-1] (perfect doubling).
+            # When D[n-1] >> k_eff (late cycles, primer depleted):
+            #     ln(1 + x) ≈ ln(x), so D[n] ≈ D[n-1] + k_eff*ln(D[n-1]/k_eff)
+            #     — growth proportional to k_eff, hence the plateau.
             log_arg = 1 + D[n-1] / k_eff
-            
             if log_arg <= 0:
+                # Cannot happen for D[n-1] > 0 and k_eff > 0, but we
+                # guard against numerical underflow that could push the
+                # argument fractionally below zero.
                 D[n] = D[n-1]
                 P[n] = P[n-1]
                 continue
-                
+
             D_increment = k_eff * np.log(log_arg)
             D[n] = D[n-1] + D_increment
-            
-            # Update primer concentration (primers consumed by amplification)
-            # Each DNA molecule produced consumes primers
+
+            # Stoichiometry of PCR: every new double-stranded product
+            # consumes one primer pair, so the primer pool depletes by
+            # exactly the same fluorescence amount that was just added
+            # to D. (Both quantities are in the same fluorescence units
+            # because we folded ``F_scale`` into D0 — see the parameter
+            # discussion in the module docstring.)
             primers_consumed = D_increment
             P[n] = max(0, P[n-1] - primers_consumed)
-        
-        # Calculate fluorescence: DNA signal + background
-        # D is already in fluorescence units, so just add background
+
+        # Total observed fluorescence = amplification-derived signal
+        # plus the linear instrument background. ``D`` is already in
+        # fluorescence units, so this is a straight elementwise add.
         F = D + F_bg_intercept + F_bg_slope * cycles
-        
+
         return cycles, D, F
     
     def simulate_to_cycle(
@@ -116,72 +219,91 @@ class MAK2Model:
         F_bg_slope: float = 0.0,
         cycle_offset: float = 0.0
     ) -> np.ndarray:
+        """Predict fluorescence at an arbitrary array of cycle numbers.
+
+        This is the per-call workhorse used by the optimizer — it takes
+        the cycle numbers actually present in the fitted window
+        (which may be e.g. 13–26, not 0–N) and returns predicted
+        fluorescence aligned with the data.
+
+        Args:
+            D0: Initial DNA fluorescence at cycle 0 (fluorescence units).
+                See ``simulate_cycles`` for unit discussion.
+            k: MAK2 rate constant.
+            P0: Initial primer pool, same units as ``D0``.
+            cycles: Cycle numbers at which to evaluate the model. Need
+                not start at 0 and need not be contiguous; the method
+                runs a single forward simulation up to ``max(cycles)``
+                and indexes into it.
+            F_bg_intercept: Background fluorescence at cycle 0.
+            F_bg_slope: Per-cycle background drift.
+            cycle_offset: Lag phase. If the well doesn't start
+                amplifying until cycle C, set ``cycle_offset=C`` so
+                that the simulator treats cycle C as its "n=0" — i.e.
+                ``D0`` is the DNA quantity at the start of the
+                exponential phase, not at the literal first measurement
+                cycle. Cycles before the offset return pure background.
+
+        Returns:
+            Predicted fluorescence array, same shape as ``cycles``.
         """
-        Simulate PCR and return fluorescence at specific cycle numbers.
-        Useful for fitting to data where cycles may not start at 0.
-        
-        Parameters
-        ----------
-        D0 : float
-            Initial DNA fluorescence (fluorescence units)
-        k : float
-            PCR characteristic constant
-        P0 : float
-            Initial primer concentration
-        cycles : np.ndarray
-            Array of cycle numbers to evaluate
-        F_bg_intercept : float
-            Background fluorescence intercept
-        F_bg_slope : float
-            Background fluorescence slope
-        cycle_offset : float
-            Cycle at which amplification begins (lag phase)
-            
-        Returns
-        -------
-        F : np.ndarray
-            Fluorescence at each requested cycle
-        """
-        # Shift cycles by offset (amplification starts at cycle_offset)
+        # Translate input cycle numbers into the simulator's internal
+        # frame. Cycles before ``cycle_offset`` clip to 0 — they're in
+        # the lag phase and return pure background below.
         effective_cycles = np.maximum(0, cycles - cycle_offset)
         max_cycle = int(np.max(effective_cycles)) + 1
-        
+
+        # Run one forward simulation deep enough to cover every
+        # requested cycle, then sample.
         _, _, F_all = self.simulate_cycles(
             D0, k, P0, max_cycle, F_bg_intercept, F_bg_slope
         )
-        
-        # Interpolate or extract values at requested effective cycles
+
         F_result = np.zeros_like(cycles, dtype=float)
         for i, eff_cyc in enumerate(effective_cycles):
             if eff_cyc < 0:
-                # Before amplification starts - just background
+                # Pre-amplification: instrument sees only background.
+                # Use the original (un-offset) cycle so the linear
+                # baseline keeps drifting through the lag phase.
                 F_result[i] = F_bg_intercept + F_bg_slope * cycles[i]
             else:
                 idx = int(eff_cyc)
                 if idx < len(F_all):
                     F_result[i] = F_all[idx]
                 else:
+                    # Defensive: simulator was sized to ``max_cycle``
+                    # so this branch should be unreachable. Clamp to
+                    # the last simulated value if floating-point
+                    # arithmetic ever slips past the end.
                     F_result[i] = F_all[-1]
-        
+
         return F_result
 
 
 def calculate_amplification_efficiency(D: np.ndarray) -> np.ndarray:
-    """
-    Calculate cycle-by-cycle amplification efficiency.
-    
-    Efficiency at cycle n is defined as:
-    E_n = (D_n - D_{n-1}) / D_{n-1}
-    
-    Parameters
-    ----------
-    D : np.ndarray
-        DNA concentration at each cycle
-        
-    Returns
-    -------
-    efficiency : np.ndarray
-        Amplification efficiency at each cycle (starts at cycle 1)
+    """Compute per-cycle PCR efficiency from a DNA-fluorescence array.
+
+    Efficiency at cycle n is defined as the fractional gain over the
+    previous cycle:
+
+        E[n] = (D[n] - D[n-1]) / D[n-1]
+
+    With this definition E=1.0 means perfect doubling and E=0 means
+    no amplification. (Other parts of the codebase use the alternative
+    convention E = D[n]/D[n-1], where E=2.0 is perfect doubling — be
+    careful when comparing.) This is a diagnostic function used in
+    the UI to plot how efficiency drops across the run as primers
+    deplete; it is not used in the fit itself.
+
+    Args:
+        D: DNA-only fluorescence per cycle, e.g. the ``D`` returned by
+            ``MAK2Model.simulate_cycles``. Must have at least 2 entries.
+
+    Returns:
+        Efficiency array of length ``len(D) - 1``. Entry ``i``
+        corresponds to the transition from cycle ``i`` to cycle ``i+1``.
+        Cycles where ``D[n-1] == 0`` get efficiency 0 to avoid division
+        by zero.
     """
     efficiency = np.zeros(len(D) - 1)
     for n in range(1, len(D)):
@@ -194,52 +316,61 @@ def find_slope_threshold_cycle(
     fluorescence: np.ndarray,
     cycles_after_max: int = 3
 ) -> int:
-    """
-    Find the cutoff cycle based on the maximum slope (first derivative).
+    """Locate the inflection (max-slope) cycle plus a small offset.
 
-    Returns the cycle at maximum slope + cycles_after_max.
+    Used by the optimizer to truncate the fit window: the inflection
+    point of the qPCR sigmoid marks the boundary between exponential
+    growth and primer-depletion plateau. Fitting only up to a few
+    cycles past the inflection avoids the noisy tail (where the
+    plateau is sensitive to dye degradation and the model has very
+    little residual structure to learn from), while still giving the
+    optimizer enough plateau information to constrain ``P0``.
 
-    Uses a 5-point stencil formula for first derivative calculation:
-    f'[i] = (-f[i-2] + 8*f[i-1] - 8*f[i+1] + f[i+2]) / 12h
-    where h=1 for unit spacing. This provides better noise resistance
-    than simple finite differences.
+    Uses a 5-point stencil for the first derivative:
 
-    Parameters
-    ----------
-    fluorescence : np.ndarray
-        Fluorescence values at each cycle
-    cycles_after_max : int
-        Number of cycles after maximum slope to use as cutoff (default: 3)
+        f'[i] = (f[i-2] - 8*f[i-1] + 8*f[i+1] - f[i+2]) / 12
 
-    Returns
-    -------
-    threshold_cycle : int
-        Cutoff cycle index
-        Returns last cycle if threshold never reached
+    rather than ``np.gradient``'s 2-point central difference, because
+    qPCR data is noisy and the higher-order stencil reduces the
+    chance that a single noisy cycle gets picked as the inflection.
+
+    Args:
+        fluorescence: Per-cycle fluorescence array (smoothed or raw).
+        cycles_after_max: How many cycles past the inflection to
+            include before truncating. Default of 3 mirrors the
+            optimizer's ``CYCLES_AFTER_MAX`` setting.
+
+    Returns:
+        Index into ``fluorescence`` corresponding to the truncation
+        cycle. If the array is too short for the 5-point stencil, or
+        if no positive slope is detected (flat baseline / failed
+        well), returns the last index — i.e. "use everything".
     """
     if len(fluorescence) < 5:
-        # Need at least 5 points for 5-point stencil
+        # 5-point stencil needs ≥5 points; fall back to "use all data".
         return len(fluorescence) - 1
 
-    # Calculate first derivative using 5-point stencil formula
-    # f'[i] = (f[i-2] - 8*f[i-1] + 8*f[i+1] - f[i+2]) / 12
+    # Compute the smoothed first derivative. We leave the first two
+    # and last two entries as zero (the stencil is undefined at the
+    # boundaries); they're excluded from the argmax search below.
     f = fluorescence
     n = len(f)
     f1 = np.zeros(n)
-
     for i in range(2, n - 2):
         f1[i] = (f[i-2] - 8*f[i-1] + 8*f[i+1] - f[i+2]) / 12.0
 
     slope = f1
 
-    # Find maximum slope and its position (only search interior points)
+    # Search only the valid interior of the stencil for the peak slope.
     interior_slope = slope[2:-2]
     if len(interior_slope) == 0:
         return len(fluorescence) - 1
 
-    max_slope_idx = np.argmax(interior_slope) + 2  # +2 to account for offset
+    max_slope_idx = np.argmax(interior_slope) + 2  # un-offset
     max_slope = slope[max_slope_idx]
 
+    # A non-positive maximum slope means the curve never goes up — the
+    # well failed to amplify. Tell the caller to use the whole array.
     if max_slope <= 0:
         return len(fluorescence) - 1
 
@@ -253,34 +384,42 @@ def pre_estimate_background(
     bl_start_idx: int,
     bl_end_idx: int,
 ) -> tuple:
-    """
-    Estimate linear background (slope, intercept) from a known baseline region.
+    """Linear-regress the pre-amplification baseline window.
 
-    Fits a linear regression to fluorescence[bl_start_idx:bl_end_idx] using
-    the corresponding cycle numbers as x.  This is the same calculation the
-    instrument performs for its per-well baseline correction.
+    Why this function exists separately from the optimizer's joint fit:
+    the kinetic parameters (D0, k, P0) and the background
+    (F_bg_intercept, F_bg_slope) are mutually substitutable in the
+    pre-amplification region — a wrong D0 can be hidden by a
+    correspondingly wrong background, leaving R² high while the
+    quantification answer is meaningless. The mitigation is to pin
+    background down *first* using only baseline cycles (where there is
+    no amplification signal to confound it), then pass those values
+    in as near-fixed constants to the kinetic optimization. See the
+    "Background separation" entry in the module docstring.
 
-    Parameters
-    ----------
-    cycles : np.ndarray
-        Full cycle array (cycle numbers, not indices).
-    fluorescence : np.ndarray
-        Full fluorescence array.
-    bl_start_idx : int
-        Start index (inclusive) of the baseline region.
-    bl_end_idx : int
-        End index (exclusive) of the baseline region.
+    The regression itself is exactly what most qPCR instruments do
+    internally for their own baseline correction, so the slope and
+    intercept this returns should match (up to baseline-window
+    differences) the values reported by the instrument's own
+    Ct calculator.
 
-    Returns
-    -------
-    slope : float
-        RFU per cycle (or Rn per cycle after normalization).
-    intercept : float
-        Extrapolated fluorescence at cycle 0.
+    Args:
+        cycles: Full cycle array (cycle numbers — *not* array indices).
+        fluorescence: Full per-cycle fluorescence array.
+        bl_start_idx: Inclusive start index of the baseline window.
+        bl_end_idx: Exclusive end index. The window is
+            ``cycles[bl_start_idx:bl_end_idx]``.
+
+    Returns:
+        ``(slope, intercept)`` floats. If fewer than 2 points are in
+        the window, returns ``(0.0, mean(fluorescence))`` as a
+        defensive fallback rather than raising.
     """
     bl_cycles = cycles[bl_start_idx:bl_end_idx].astype(float)
     bl_fluor  = fluorescence[bl_start_idx:bl_end_idx].astype(float)
     if len(bl_cycles) < 2:
+        # Degenerate window — return zero drift and the plate-wide
+        # average as the intercept so downstream code doesn't crash.
         return 0.0, float(np.mean(fluorescence))
     coeffs = np.polyfit(bl_cycles, bl_fluor, 1)
     return float(coeffs[0]), float(coeffs[1])
@@ -292,38 +431,86 @@ def estimate_D0_bounds(
     bg_slope: float = None,
     bg_intercept: float = None,
 ) -> tuple:
-    """
-    Estimate bounds on initial DNA fluorescence (D0) by fitting exponentials.
-    
-    Uses two exponential models starting from cycle 1:
-    1. Perfect doubling: F = F_bg + D0 * 2^n (lower bound)
-    2. With efficiency: F = F_bg + D0 * E^n (upper bound, E~1.8)
-    
-    Note: D0 is now in fluorescence units directly, not molecules.
-    
-    Parameters
-    ----------
-    cycles : np.ndarray
-        Cycle numbers
-    fluorescence : np.ndarray
-        Fluorescence measurements
-    bg_slope : float, optional
-        Pre-estimated background slope (RFU/cycle) from pre_estimate_background().
-        When provided, this is used for detrending instead of fitting the first
-        10 cycles internally — more accurate for wells with known baseline regions.
-    bg_intercept : float, optional
-        Pre-estimated background intercept from pre_estimate_background().
+    """Bracket D0 by fitting two exponential models in the early cycles.
 
-    Returns
-    -------
-    D0_lower : float
-        Lower bound on D0 (from perfect doubling model)
-    D0_upper : float
-        Upper bound on D0 (from efficiency model)
-    F_bg_estimate : float
-        Estimated background fluorescence
-    fit_info : dict
-        Additional info for visualization (cycles, fitted values, etc.)
+    Why this is necessary: the MAK2 optimizer needs box bounds on every
+    parameter, but D0 spans 6+ orders of magnitude across a typical
+    dilution series — there is no universal default ``[D0_lo, D0_hi]``
+    that works on both an undiluted standard and a 1:1e6 dilution.
+    Computing per-well bounds from the data itself is what makes the
+    full pipeline run unattended on plates with mixed templates.
+
+    Strategy: in the early cycles (before the inflection / before
+    primer depletion bites), the MAK2 model is well approximated by
+    pure exponential growth. Fit two exponentials over an
+    automatically detected exponential region:
+
+    1.  ``F = F_bg + D0 * 2^n``        — perfect doubling.
+        This OVER-estimates the rate of growth (real efficiencies are
+        always a bit below 2.0), so the fitted D0 *under-estimates*
+        the true D0. → **lower bound.**
+    2.  ``F = F_bg + D0 * E^n``        — fitted efficiency E ∈ (1, 2).
+        E settles to roughly 1.8 in practice. This *over-estimates*
+        D0 because the exponential fit absorbs into D0 some of the
+        early curvature that the full MAK2 model would attribute to
+        primer depletion. → **upper bound.**
+
+    The two fits also yield a fitted background (``F_bg``) which is
+    averaged and returned so callers (the optimizer and the UI) have
+    a starting point even when the metadata baseline window is
+    unavailable.
+
+    Pipeline overview (each step is heavily commented inline below):
+
+    - Detect the baseline-end cycle by scanning for a sustained
+      slope+fluorescence increase (5σ above noise).
+    - Fit a fresh background regression on all baseline points and
+      derive uncertainty bounds (±3σ intercept, ±5σ slope, with a
+      50% safety margin) — these become the ``F_bg`` box bounds.
+    - Find the inflection cycle by scanning the smoothed gradient
+      from the right (avoids early-cycle noise spikes that look like
+      growth peaks).
+    - Define two cycle ranges within the exponential region:
+      ``cycles_lower`` = first few cycles (before primer depletion
+      reduces efficiency below 2) for the doubling fit;
+      ``cycles_upper`` = the full exponential region up to the
+      inflection for the efficiency fit.
+    - Fit each exponential with a multi-start adaptive strategy
+      (10 initial guesses for doubling, 5 for efficiency) and accept
+      the best R².
+    - Add 10× margin to each bound so the downstream optimizer has
+      slack, and cap the upper bound by the fluorescence range so
+      raw ABI multicomponent data (~1e6 RFU) doesn't get clipped to
+      the same ceiling as normalized Rn data (~1–3 RFU).
+
+    Args:
+        cycles: Per-cycle cycle-number array.
+        fluorescence: Per-cycle fluorescence array (raw RFU or
+            normalized Rn — the function is scale-aware).
+        bg_slope: Optional externally-supplied background slope. When
+            provided, it's used for the detrending step that finds
+            the amplification onset; the bounds returned for the
+            *background itself* are still derived from the local
+            baseline regression. Pass this when you have a metadata
+            baseline window (more accurate than the function's own
+            10-cycle fallback).
+        bg_intercept: Companion to ``bg_slope``.
+
+    Returns:
+        4-tuple ``(D0_lower, D0_upper, F_bg_estimate, fit_info)``:
+
+        - ``D0_lower``: lower bound on D0 (from doubling fit, with
+          10× safety margin applied).
+        - ``D0_upper``: upper bound on D0 (from efficiency fit, with
+          10× safety margin and a fluorescence-range cap).
+        - ``F_bg_estimate``: averaged background intercept from the
+          two exponential fits (NOT the same as the regression-only
+          intercept — this version "saw" the early exponential).
+        - ``fit_info``: dict with everything the UI and the
+          downstream ``estimate_MAK2_params_from_exponential`` call
+          consume — fitted curves, R², bounds, the efficiency E, the
+          detected inflection cycle, and the analytical k estimate.
+          Empty dict if the exponential fits failed entirely.
     """
     from scipy.optimize import curve_fit
     import numpy as np
@@ -917,51 +1104,76 @@ def estimate_k_from_exponential(
     P0_assumed: float = 1.0,
     use_cycle: Optional[int] = None
 ) -> float:
-    """
-    Analytically estimate k by matching MAK2 growth to efficiency exponential.
-    
-    Strategy:
-    1. Efficiency exponential tells us: D_n = D0 × E^n
-    2. MAK2 growth per cycle: ΔD = k × P × ln(1 + D/(k×P))
-    3. Match them at a specific cycle to solve for k
-    
-    Parameters
-    ----------
-    D0_eff : float
-        Initial DNA from efficiency exponential fit
-    E : float
-        Efficiency from exponential fit (typically 1.3-1.9)
-    cycles : np.ndarray
-        Cycle numbers that were fit
-    P0_assumed : float
-        Assumed P0 value (default 1.0, will be refined during full MAK2 fit)
-    use_cycle : int, optional
-        Specific cycle to use for matching. If None, uses middle of fitted region.
-        
-    Returns
-    -------
-    k_estimate : float
-        Estimated k value
+    """Solve for the MAK2 rate constant k that matches an observed efficiency.
+
+    The k parameter has no closed-form relationship to the observable
+    PCR efficiency E — k controls a continuous tradeoff between
+    exponential growth and primer depletion, while E is what the
+    well actually showed in the early cycles. This function inverts
+    that relationship by:
+
+    1. Picking a representative cycle in the exponential fit window.
+    2. Computing the cumulative growth predicted by the efficiency
+       exponential at that cycle (``D_prev * (E - 1)``).
+    3. Numerically solving for the k that produces the same
+       per-cycle growth in the MAK2 equation:
+
+           growth_exp = k * P0 * ln(1 + D_prev / (k * P0))
+
+    The solution is well-defined and unimodal in k (for fixed P0,
+    D_prev, growth_exp), so we use ``scipy.optimize.fsolve`` with
+    multiple initial guesses and take the median accepted root for
+    robustness.
+
+    P0 is **assumed** here (default 1.0) because it cannot be
+    disentangled from k using only the exponential region — the
+    plateau is what pins down P0 and we haven't gotten there yet.
+    The k returned is a starting estimate; the full MAK2 optimization
+    refines both jointly.
+
+    Args:
+        D0_eff: Fitted D0 from the efficiency exponential model.
+        E: Fitted efficiency, conventionally in the range 1.3–1.9 for
+            real qPCR data (E=2.0 means perfect doubling).
+        cycles: Cycle numbers from the exponential fit window, used
+            to pick the representative cycle.
+        P0_assumed: Working assumption for the primer pool size; the
+            optimizer rescales k after fitting the true P0 to the
+            plateau. Default 1.0.
+        use_cycle: Optional override for the representative cycle
+            (index into ``cycles``). Default behavior is to pick the
+            middle of the fit window, which balances numerical
+            stability against signal-to-noise.
+
+    Returns:
+        Estimated k value. If every numerical solver attempt fails,
+        falls back to an empirical scaling (``0.3 * (2 - E)``) — that
+        formula has no theoretical justification beyond "small E
+        means lots of depletion means large k, and vice versa," but
+        it's robust enough to keep the pipeline running.
     """
     from scipy.optimize import fsolve
-    
-    # Use middle cycle of exponential fit region for matching
+
+    # Pick the representative cycle. Mid-window is a balance:
+    # earlier cycles have D ≈ D0 (very small), making the equation
+    # numerically degenerate; later cycles are more affected by the
+    # exponential's slight extrapolation error away from the data.
     if use_cycle is None:
         use_cycle = len(cycles) // 2
     else:
         use_cycle = min(use_cycle, len(cycles) - 1)
-    
+
     n_cycle = cycles[use_cycle]
-    
-    # DNA concentration at cycle n-1 (from exponential)
+
+    # Reconstruct the "previous-cycle" DNA quantity from the fitted
+    # exponential, then compute the per-cycle growth E predicts.
     D_prev = D0_eff * E**(n_cycle - 1)
-    
-    # Expected growth from exponential
     growth_exp = D_prev * (E - 1)
-    
-    # Solve for k where MAK2 growth matches exponential growth
-    # growth_exp = k × P0 × ln(1 + D_prev / (k × P0))
-    
+
+    # The function we want to zero: squared difference between the
+    # exponential's predicted growth and MAK2's growth at this k.
+    # Returns a huge sentinel for non-physical inputs so fsolve walks
+    # away from them.
     def equation(k):
         if k <= 1e-8:
             return 1e10
@@ -970,28 +1182,37 @@ def estimate_k_from_exponential(
             return (growth_exp - mak2_growth)**2
         except:
             return 1e10
-    
-    # Try multiple initial guesses
+
+    # Multi-start: fsolve is gradient-based and the squared-residual
+    # surface has a flat tail at large k. Scattering initial guesses
+    # across the realistic k range catches both shallow and steep
+    # local-minima geometries.
     k_estimates = []
     for k_init in [0.01, 0.05, 0.1, 0.2, 0.5]:
         try:
             result = fsolve(equation, k_init, full_output=True)
-            if result[2] == 1:  # Solution converged
+            if result[2] == 1:  # fsolve says it converged
                 k_est = result[0][0]
                 error = equation(k_est)
-                # Only accept if error is very small (true minimum) and k is reasonable
+                # Only accept genuine roots (squared residual ≈ 0) in
+                # a physically reasonable range — otherwise fsolve may
+                # have just stopped at a flat region.
                 if error < 1e-10 and 1e-6 < k_est < 100:
                     k_estimates.append(k_est)
         except:
             continue
 
     if not k_estimates:
-        # Fallback: use empirical relationship
-        # E close to 2 → minimal depletion → small k
-        # E close to 1 → strong depletion → large k
+        # Empirical fallback when the numerics fail entirely: a linear
+        # interpolation between "E ≈ 2 → no depletion → k ≈ 0" and
+        # "E ≈ 1 → heavy depletion → k ≈ 0.3". Coarse but it keeps the
+        # downstream optimizer from getting None.
         k_estimate = 0.3 * (2.0 - E)
         print(f"    Warning: Numerical solution failed, using empirical estimate")
     else:
+        # Median across initial guesses suppresses any single bad
+        # convergence; with this many starts a true root will be hit
+        # multiple times.
         k_estimate = np.median(k_estimates)
 
     return k_estimate
@@ -1003,35 +1224,61 @@ def estimate_MAK2_params_from_exponential(
     P0_assumed: float = 1.0,
     verbose: bool = True
 ) -> Tuple[dict, dict]:
-    """
-    Analytically estimate MAK2 parameters from exponential fits.
-    
-    This provides data-driven initial guesses and tight bounds for MAK2 optimization.
-    
-    Strategy:
-    1. Fit efficiency exponential: F = D0 × E^n + bg (already very accurate)
-    2. D0 estimate: Use D0 from exponential fit directly
-    3. k estimate: Solve for k where MAK2 growth matches exponential growth
-    4. P0 estimate: Assume typical value (1.0), will be refined in plateau region
-    5. Return tight bounds (±1 order of magnitude) around estimates
-    
-    Parameters
-    ----------
-    cycles : np.ndarray
-        Cycle numbers
-    fluorescence : np.ndarray
-        Fluorescence values
-    P0_assumed : float
-        Assumed P0 for k estimation (default 1.0)
-    verbose : bool
-        Print diagnostic information
-        
-    Returns
-    -------
-    estimates : dict
-        Point estimates for D0, k, P0, F_bg_intercept, F_bg_slope
-    bounds : dict
-        Tight bounds for each parameter (±1 order of magnitude)
+    """Build a data-driven prior (point estimates + box bounds) for the MAK2 optimizer.
+
+    This is the function the tiered optimizer calls to obtain its
+    starting point. It composes the lower-level primitives:
+
+    1. Run ``estimate_D0_bounds`` to get bracket estimates of D0 from
+       perfect-doubling and efficiency exponential fits, plus
+       background bounds and the fitted efficiency E.
+    2. Use the efficiency-fit D0 as the point estimate.
+    3. Call ``estimate_k_from_exponential`` to invert E into a
+       starting k (with P0 assumed).
+    4. Set P0's point estimate to ``F_max`` — empirically, the
+       primer pool that produces a given plateau scales linearly with
+       the observed plateau across instruments and dye chemistries.
+    5. Apply the **cycle-offset correction** to D0 (see inline
+       comments below) so the bounds are expressed in the MAK2
+       model's "DNA at cycle 0" reference frame, not the
+       exponential-fit's "DNA at the start of the exponential
+       region" frame. Without this correction, a late-amplifying
+       well (exponential region starts at cycle 25) would have D0
+       bounds that are 2^25 ≈ 33 million times too high.
+    6. Set k bounds: lower = ``max(0.01, k_estimate / 2)``;
+       upper from the empirically-fit relationship
+       ``k_upper = 0.2 - 0.03 * log10(D0_upper)``, clipped to
+       ``[0.3, 2.0]``. The negative D0–k correlation comes from the
+       fact that high-D0 wells reach the plateau quickly (short
+       exponential phase, minimal observable depletion → small k
+       range explored), while low-D0 wells take many cycles to
+       plateau (long exponential phase, cumulative depletion visible
+       → large k range needed). The fixed ``[0.3, 2.0]`` clip
+       prevents pathological bounds when D0 is itself extreme.
+    7. Cap k_upper at 0.85 for late-baseline wells (baseline ends
+       at cycle ≥21) to suppress an empirically observed oscillation
+       in the optimizer when k drifts above ~1.0.
+
+    Args:
+        cycles: Per-cycle cycle-number array.
+        fluorescence: Per-cycle fluorescence array.
+        P0_assumed: Working P0 used during the analytical k estimation
+            (passed to ``estimate_k_from_exponential``). The bounds
+            returned for the *real* P0 are derived independently from
+            ``F_max``. Default 1.0.
+        verbose: Print step-by-step diagnostics. The optimizer passes
+            ``True`` so per-well diagnostics appear in the batch log.
+
+    Returns:
+        ``(estimates, bounds)`` two-tuple of dicts with keys
+        ``D0``, ``k``, ``P0``, ``F_bg_intercept``, ``F_bg_slope``.
+        ``estimates`` values are scalars; ``bounds`` values are
+        ``(lo, hi)`` pairs for the optimizer's box constraints.
+
+    Raises:
+        ValueError: If the upstream exponential fit failed entirely
+            (returns an empty ``fit_info``). The optimizer treats
+            this as a fall-through to its non-analytical bounds.
     """
     
     if verbose:
