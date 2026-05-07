@@ -19,6 +19,47 @@ from mak2_model import (
     estimate_D0_bounds,
     estimate_MAK2_params_from_exponential
 )
+from config import RANDOM_SEED
+
+
+# ── Per-call-site offsets for derived seeds ──────────────────────────────────
+# Different stochastic loops in fit() must not share the same seed sequence —
+# if they did, two LHS calls (or LHS + retry-loop inits) would explore the
+# same corners of the parameter space, weakening the search. Each site below
+# adds a unique offset to RANDOM_SEED so derived seeds stay disjoint without
+# the user needing to think about it.
+#
+# In production (RANDOM_SEED is None), every seed below resolves to None and
+# scipy/numpy pull fresh entropy on each call — i.e. the optimizer naturally
+# varies run-to-run, exposing the optimizer's stochastic spread.
+#
+# In testing (RANDOM_SEED=<int>), each site gets a deterministic seed
+# (RANDOM_SEED + offset + attempt), so the full pipeline is byte-reproducible.
+_SEED_OFFSET_LHS_3D       = 0      # Tier 2 LHS sampler
+_SEED_OFFSET_LHS_5D       = 100    # Tier 2.5 fallback LHS sampler
+_SEED_OFFSET_DE           = 200    # Tier 3 differential evolution
+_SEED_OFFSET_TIER1_RETRY  = 1000   # Tier 1.5 per-attempt seeds
+_SEED_OFFSET_PATTERN      = 2000   # pattern-based retry seeds
+_SEED_OFFSET_TIER2_SECOND = 3000   # Tier 2 secondary attempts
+_SEED_OFFSET_TIER25_ATTEMPT = 4000  # Tier 2.5 per-attempt seeds
+
+
+def _derive_seed(offset: int, attempt: int = 0) -> Optional[int]:
+    """Combine ``RANDOM_SEED`` with a per-site offset and a per-attempt index.
+
+    Returns ``None`` when ``RANDOM_SEED is None`` (production / unseeded
+    mode) — both scipy and numpy treat ``seed=None`` as "use fresh
+    entropy", giving the optimizer its natural stochastic variation.
+
+    Returns a deterministic integer when ``RANDOM_SEED`` is set
+    (testing / CI). The combination ``base + offset + attempt`` keeps
+    every call site's seed sequence disjoint from every other call
+    site's, so the LHS samplers and the per-attempt retry loops
+    don't accidentally explore the same parameter-space corners.
+    """
+    if RANDOM_SEED is None:
+        return None
+    return RANDOM_SEED + offset + attempt
 
 
 def calculate_r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -407,7 +448,7 @@ class MAK2Optimizer:
         n_lhs_samples = 20 * (max_attempts - 1)  # Attempt 1 uses analytical, rest use LHS
 
         if n_lhs_samples > 0:
-            sampler = qmc.LatinHypercube(d=3, seed=42)  # 3D: D0, k, P0
+            sampler = qmc.LatinHypercube(d=3, seed=_derive_seed(_SEED_OFFSET_LHS_3D))  # 3D: D0, k, P0
             lhs_samples = sampler.random(n=n_lhs_samples)
             print(f"✅ Generated {n_lhs_samples} LHS samples ({20} per attempt × {max_attempts-1} attempts)")
             print(f"   This provides {n_lhs_samples}x more coverage than previous approach")
@@ -547,7 +588,7 @@ class MAK2Optimizer:
                     cycles_fit,
                     fluorescence_fit,
                     bounds_to_use,
-                    seed=attempt,
+                    seed=_derive_seed(_SEED_OFFSET_TIER1_RETRY, attempt),
                     lhs_D0=lhs_D0,
                     lhs_k=lhs_k,
                     lhs_P0=lhs_P0
@@ -1171,7 +1212,7 @@ class MAK2Optimizer:
                              'P0': (P0_new_lower, P0_new_upper),
                              'F_bg_intercept': (bg_int_new_lower, bg_int_new_upper),
                              'F_bg_slope': (bg_slope_new_lower, bg_slope_new_upper)},
-                            seed=1000 + retry_i,
+                            seed=_derive_seed(_SEED_OFFSET_PATTERN, retry_i),
                             lhs_D0=D0_sample,
                             lhs_k=k_sample,
                             lhs_P0=P0_sample,
@@ -1335,8 +1376,8 @@ class MAK2Optimizer:
                     params, r2 = self._fit_attempt(
                         cycles_fit, 
                         fluorescence_fit, 
-                        bounds, 
-                        seed=attempt + 100  # Different seed from first round
+                        bounds,
+                        seed=_derive_seed(_SEED_OFFSET_TIER2_SECOND, attempt)
                     )
                     
                     if verbose:
@@ -1442,7 +1483,7 @@ class MAK2Optimizer:
                 print(f"   Generating {n_lhs_fallback} LHS samples for 5D parameter space...")
 
                 # qmc is already imported at the top
-                sampler = qmc.LatinHypercube(d=5, seed=42)  # 5D: D0, k, P0, F_bg_int, F_bg_slope
+                sampler = qmc.LatinHypercube(d=5, seed=_derive_seed(_SEED_OFFSET_LHS_5D))  # 5D: D0, k, P0, F_bg_int, F_bg_slope
                 lhs_samples_5d = sampler.random(n=n_lhs_fallback)
 
                 # Scale to WIDENED bounds in log space for D0, linear for others
@@ -1490,7 +1531,7 @@ class MAK2Optimizer:
                             cycles_fit,
                             fluorescence_fit,
                             fallback_bounds,  # Use widened bounds!
-                            seed=attempt + 1000,  # Different seed range
+                            seed=_derive_seed(_SEED_OFFSET_TIER25_ATTEMPT, attempt),
                             lhs_D0=D0_lhs_5d[idx],
                             lhs_k=k_lhs_5d[idx],
                             lhs_P0=P0_lhs_5d[idx]
@@ -1789,7 +1830,7 @@ class MAK2Optimizer:
             tol=1e-7,             # Convergence tolerance
             mutation=(0.5, 1.5),  # Mutation factor range
             recombination=0.7,    # Crossover probability
-            seed=42,              # Reproducible results
+            seed=_derive_seed(_SEED_OFFSET_DE),  # None in production (natural variation), deterministic in tests
             polish=True,          # Use L-BFGS-B to polish the best solution
             workers=1,            # Single-threaded (avoid pickling issues)
             updating='deferred'   # Evaluate full generation before updating
