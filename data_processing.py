@@ -35,7 +35,6 @@ def estimate_baseline_end(cycles, fluorescence, first_cycle_idx=2, window_size=1
     int
         0-based index of the last baseline cycle (exclusive end, i.e. baseline is cycles[:result])
     """
-    import numpy as np
     n = len(cycles)
     bl_start = first_cycle_idx
     bl_end = min(bl_start + window_size, n - 1)
@@ -56,54 +55,6 @@ def estimate_baseline_end(cycles, fluorescence, first_cycle_idx=2, window_size=1
             break
         bl_end = new_bl_end
     return bl_end  # index of last baseline cycle (exclusive)
-
-
-def export_results(
-    cycles: np.ndarray,
-    fluorescence_data: np.ndarray,
-    fluorescence_fit: np.ndarray,
-    params: dict,
-    output_path: str
-):
-    """
-    Export fitting results to CSV.
-    
-    Parameters
-    ----------
-    cycles : np.ndarray
-        Cycle numbers
-    fluorescence_data : np.ndarray
-        Measured fluorescence
-    fluorescence_fit : np.ndarray
-        Fitted fluorescence
-    params : dict
-        Fitted parameters
-    output_path : str
-        Path for output CSV file
-    """
-    # Create DataFrame with data
-    df = pd.DataFrame({
-        'Cycle': cycles,
-        'Fluorescence_Data': fluorescence_data,
-        'Fluorescence_Fit': fluorescence_fit,
-        'Residual': fluorescence_data - fluorescence_fit
-    })
-    
-    # Add parameters as metadata in separate rows
-    param_df = pd.DataFrame({
-        'Parameter': list(params.keys()),
-        'Value': list(params.values())
-    })
-    
-    # Write to file
-    with open(output_path, 'w') as f:
-        f.write("# MAK2 Fitting Results\n")
-        f.write("# Parameters:\n")
-        param_df.to_csv(f, index=False)
-        f.write("\n# Data:\n")
-        df.to_csv(f, index=False)
-    
-    print(f"Results exported to {output_path}")
 
 
 def detect_no_signal_samples(
@@ -300,13 +251,3 @@ def detect_no_signal_samples(
     return clear_signal_samples, obvious_no_signal, plate_stats
 
 
-if __name__ == "__main__":
-    # Test example data generation
-    examples = prepare_example_data()
-    
-    print("Generated example datasets:")
-    for name, data in examples.items():
-        print(f"\n{name}:")
-        print(f"  Cycles: {len(data['cycles'])}")
-        print(f"  Fluorescence range: {data['fluorescence'].min():.2f} - {data['fluorescence'].max():.2f}")
-        print(f"  True params: D0={data['true_params']['D0']}, k={data['true_params']['k']}, P0={data['true_params']['P0']:.2e}")
