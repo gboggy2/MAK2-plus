@@ -13,8 +13,8 @@ Author: Greg Boggy, PhD
 
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Optional, Tuple, Union
-from scipy.stats import linregress, t as t_dist, poisson
+from typing import Dict, List, Optional
+from scipy.stats import linregress, poisson
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -1041,7 +1041,6 @@ def plot_limited_dilution_diagnostics(ld_calibration: Dict) -> go.Figure:
     cf = ld_calibration['conversion_factor']
     N_total = ld_calibration['n_total']
     N_pos = ld_calibration['n_positive']
-    N_neg = ld_calibration['n_negative']
 
     # ── Left panel: D0 histogram ──────────────────────────────────────────
     fig.add_trace(
