@@ -16,6 +16,7 @@ from tqdm import tqdm
 
 from mak2_model import MAK2Model
 from optimizer import MAK2Optimizer
+from config import RANDOM_SEED
 
 
 @dataclass
@@ -123,9 +124,16 @@ class BootstrapAnalyzer:
         self.n_bootstrap = n_bootstrap
         self.confidence_level = confidence_level
         self.show_progress = show_progress
-        
-        if random_seed is not None:
-            np.random.seed(random_seed)
+
+        # Seed precedence: explicit constructor arg > MAK2_RANDOM_SEED env var
+        # > None (truly random). The effective seed is stashed for use by the
+        # per-iteration RandomState in run_bootstrap() — without this,
+        # MAK2_RANDOM_SEED would seed the optimizer's per-iteration refits
+        # (good) but leave the residual-resampling RNG unseeded (bad), so the
+        # bootstrap loop would still be non-deterministic in CI.
+        self._effective_seed = random_seed if random_seed is not None else RANDOM_SEED
+        if self._effective_seed is not None:
+            np.random.seed(self._effective_seed)
     
     def run_bootstrap(
         self,
@@ -179,8 +187,11 @@ class BootstrapAnalyzer:
         if self.show_progress:
             iterator = tqdm(iterator, desc="Bootstrap iterations")
         
-        # Create random number generator with explicit state
-        rng = np.random.RandomState()
+        # Per-iteration RNG. Seeded from the effective seed (explicit
+        # constructor arg or MAK2_RANDOM_SEED env var) so the residual
+        # resampling sequence is reproducible across runs in tests.
+        # Production (no seed) gets fresh entropy as before.
+        rng = np.random.RandomState(self._effective_seed)
         
         for i in iterator:
             try:

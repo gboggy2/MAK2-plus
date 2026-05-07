@@ -37,6 +37,8 @@ from scipy.stats import linregress, poisson
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from config import RANDOM_SEED
+
 
 # ── Standard Curve ────────────────────────────────────────────────────────────
 
@@ -664,7 +666,13 @@ def build_limited_dilution_calibration(
     }
 
     # ── Bootstrap CI ──────────────────────────────────────────────────────
-    rng = np.random.default_rng(42)
+    # Seed precedence: MAK2_RANDOM_SEED env var when set, otherwise the
+    # historical hardcoded 42. Production users who want truly stochastic
+    # bootstrap CIs can set MAK2_RANDOM_SEED=None explicitly via shell —
+    # but the default keeps the limited-dilution CI reproducible across
+    # runs (which is the more sensible default for a confidence-interval
+    # estimator that's meant to characterize the data, not the RNG).
+    rng = np.random.default_rng(RANDOM_SEED if RANDOM_SEED is not None else 42)
     well_d0_array = np.zeros(N_total)
     # Fill in D0 values for positive wells (first N_pos entries)
     # and leave zeros for negative wells
