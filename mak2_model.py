@@ -1177,6 +1177,22 @@ def estimate_MAK2_params_from_exponential(
         log_D0 = np.log10(D0_upper)  # Use D0 from efficiency fit
         k_upper_D0 = 0.2 - 0.03 * log_D0
         k_upper = np.clip(k_upper_D0, 0.3, 2.0)  # Reasonable bounds
+
+        # Guard against inconsistent analytical bounds.  When k_estimate is
+        # unphysically large (e.g. dilution-series wells where the linear-fit
+        # k underestimate spikes to >0.6) AND D0_upper is large enough to clip
+        # k_upper to its 0.3 floor, k_lower can exceed k_upper and the
+        # downstream optimizer rejects the bounds.  In that case the
+        # analytical estimates disagree, so fall back to the wider
+        # non-analytical range — preserving the optimizer's ability to
+        # actually run instead of trusting a contradictory tight box.
+        if k_lower >= k_upper:
+            if verbose:
+                print(f"  ⚠ Analytical k bounds inconsistent "
+                      f"(k_lower={k_lower:.4f} ≥ k_upper={k_upper:.4f}); "
+                      f"falling back to (0.05, 1.2)")
+            k_lower = 0.05
+            k_upper = 1.2
     else:
         k_lower = 0.05
         k_upper = 1.2  # Fallback if k_estimate unavailable
