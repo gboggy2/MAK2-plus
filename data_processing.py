@@ -1,5 +1,17 @@
-"""
-Data processing utilities for qPCR data.
+"""Data processing utilities for qPCR plates.
+
+Two helpers consumed by the per-well pipeline (``run_batch.py`` and the
+Streamlit ``app.py``):
+
+- ``estimate_baseline_end`` — algorithmic discovery of where the
+  pre-amplification baseline ends, used as a fallback / sanity-check
+  against the instrument-reported ``Baseline End`` from metadata.
+- ``detect_no_signal_samples`` — plate-wide triage: identify wells
+  with no real amplification (NTC controls, failed reactions) so the
+  expensive MAK2 fit is not run on them.
+
+Neither function knows anything about the MAK2 model itself; both
+work directly on the raw fluorescence trace.
 """
 
 import pandas as pd
@@ -9,31 +21,47 @@ from typing import Tuple, Optional, Dict
 
 
 def estimate_baseline_end(cycles, fluorescence, first_cycle_idx=2, window_size=12, n_sd=5, max_iter=3):
-    """Estimate end of pre-amplification baseline region using forward projection.
+    """Locate the last cycle of the pre-amplification baseline.
 
-    Fits a line to an early window of cycles, then scans forward to find the first
-    cycle where fluorescence exceeds the projected baseline + n_sd * SD of residuals.
-    Iterates to refine the window boundary.
+    Iterative forward-projection: fit a line through the current
+    baseline window, then look for the first cycle whose fluorescence
+    exceeds the projected line by more than ``n_sd`` standard
+    deviations of the in-window residuals. That cycle becomes the new
+    baseline end; the procedure repeats up to ``max_iter`` times to
+    refine.
 
-    Parameters
-    ----------
-    cycles : np.ndarray
-        Cycle numbers (1-indexed)
-    fluorescence : np.ndarray
-        Raw fluorescence values
-    first_cycle_idx : int
-        Index (0-based) of the first cycle to include in baseline window
-    window_size : int
-        Initial number of cycles to use for baseline fit
-    n_sd : float
-        Number of baseline SDs above projection to call as end-of-baseline
-    max_iter : int
-        Maximum iterations
+    The 5σ default is deliberately conservative — qPCR baseline noise
+    is typically ~0.5-1% of plateau fluorescence, so 5σ catches the
+    onset of amplification reliably without false positives from
+    single-cycle noise spikes. Lower thresholds occasionally trigger
+    on early-cycle outliers.
 
-    Returns
-    -------
-    int
-        0-based index of the last baseline cycle (exclusive end, i.e. baseline is cycles[:result])
+    Used in two places: as the algorithmic baseline-end estimate that
+    the per-well pipeline compares against the instrument's metadata
+    value, and (in the Streamlit app) as the value reported in the
+    ``bl_end_est`` result column for diagnostic display.
+
+    Args:
+        cycles: Per-cycle cycle-number array.
+        fluorescence: Per-cycle fluorescence array (raw RFU or Rn).
+        first_cycle_idx: 0-based index of the first cycle to include
+            in the baseline window. Default 2 skips the first two
+            cycles, which on most instruments are unreliable
+            (initial dye equilibration).
+        window_size: Initial size of the baseline window in cycles.
+            Default 12 is large enough to give a meaningful linear
+            regression but small enough that it won't accidentally
+            contain amplification on early-amplifying wells.
+        n_sd: Threshold in baseline standard deviations.
+        max_iter: Maximum refinement passes. The procedure usually
+            converges in 1–2 iterations; the cap exists only to
+            guarantee termination.
+
+    Returns:
+        0-based index ``i`` such that ``cycles[:i]`` is the baseline
+        region (i.e. ``i`` is exclusive — it points at the first
+        amplifying cycle). Returns ``min(first_cycle_idx + window_size,
+        n - 1)`` if no clear amplification is detected.
     """
     n = len(cycles)
     bl_start = first_cycle_idx
@@ -42,9 +70,13 @@ def estimate_baseline_end(cycles, fluorescence, first_cycle_idx=2, window_size=1
         bl_c = cycles[bl_start:bl_end]
         bl_f = fluorescence[bl_start:bl_end]
         if len(bl_c) < 3:
+            # Window collapsed below the minimum needed for meaningful
+            # regression — bail out with whatever we have.
             break
         coeffs = np.polyfit(bl_c, bl_f, 1)
         residuals = bl_f - np.polyval(coeffs, bl_c)
+        # Floor the SD so a perfectly flat baseline (residuals ≈ 0)
+        # doesn't make the threshold infinitely sensitive.
         sd = max(float(np.std(residuals)), 1e-10)
         new_bl_end = bl_end
         for i in range(bl_end, n):
@@ -52,9 +84,11 @@ def estimate_baseline_end(cycles, fluorescence, first_cycle_idx=2, window_size=1
                 new_bl_end = i
                 break
         if new_bl_end == bl_end:
+            # Converged: no further extension reduces the window's
+            # purity claim.
             break
         bl_end = new_bl_end
-    return bl_end  # index of last baseline cycle (exclusive)
+    return bl_end
 
 
 def detect_no_signal_samples(
@@ -64,44 +98,66 @@ def detect_no_signal_samples(
     min_r2: float = 0.80,
     verbose: bool = True
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, dict], dict]:
-    """
-    Detect wells with no real qPCR signal using plate-wide fluorescence range.
+    """Triage a plate, separating wells that amplified from wells that didn't.
 
-    Strategy:
-    1. Calculate max fluorescence range across ALL samples on plate
-    2. Flag samples with range < X% of max range (e.g., 2%)
-    3. For borderline cases (2-5% of max), check exponential fit R²
+    Why this exists: the MAK2 optimizer is expensive (~0.3-1 s per
+    well, longer for difficult fits) and produces meaningless
+    parameters when run on a flat NTC trace or a failed well. A
+    plate-wide screen up front saves time and prevents the result
+    table from being polluted by garbage fits that pass R² gates by
+    accident.
 
-    This avoids fitting MAK2+ model to wells with no amplification signal
-    (e.g., NTC controls, failed reactions, or extremely low/no template).
+    Three-stage classification:
 
-    Parameters
-    ----------
-    cycles : np.ndarray
-        Cycle numbers (same for all samples)
-    all_samples : dict
-        Dictionary {sample_name: fluorescence_array}
-    min_range_pct : float, optional
-        Minimum fluorescence range as % of max plate range (default 2%)
-    min_r2 : float, optional
-        Minimum R² for exponential fit for borderline cases (default 0.80)
-    verbose : bool, optional
-        Print diagnostic information (default True)
+    1. **Range-only rejection.** Compute fluorescence range for every
+       well; reject wells whose range is below ``min_range_pct`` of
+       the plate's largest range. The relative comparison adapts
+       automatically to instrument scale (Rn, RFU, normalized) and
+       template concentration without per-plate tuning.
 
-    Returns
-    -------
-    valid_samples : dict
-        Samples with detectable signal {name: fluorescence_array}
-    no_signal_samples : dict
-        Samples without signal {name: diagnostic_info_dict}
-    plate_stats : dict
-        Plate-wide statistics for reference
+    2. **Exponential-fit screening.** For surviving wells, fit the
+       efficiency exponential (via ``estimate_D0_bounds``) and reject
+       wells whose R² falls below ``min_r2``, *unless* the
+       fluorescence range is >10% of the plate max — in that case the
+       well clearly amplified and a poor exponential fit just means
+       the curve is unusual (background-subtracted data, very late
+       amplifiers, or oddly shaped sigmoids). Substantial signal
+       overrides poor fit.
 
-    Examples
-    --------
-    >>> valid, no_signal, stats = detect_no_signal_samples(cycles, all_samples)
-    >>> print(f"Found {len(valid)} samples with signal")
-    >>> print(f"Flagged {len(no_signal)} samples with no signal")
+    3. **Linear-vs-exponential comparison.** A linearly drifting
+       baseline can produce a high range and a passable exponential
+       R² simply because any monotone curve is locally well
+       approximated by either model. Reject wells where the
+       exponential R² isn't at least 0.05 better than a pure linear
+       fit and the range is <10% of plate max — those wells are drift,
+       not amplification.
+
+    Args:
+        cycles: Per-cycle cycle-number array, shared across all wells.
+        all_samples: ``{sample_name: fluorescence_array}``. The
+            fluorescence arrays must all have the same length as
+            ``cycles``.
+        min_range_pct: Range threshold as percent of plate max for
+            stage 1 rejection. Default 2.0 catches obviously flat
+            wells without rejecting genuine low-template amplifiers.
+        min_r2: R² threshold for stage 2 rejection. Default 0.80 is
+            permissive — the goal here is to filter NTCs, not to
+            assess fit quality. The downstream MAK2 quality gates do
+            the real assessment.
+        verbose: Print per-well diagnostics. Set False for unit tests.
+
+    Returns:
+        ``(valid_samples, no_signal_samples, plate_stats)``:
+
+        - ``valid_samples``: ``{name: fluorescence_array}``, ready to
+          pass to the MAK2 optimizer.
+        - ``no_signal_samples``: ``{name: diag_dict}`` where the
+          diag_dict has a ``'reason'`` string and a ``'check_type'``
+          tag identifying which stage made the rejection
+          (``'range_only'``, ``'fit_failed'``, ``'poor_fit'``,
+          ``'linear_drift'``, ``'error'``).
+        - ``plate_stats``: dict of plate-wide aggregates used in the
+          UI summary (max range, thresholds, sample counts).
     """
     from mak2_model import estimate_D0_bounds
 
