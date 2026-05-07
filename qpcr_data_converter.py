@@ -1187,44 +1187,6 @@ class QPCRDataConverter:
             result[target] = (cycles, samples, metadata)
         return result
 
-    def filter_samples(
-        self,
-        samples: Dict[str, np.ndarray],
-        min_signal: float = 2.0,
-        max_initial: Optional[float] = None
-    ) -> Dict[str, np.ndarray]:
-        """
-        Filter samples based on quality criteria.
-        
-        Parameters
-        ----------
-        samples : Dict[str, np.ndarray]
-            Sample dictionary
-        min_signal : float
-            Minimum ratio of max/min fluorescence
-        max_initial : float, optional
-            Maximum allowed initial fluorescence (to filter pre-amplified samples)
-            
-        Returns
-        -------
-        Dict[str, np.ndarray]
-            Filtered samples
-        """
-        filtered = {}
-        for name, fluor in samples.items():
-            # Check signal range
-            if fluor.max() / fluor.min() < min_signal:
-                continue
-            
-            # Check initial fluorescence if specified
-            if max_initial is not None and fluor[0] > max_initial:
-                continue
-            
-            filtered[name] = fluor
-        
-        return filtered
-
-
 def load_abi_results_csv(file) -> Dict:
     """
     Parse an ABI results CSV (exported from QuantStudio / StepOnePlus results table).
@@ -1328,46 +1290,8 @@ def load_abi_results_csv(file) -> Dict:
     }
 
 
-def load_qpcr_file(
-    filepath: Union[str, Path, io.BytesIO],
-    add_offset: bool = True,
-    offset_value: float = 1e-5
-) -> Tuple[np.ndarray, Dict[str, np.ndarray], Dict]:
-    """
-    Convenience function to load qPCR data from any supported format.
-    
-    Parameters
-    ----------
-    filepath : str, Path, or BytesIO
-        Path to data file or uploaded file buffer
-    add_offset : bool
-        Add small offset to avoid zeros
-    offset_value : float
-        Offset value if add_offset=True
-        
-    Returns
-    -------
-    cycles : np.ndarray
-        Cycle numbers
-    samples : Dict[str, np.ndarray]
-        Sample fluorescence data
-    metadata : Dict
-        File and format information
-        
-    Example
-    -------
-    >>> cycles, samples, info = load_qpcr_file('data.xlsx')
-    >>> print(f"Loaded {info['n_samples']} samples, format: {info['format']}")
-    >>> print(f"Available samples: {info['sample_names']}")
-    """
-    converter = QPCRDataConverter(add_offset=add_offset, offset_value=offset_value)
-    return converter.load_from_file(filepath)
-
-
 if __name__ == "__main__":
     # Test with example data
-    import sys
-    
     print("qPCR Data Converter - Testing")
     print("=" * 50)
     
