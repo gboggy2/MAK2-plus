@@ -1,7 +1,19 @@
-"""
-Replicate and dilution series analysis for qPCR data.
+"""Replicate and dilution-series analysis for qPCR results.
 
-Provides statistical comparison between Ct and D0 quantification methods.
+Sits downstream of the per-well fit. After every well in a plate has
+its D0/Ct/R² recorded, the functions here aggregate technical
+replicates and compare the relative precision of D0-based vs.
+Ct-based quantification — the headline scientific argument for
+mechanistic modelling over Ct calibration is that D0 has lower CV%
+across replicates on the same template (because D0 doesn't depend on
+threshold-line position or per-well efficiency assumptions).
+
+Public API:
+    parse_sample_groups       — group sample names into replicates
+    calculate_replicate_stats — mean/SD/CV per group for D0 and Ct
+    analyze_dilution_series   — fit standard curves and compare R²
+    plot_dilution_series_comparison — side-by-side Plotly figure
+    compare_precision         — convert Ct CV% to concentration-equivalent CV%
 """
 
 import numpy as np
@@ -13,25 +25,32 @@ from plotly.subplots import make_subplots
 
 
 def parse_sample_groups(sample_names: List[str], pattern: Optional[str] = None) -> Dict[str, List[str]]:
-    """
-    Group samples into replicates based on naming pattern.
+    """Group sample names into replicates by splitting on a delimiter.
 
-    Supports common patterns:
-    - F1.1, F1.2, F1.3 → group "F1"
-    - Sample_A_rep1, Sample_A_rep2 → group "Sample_A"
-    - Custom pattern matching
+    qPCR sample naming follows a few well-known conventions; this
+    function recognises three of them. The grouping logic is purely
+    string-based — no metadata is consulted.
 
-    Parameters
-    ----------
-    sample_names : list of str
-        Sample names to group
-    pattern : str, optional
-        Pattern for grouping (e.g., "." splits on last dot)
+    Args:
+        sample_names: All sample names on the plate.
+        pattern: Which split convention to use:
 
-    Returns
-    -------
-    groups : dict
-        {group_name: [sample1, sample2, ...]}
+            - ``'dot'`` or ``None`` (default): split on the **last**
+              dot. ``"F1.1"`` → group ``"F1"``. Matches the qpcR R
+              package's Boggy/Rutledge dataset naming.
+            - ``'underscore'``: split on the last underscore.
+              ``"Sample_A_rep1"`` → group ``"Sample_A"``.
+            - ``'first_part'``: split on the **first** dot.
+              ``"X1.R1.1"`` → group ``"X1"``. Used for nested
+              replicate naming like the Rutledge dataset's
+              experimental × technical replicate layout.
+            - any other value: no grouping (each sample is its own
+              group).
+
+    Returns:
+        ``{group_name: [sample, sample, ...]}``. Singleton groups
+        are dropped — a group with only one sample isn't a replicate
+        group.
     """
     groups = {}
 
@@ -67,22 +86,30 @@ def calculate_replicate_stats(
     group_column: str = 'Group',
     metrics: List[str] = ['D0', 'Ct']
 ) -> pd.DataFrame:
-    """
-    Calculate statistics for replicate groups.
+    """Aggregate per-well results into per-group descriptive statistics.
 
-    Parameters
-    ----------
-    results_df : pd.DataFrame
-        Results with columns: Sample, Group, D0, Ct, etc.
-    group_column : str
-        Column name for grouping
-    metrics : list of str
-        Metrics to calculate stats for (e.g., ['D0', 'Ct'])
+    For each metric and each replicate group, computes mean, sample
+    standard deviation (``ddof=1``), CV% (= SD/mean × 100), and
+    min/max. NaN-only groups produce NaN stats rather than raising.
 
-    Returns
-    -------
-    stats_df : pd.DataFrame
-        Statistics by group: mean, SD, CV%, min, max
+    The returned CV% is the standard biological-precision metric for
+    a replicate set; it is what feeds into ``compare_precision`` for
+    the D0-vs-Ct precision argument.
+
+    Args:
+        results_df: One row per well, must include ``group_column``
+            and every name in ``metrics``.
+        group_column: DataFrame column to group by. Default
+            ``'Group'`` is the column produced by upstream code that
+            applied ``parse_sample_groups``.
+        metrics: Which numeric columns to summarise. Default
+            ``['D0', 'Ct']`` covers the two quantification methods
+            being compared.
+
+    Returns:
+        One row per group with columns ``Group``, ``N``, and
+        ``{metric}_Mean``, ``{metric}_SD``, ``{metric}_CV``,
+        ``{metric}_Min``, ``{metric}_Max`` for each metric.
     """
     stats = []
 
@@ -123,29 +150,51 @@ def analyze_dilution_series(
     dilution_factor: float = 2,
     group_column: str = 'Group'
 ) -> Dict:
-    """
-    Analyze dilution series to assess linearity and efficiency.
+    """Fit standard curves for both Ct and D0 across a dilution series.
 
-    Parameters
-    ----------
-    results_df : pd.DataFrame
-        Results with D0 and Ct values
-    dilution_factors : dict, optional
-        {group_name: dilution_factor} e.g., {'F1': 1, 'F2': 2, 'F3': 4}
-        If None, assumes groups are ordered with given dilution_factor
-    dilution_factor : float
-        Fold-dilution between consecutive groups (e.g., 2, 10, 5)
-        Only used if dilution_factors is None
-    group_column : str
-        Column name for grouping
+    Two regressions, both using log10(dilution) as the x-axis:
 
-    Returns
-    -------
-    analysis : dict
-        Contains:
-        - 'ct_analysis': {slope, intercept, r2, efficiency}
-        - 'd0_analysis': {slope, intercept, r2}
-        - 'comparison': Which method has better linearity
+    - **Ct curve.** Standard qPCR practice: ``Ct = -m * log10(quantity) + b``.
+      The slope ``m`` should be ``-3.32`` for 100% efficient
+      doubling (one cycle delay per 10× dilution × log2(10) ≈ 3.32
+      cycles). Reported efficiency = ``10^(-1/m) - 1``, expressed
+      as a percentage.
+    - **D0 curve.** Mechanistic equivalent: ``log10(D0) = m * log10(dilution) + b``.
+      For a perfect dilution series the slope should be ``-1``
+      (10× dilution → 10× lower D0).
+
+    The R² values from the two fits are then compared. The headline
+    finding from Boggy & Woolf (2010) is that the D0 curve is
+    typically more linear than the Ct curve across instruments,
+    chemistries, and template types — that's the empirical case for
+    mechanistic quantification.
+
+    Args:
+        results_df: Per-well results. Must contain a column matching
+            ``group_column`` and the columns ``D0`` and ``Ct``.
+        dilution_factors: Explicit ``{group: dilution}`` mapping.
+            Use this when group names don't reflect the dilution
+            order. If ``None``, dilutions are auto-generated as
+            ``dilution_factor**i`` for i = 0, 1, 2, …, matching the
+            iteration order of ``groupby``.
+        dilution_factor: Fold-dilution between consecutive groups
+            (e.g., 2 for serial 1:2, 10 for serial 1:10). Only
+            consulted when ``dilution_factors`` is None.
+        group_column: Column to group on. Default ``'Group'``.
+
+    Returns:
+        Either an error dict (if fewer than 3 dilution points are
+        available — a regression needs at least 3 points to be
+        meaningful) or:
+
+        - ``ct_analysis``: ``{slope, intercept, r2, efficiency,
+          expected_slope, slope_error}``
+        - ``d0_analysis``: ``{slope, intercept, r2, expected_slope,
+          slope_error}``
+        - ``comparison``: ``{ct_r2, d0_r2, better_linearity,
+          r2_difference}``
+        - ``data``: the per-group DataFrame used for the regression
+          (passed forward to the plotting function).
     """
     # Group by replicate group
     grouped = results_df.groupby(group_column).agg({
@@ -238,18 +287,24 @@ def analyze_dilution_series(
 
 
 def plot_dilution_series_comparison(analysis_results: Dict) -> go.Figure:
-    """
-    Create publication-quality plot comparing Ct vs D0 for dilution series.
+    """Render side-by-side standard-curve plots for Ct and D0.
 
-    Parameters
-    ----------
-    analysis_results : dict
-        Output from analyze_dilution_series()
+    Plotly figure with two subplots showing each method's regression
+    line and replicate error bars on a shared log10(dilution) x-axis.
+    Subplot titles include the R² and (for Ct) the back-calculated
+    efficiency.
 
-    Returns
-    -------
-    fig : plotly Figure
-        Comparison plot
+    Error bars are drawn manually as line traces rather than using
+    Plotly's ``error_y`` because the latter doesn't render reliably
+    in subplots across Plotly versions.
+
+    Args:
+        analysis_results: Output from ``analyze_dilution_series``.
+            Must include the ``data`` DataFrame and both
+            ``ct_analysis`` / ``d0_analysis`` regression dicts.
+
+    Returns:
+        Plotly Figure ready for ``st.plotly_chart`` display.
     """
     data = analysis_results['data']
     ct_analysis = analysis_results['ct_analysis']
@@ -430,24 +485,39 @@ def plot_dilution_series_comparison(analysis_results: Dict) -> go.Figure:
 
 
 def compare_precision(stats_df: pd.DataFrame, efficiency: float = 0.95) -> pd.DataFrame:
-    """
-    Compare precision (CV%) between Ct and D0 methods.
+    """Translate Ct CV% into a concentration-equivalent CV% for fair D0 comparison.
 
-    NOTE: Ct CV% is not directly comparable to D0 CV% because Ct is logarithmic.
-    We convert Ct variation to concentration variation using: Quantity ∝ E^Ct
-    where E is PCR efficiency (default 0.95 = 95%).
+    A direct Ct CV% vs D0 CV% comparison is misleading: Ct lives on
+    a log scale (each cycle delay halves quantity at 100% efficiency),
+    so a 1% CV in Ct corresponds to a much larger CV in template
+    quantity. To compare the precision of the two quantification
+    methods on the **same scale** (template concentration), we have
+    to push Ct's variability through the relationship
+    ``quantity ∝ E^Ct``.
 
-    Parameters
-    ----------
-    stats_df : pd.DataFrame
-        Output from calculate_replicate_stats()
-    efficiency : float
-        PCR efficiency (0-1), default 0.95. Can be estimated from dilution series.
+    First-order error propagation through ``q = E^Ct``:
 
-    Returns
-    -------
-    comparison_df : pd.DataFrame
-        Side-by-side comparison with winner column
+        d(ln q) / d(Ct) = ln(E)
+        ⇒ CV(q) ≈ |ln(E)| × SD(Ct)
+
+    Numerically, with E = 1 + efficiency (default efficiency = 0.95
+    → E = 1.95), ``ln(E) ≈ 0.668``, so a single-cycle Ct SD becomes
+    a ~67% concentration CV. That's the apples-to-apples number to
+    compare against D0's CV%.
+
+    Args:
+        stats_df: Output from ``calculate_replicate_stats``. Must
+            include ``Ct_SD``, ``Ct_CV``, ``D0_CV``.
+        efficiency: PCR efficiency in fractional units (0–1). Default
+            0.95 (= 95%) is the typical fitted efficiency from
+            standard-curve dilution series. Pass ``ct_analysis['efficiency']/100``
+            from a real fit when available.
+
+    Returns:
+        Side-by-side DataFrame with original columns plus
+        ``Ct_Conc_CV`` (the converted Ct CV%), ``Better_Precision``
+        (string ``'Ct'`` or ``'D0'``), and ``CV_Difference`` (a
+        positive value means D0 wins).
     """
     comparison = stats_df[['Group', 'N', 'Ct_Mean', 'Ct_SD', 'Ct_CV', 'D0_Mean', 'D0_CV']].copy()
 
