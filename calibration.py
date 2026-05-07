@@ -1,12 +1,31 @@
-"""
-Standard curve calibration and replicate visualization for qPCR data.
+"""Standard-curve and limited-dilution calibration for qPCR data.
 
-Provides:
-- Standard curve construction from known copy numbers vs D0
-- Conversion factor derivation with error estimates
-- Calibration application to convert D0 → copy numbers
-- Diagnostic log-log calibration plot
-- Replicate overlay visualization
+The MAK2 fit produces D0 in fluorescence units. To turn that into
+absolute copy numbers, a calibration step is needed. Two paths:
+
+1.  **Standard curve.** Wells with known copy numbers (``Task=STANDARD``
+    in the metadata) are fit to a power-law relationship
+    ``log10(copies) = slope * log10(D0) + intercept``. Power-law (not
+    a single conversion factor) is preferred because the MAK2 model
+    has a small residual D0 compression (~4%) at high copy number;
+    the power-law absorbs that bias. See ``build_standard_curve``.
+
+2.  **Limited dilution.** When standards aren't available but the
+    sample can be diluted to single-molecule level, well occupancies
+    follow a Poisson distribution. The fraction of negative wells
+    estimates the Poisson parameter λ, and the per-positive-well D0
+    estimates the single-copy D0. The product gives the conversion
+    factor without needing a standard curve at all. See
+    ``build_limited_dilution_calibration``.
+
+A traditional Ct-based standard curve is also implemented
+(``build_ct_standard_curve``) so the UI can display side-by-side
+D0-vs-Ct calibration quality and let the user judge which to trust
+on their data.
+
+Apply functions add ``Copies_D0`` and ``Copies_Ct`` columns to the
+batch results DataFrame; plotting functions render diagnostic Plotly
+figures for the UI.
 
 Author: Greg Boggy, PhD
 """
@@ -27,39 +46,44 @@ def build_standard_curve(
     sample_metadata: Dict[str, Dict],
     r2_min: float = 0.99
 ) -> Optional[Dict]:
-    """
-    Build standard curve calibration using power-law (log-log regression).
+    """Fit a power-law standard curve from STANDARD wells.
 
-    Primary conversion:
-        log10(copies) = slope * log10(D0) + intercept
+    The conversion is ``log10(copies) = slope * log10(D0) + intercept``.
+    Why power-law and not a single conversion factor (CF):
 
-    This corrects for the ~4% D0 compression intrinsic to the MAK2 model.
-    Testing showed the power-law outperforms both a single median CF and
-    D0-neighbor interpolation in cross-validation, and works well with as
-    few as 2-3 standard concentration levels.
+    - **MAK2 D0 compression bias.** The MAK2 fit has a small
+      systematic compression at high copy numbers (~4%); the
+      power-law slope ≠ 1 absorbs this bias rather than letting it
+      hit every quantification result.
+    - **Cross-validation results.** In leave-one-out testing on the
+      reference plate, the power-law beat both the median CF and
+      D0-neighbor interpolation across the dilution range.
+    - **Robustness with few standards.** Works reliably with as few
+      as 2–3 concentration levels.
 
-    A median CF is also computed for diagnostic/informational purposes.
+    A median CF is also returned for diagnostic display only — it's
+    not used for quantification.
 
-    Parameters
-    ----------
-    results_df : pd.DataFrame
-        Batch fitting results with 'Sample' and 'D0' columns.
-    sample_metadata : dict
-        Per-well metadata keyed by well position, e.g.:
-        {'D1': {'Task': 'STANDARD', 'Quantity': 3313000.0, ...}, ...}
-    r2_min : float
-        Minimum R² for warning (default 0.99).
+    Args:
+        results_df: Batch fitting results. Must include ``Sample``
+            and ``D0`` columns.
+        sample_metadata: Per-well metadata dict keyed by well
+            position. Wells with ``Task == 'STANDARD'`` and a
+            non-null ``Quantity`` become standard points. Falls back
+            to ``Task``/``Known_Copies`` columns in ``results_df``
+            for EDS Sample-Setup data.
+        r2_min: R² floor below which a warning string is appended to
+            the calibration result. Default 0.99.
 
-    Returns
-    -------
-    dict or None
-        Calibration dict with keys:
-            slope, intercept, r_squared, slope_stderr, intercept_stderr,
-            median_cf, cf_spread, per_level_cf,
-            replicate_variance, pooled_replicate_cv,
-            n_standards, n_concentrations,
-            per_point_data, warnings
-        Returns None if < 2 concentration levels or no valid standards.
+    Returns:
+        Calibration dict with regression parameters (``slope``,
+        ``intercept``, ``r_squared``, ``slope_stderr``,
+        ``intercept_stderr``), diagnostic CF stats (``median_cf``,
+        ``cf_spread``, ``per_level_cf``), replicate variance metrics
+        (``replicate_variance``, ``pooled_replicate_cv``), counts
+        (``n_standards``, ``n_concentrations``), per-point data for
+        plotting, and a ``warnings`` list. Returns ``None`` if fewer
+        than 2 concentration levels are usable.
     """
     # 1. Identify standard wells from metadata
     standard_wells = {}
@@ -216,21 +240,34 @@ def build_ct_standard_curve(
     results_df: pd.DataFrame,
     sample_metadata: Dict[str, Dict],
 ) -> Optional[Dict]:
-    """
-    Build traditional Ct-based standard curve: log10(copies) = slope * Ct + intercept.
+    """Fit a traditional Ct-based standard curve.
 
-    Parameters
-    ----------
-    results_df : pd.DataFrame
-        Batch fitting results with 'Sample' and 'Ct' columns.
-    sample_metadata : dict
-        Per-well metadata with Task='STANDARD' and Quantity.
+    The standard PCR practitioner's calibration:
+    ``log10(copies) = slope * Ct + intercept``. Slope of ``-3.32``
+    corresponds to 100% efficient doubling; ``efficiency = 10^(-1/slope) - 1``
+    is reported alongside the regression.
 
-    Returns
-    -------
-    dict or None
-        Calibration dict with slope, intercept, r_squared, efficiency,
-        per_point_data, replicate_variance, warnings, etc.
+    Used for **comparison only** — the actual D0→copies conversion
+    in the per-well pipeline goes through the power-law standard
+    curve from ``build_standard_curve``. This function exists so the
+    UI can show side-by-side Ct-vs-D0 standard-curve quality on the
+    same standards.
+
+    Prefers instrument-reported Ct values when present in the
+    metadata (more comparable to other software's results) but
+    falls back to the fitted Ct from the MAK2 result.
+
+    Args:
+        results_df: Batch fitting results. Must include ``Sample``
+            and ``Ct`` columns.
+        sample_metadata: Per-well metadata. Standard wells identified
+            by ``Task == 'STANDARD'`` with a ``Quantity``.
+
+    Returns:
+        Calibration dict with ``slope``, ``intercept``, ``r_squared``,
+        ``efficiency``, ``per_point_data``, ``replicate_variance``,
+        ``warnings``, and book-keeping for which Ct source was used.
+        Returns ``None`` if no Ct column or fewer than 2 standards.
     """
     if 'Ct' not in results_df.columns:
         return None
@@ -391,29 +428,28 @@ def apply_calibration(
     calibration: Optional[Dict] = None,
     manual_cf: Optional[float] = None
 ) -> pd.DataFrame:
-    """
-    Add 'Copies_D0' column to results_df using D0-based calibration.
+    """Add a ``Copies_D0`` column using either a fitted curve or a manual CF.
 
-    When a standard curve calibration dict is provided, uses the power-law:
-        copies = 10^(slope * log10(D0) + intercept)
+    Two modes:
 
-    When a manual_cf is provided, uses the simple linear relationship:
-        copies = manual_cf * D0
+    - **Power-law standard curve** (preferred): pass ``calibration``,
+      get ``copies = 10^(slope * log10(D0) + intercept)``.
+    - **Manual conversion factor** (fallback when no standards are
+      available): pass ``manual_cf``, get ``copies = manual_cf * D0``.
 
-    Parameters
-    ----------
-    results_df : pd.DataFrame
-        Batch fitting results with 'D0' column.
-    calibration : dict, optional
-        Output from build_standard_curve(). Uses power-law regression.
-    manual_cf : float, optional
-        Manual conversion factor: copies = manual_cf * D0.
-        Used only if calibration is None.
+    If both are ``None``, returns the input DataFrame unchanged
+    (the column stays missing rather than getting filled with NaN).
 
-    Returns
-    -------
-    pd.DataFrame
-        Copy of results_df with 'Copies_D0' column added.
+    Args:
+        results_df: Per-well results. Must include a ``D0`` column.
+        calibration: Output from ``build_standard_curve``. Wins over
+            ``manual_cf`` if both are passed.
+        manual_cf: Linear conversion factor. Only used when
+            ``calibration`` is ``None`` and ``manual_cf > 0``.
+
+    Returns:
+        Copy of ``results_df`` with a ``Copies_D0`` column. Wells
+        with missing or non-positive D0 get ``NaN``.
     """
     df = results_df.copy()
 
@@ -439,20 +475,15 @@ def apply_ct_calibration(
     results_df: pd.DataFrame,
     ct_calibration: Dict,
 ) -> pd.DataFrame:
-    """
-    Add 'Copies_Ct' column to results_df using Ct-based standard curve.
+    """Add a ``Copies_Ct`` column using a fitted Ct standard curve.
 
-    Parameters
-    ----------
-    results_df : pd.DataFrame
-        Batch fitting results with 'Ct' column.
-    ct_calibration : dict
-        Output from build_ct_standard_curve().
+    Args:
+        results_df: Per-well results, must include a ``Ct`` column.
+        ct_calibration: Output from ``build_ct_standard_curve``.
 
-    Returns
-    -------
-    pd.DataFrame
-        Copy of results_df with 'Copies_Ct' column added.
+    Returns:
+        Copy of ``results_df`` with ``Copies_Ct = 10^(slope*Ct + intercept)``.
+        Wells with missing or non-positive Ct get ``NaN``.
     """
     df = results_df.copy()
     slope = ct_calibration['slope']
@@ -477,36 +508,52 @@ def build_limited_dilution_calibration(
     n_bootstrap: int = 2000,
     confidence_level: float = 0.95,
 ) -> Optional[Dict]:
-    """
-    Build conversion factor from limited dilution (digital-style) assay.
+    """Derive a conversion factor from a Poisson-distributed dilution panel.
 
-    Dilute sample to single-molecule level so wells follow Poisson distribution.
-    Negative wells estimate lambda; positive-well D0 values give single-copy D0.
+    The limited-dilution (digital-PCR-style) calibration sidesteps
+    the need for known-quantity standards. The trick: dilute the
+    sample so that on average each well contains ≪1 template
+    molecule. The number of molecules per well then follows a
+    Poisson distribution with parameter λ, which can be estimated
+    from the fraction of *negative* (no-amplification) wells alone:
 
-    CF = (N_total * lambda) / sum(D0_positive)
+        P(0 molecules) = e^(-λ)  ⇒  λ = -ln(N_neg / N_total)
 
-    Parameters
-    ----------
-    results_df : pd.DataFrame
-        Batch fitting results with 'Sample' and 'D0' columns.
-    ld_wells : list of str
-        ALL well positions in the limited dilution panel (positive AND negative).
-    no_signal_wells : list of str, optional
-        Wells flagged as no-signal by detect_no_signal_samples(). If None,
-        negative wells are inferred from absence in results_df or D0 <= 0.
-    n_bootstrap : int
-        Number of bootstrap resamples for CI estimation.
-    confidence_level : float
-        Confidence level for bootstrap intervals.
+    The fitted D0 values from positive wells span 1, 2, 3, … copies
+    (because Poisson with λ < 1 produces a few wells with multiple
+    copies). Their sum, divided by the total expected molecule count
+    ``N_total * λ``, inverts to the conversion factor:
 
-    Returns
-    -------
-    dict or None
-        Calibration dict with keys: method, conversion_factor, cf_ci_lower,
-        cf_ci_upper, cf_se, lambda_hat, lambda_se, n_total, n_positive,
-        n_negative, fraction_negative, mean_d0_positive, d0_single_copy,
-        pos_d0_values, poisson_probs, warnings, etc.
-        Returns None if calibration is not possible.
+        CF = (N_total * λ) / Σ D0_positive
+
+    Bootstrap (default 2000 resamples) gives a confidence interval
+    on CF that accounts for both the Poisson sampling uncertainty
+    in λ and the D0 measurement spread.
+
+    Args:
+        results_df: Per-well batch results, must include ``Sample``
+            and ``D0`` columns.
+        ld_wells: Every well position in the limited-dilution panel
+            (positives and negatives together — the function works
+            out which is which from D0 and ``no_signal_wells``).
+        no_signal_wells: Wells flagged as no-signal by
+            ``detect_no_signal_samples``. If ``None``, the function
+            falls back to inferring negatives from
+            absent-in-results-df or D0 ≤ 0.
+        n_bootstrap: Resampling iterations for the CI. Default 2000;
+            CI half-width plateaus around 1000 in practice.
+        confidence_level: CI level (e.g. 0.95 → 95% CI). Used both
+            for the bootstrap percentile cuts and for displayed
+            labels.
+
+    Returns:
+        Calibration dict with method tag (``'limited_dilution'``),
+        ``conversion_factor`` plus CI bounds and SE, the Poisson
+        parameters (``lambda_hat``, ``lambda_se``), well counts,
+        per-positive-well D0 values, the expected/observed Poisson
+        distribution for the diagnostic plot, and a ``warnings``
+        list. Returns ``None`` if fewer than 3 LD wells are
+        available.
     """
     warnings = []
 
@@ -729,23 +776,24 @@ def build_limited_dilution_calibration(
 
 
 def plot_calibration(calibration: Dict, channel_label: str = "") -> go.Figure:
-    """
-    Create diagnostic log-log scatter plot of standard curve.
+    """Render the diagnostic log-log standard curve.
 
-    Shows individual standard wells, concentration means with error bars,
-    the power-law regression line (primary), and the CF=median line
-    (diagnostic, slope=1 on log-log).
+    Shows each standard well (colored by concentration level), the
+    per-level mean with error bars, the fitted power-law regression
+    line (the actual conversion path), and a diagnostic
+    ``CF = median`` line (slope-1 in log-log space). Divergence
+    between the two lines visualises the MAK2 D0 compression bias —
+    if they agree, the power-law slope is close to 1 and the simple
+    median CF would have been fine; if they diverge, the power-law
+    is doing real work.
 
-    Parameters
-    ----------
-    calibration : dict
-        Output from build_standard_curve().
-    channel_label : str
-        Optional channel/target label to include in the title (e.g. " (FAM)").
+    Args:
+        calibration: Output from ``build_standard_curve``.
+        channel_label: Optional label appended to the title (e.g.
+            ``" (FAM)"`` for multi-channel plates).
 
-    Returns
-    -------
-    plotly.graph_objects.Figure
+    Returns:
+        Plotly Figure for ``st.plotly_chart``.
     """
     points_df = calibration['per_point_data']
     median_cf = calibration['median_cf']
@@ -878,20 +926,23 @@ def plot_calibration(calibration: Dict, channel_label: str = "") -> go.Figure:
 
 
 def plot_ct_calibration(ct_calibration: Dict, channel_label: str = "") -> go.Figure:
-    """
-    Create Ct standard curve plot: Ct (x) vs log10(Known Copies) (y).
+    """Render the Ct standard curve for side-by-side comparison with D0.
 
-    Shows individual standard wells, concentration means with Ct error bars,
-    regression line, and annotation with slope, R², efficiency.
+    Plots Ct on the x-axis and ``log10(Known_Copies)`` on the y-axis
+    (the convention used by most qPCR software). Includes the
+    regression line and an annotation with slope, R², and
+    back-calculated PCR efficiency.
 
-    Parameters
-    ----------
-    ct_calibration : dict
-        Output from build_ct_standard_curve().
+    Together with ``plot_calibration``, lets the user compare the
+    linearity and replicate spread of D0-vs-Ct quantification on
+    the same standards.
 
-    Returns
-    -------
-    plotly.graph_objects.Figure
+    Args:
+        ct_calibration: Output from ``build_ct_standard_curve``.
+        channel_label: Optional label for the title.
+
+    Returns:
+        Plotly Figure.
     """
     points_df = ct_calibration['per_point_data']
     slope = ct_calibration['slope']
@@ -1010,21 +1061,21 @@ def plot_ct_calibration(ct_calibration: Dict, channel_label: str = "") -> go.Fig
 
 
 def plot_limited_dilution_diagnostics(ld_calibration: Dict) -> go.Figure:
-    """
-    Create diagnostic plots for limited dilution calibration.
+    """Render the two-panel diagnostic for the limited-dilution calibration.
 
-    Two subplots side by side:
-    - Left: D0 histogram of positive wells with expected copy-number marks
-    - Right: Poisson expected vs observed copy-number distribution
+    - **Left panel**: histogram of positive-well D0 values with
+      vertical reference lines at 1×, 2×, 3× the inferred
+      single-copy D0. If the Poisson assumption holds, the histogram
+      should cluster around those marks.
+    - **Right panel**: Poisson expected counts vs. observed counts
+      for the 0/1/2/3+-copy occupancy classes. Visual goodness-of-fit
+      check on the Poisson assumption itself.
 
-    Parameters
-    ----------
-    ld_calibration : dict
-        Output from build_limited_dilution_calibration().
+    Args:
+        ld_calibration: Output from ``build_limited_dilution_calibration``.
 
-    Returns
-    -------
-    plotly.graph_objects.Figure
+    Returns:
+        Two-subplot Plotly Figure.
     """
     fig = make_subplots(
         rows=1, cols=2,
@@ -1173,28 +1224,25 @@ def plot_replicate_overlay(
     group_wells: List[str],
     group_name: str,
 ) -> go.Figure:
-    """
-    Overlay raw fluorescence + MAK2 fits for all wells in a replicate group.
+    """Overlay raw curves + fitted MAK2 curves for one replicate group.
 
-    Each replicate gets a distinct color. The legend shows well position
-    and key parameters (D0, k, R²).
+    Each replicate well gets its own color so the user can spot
+    outlier replicates by eye (e.g., one well's curve obviously
+    shifted from the others). The legend includes per-well D0, k,
+    R² so the visual outlier check is grounded in the actual fit
+    parameters.
 
-    Parameters
-    ----------
-    cycles : np.ndarray
-        Cycle numbers used for fitting.
-    all_samples : dict
-        Full sample dict {well: fluorescence_array}.
-    results_list : list of dict
-        Full results list from batch fitting (includes 'fluor_data').
-    group_wells : list of str
-        Well positions belonging to this replicate group.
-    group_name : str
-        Display name for the group.
+    Args:
+        cycles: Cycle-number array shared across the wells.
+        all_samples: Full plate ``{well: fluorescence_array}``.
+        results_list: Full per-well results list (must include the
+            ``fluor_data`` field so this function can plot the
+            actual fitted curves rather than re-simulate).
+        group_wells: Wells belonging to this replicate group.
+        group_name: Display name shown in the title.
 
-    Returns
-    -------
-    plotly.graph_objects.Figure
+    Returns:
+        Plotly Figure ready for display.
     """
     from mak2_model import MAK2Model
 
@@ -1302,22 +1350,23 @@ def calculate_replicate_param_summary(
     group_wells: List[str],
     param_cols: Optional[List[str]] = None
 ) -> pd.DataFrame:
-    """
-    Calculate mean +/- SE for parameters across replicates in a group.
+    """Mean ± standard error of MAK2 parameters across one replicate group.
 
-    Parameters
-    ----------
-    results_df : pd.DataFrame
-        Batch fitting results.
-    group_wells : list of str
-        Well positions in this replicate group.
-    param_cols : list of str, optional
-        Parameter columns to summarize. Default: D0, k, P0, Ct, plus Copies if present.
+    Companion to ``plot_replicate_overlay``: same group of wells,
+    quantitative summary instead of curves. SE is sample SD divided
+    by sqrt(N), the appropriate uncertainty on the *mean* (not on
+    a single replicate, which would be SD).
 
-    Returns
-    -------
-    pd.DataFrame
-        Summary with index = parameter names, columns = Mean, SE, N.
+    Args:
+        results_df: Per-well batch results DataFrame.
+        group_wells: Wells in this replicate group.
+        param_cols: Columns to summarise. Default
+            ``['D0', 'k', 'P0', 'Ct']`` plus ``Copies_D0`` /
+            ``Copies_Ct`` when present in the DataFrame.
+
+    Returns:
+        DataFrame indexed by parameter name with columns ``Mean``,
+        ``SE``, and ``N``.
     """
     group_results = results_df[results_df['Sample'].isin(group_wells)]
 
