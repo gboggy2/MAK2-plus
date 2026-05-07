@@ -1,10 +1,35 @@
 #!/Users/boggy/anaconda3/envs/qpcr_mak2/bin/python
-"""
-MAK2+ Offline Batch Fitting Script
-===================================
-Processes multiple qPCR plates overnight and produces Excel result files
-that can be uploaded to the MAK2+ app via "Load Previous Results" for
-visualization.
+"""Offline batch-fitting driver: process every plate in a folder, write Excel.
+
+Why this script exists alongside ``app.py``:
+
+The Streamlit app does the same per-well fitting work, but it does
+it interactively, one plate at a time, in a process that needs to
+stay attached to the user's browser. This script is the headless
+batch equivalent — point it at a folder of plate files and it
+processes each one to completion overnight, producing
+``Results/<PlateX>_MAK2Plus_Results.xlsx`` that can later be
+re-loaded in the app for visualization via "Load Previous Results".
+
+The per-well fitting logic was duplicated here from ``app.py`` (see
+the Phase-1 unification task in CLAUDE.md). Keeping them in sync is
+manual; the long-term plan is to extract a shared ``fit_well()``
+function during the Next.js + FastAPI port.
+
+Pipeline overview (orchestrated by ``process_plate`` per plate):
+
+  1. ``load_plate_data`` — parse multicomponent + metadata CSVs.
+  2. ``detect_no_signal_samples`` — triage NTCs and failed wells.
+  3. ``run_pass1`` — fit every survivor with the MAK2 optimizer.
+  4. ``run_pass2`` — channel-aware retry pass for borderline fits
+     (using channel-median k/P0 as priors).
+  5. ``run_quality_gates`` — mark final PASS / FAIL / INDETERMINATE
+     status per well.
+  6. ``build_replicate_groups`` — replicate stats from the metadata.
+  7. ``build_standard_curve`` / ``build_ct_standard_curve`` — fit
+     calibration curves from STANDARD wells.
+  8. ``apply_calibration`` / ``apply_ct_calibration`` — D0→Copies.
+  9. ``build_excel`` — write the multi-sheet result file.
 
 Usage:
     caffeinate -s python run_batch.py
@@ -60,19 +85,42 @@ REPLICATE_GROUPING = "sample_name"
 # ── Helper functions ───────────���──────────────────────────────────────────────
 
 def _ch(name):
-    """Return the channel prefix of a sample name."""
+    """Extract the channel prefix from a composite sample name.
+
+    Sample names from multi-channel ABI plates are ``"{channel}::{well}"``
+    or ``"{channel}_{well}"``; this returns the channel part. Falls
+    back to ``'default'`` for plain well names.
+
+    NOTE: an identical helper is defined in ``app.py``. The
+    duplication is tracked as a Phase-1 unification task — see
+    CLAUDE.md.
+    """
     if '::' in name: return name.split('::')[0]
     if '_'  in name: return name.split('_')[0]
     return 'default'
 
 def _get_well_pos(name):
-    """Extract bare well position from a sample name."""
+    """Extract the bare well position (``A1``, ``H12`` …) from a composite sample name.
+
+    Inverse of ``_ch``: returns the well part of
+    ``"{channel}::{well}"`` or ``"{channel}_{well}"``. Falls back to
+    the input itself for plain names.
+
+    Also duplicated in ``app.py`` — see CLAUDE.md Phase-1
+    unification.
+    """
     if '::' in name: return name.split('::')[1] if len(name.split('::')) > 1 else name
     if '_'  in name: return '_'.join(name.split('_')[1:]) if len(name.split('_')) > 1 else name
     return name
 
 def pre_estimate_background(cycles, fluor, bl_start_idx, bl_end_idx):
-    """Linear regression on baseline region for background estimation."""
+    """Linear regression over a baseline window — local copy of the canonical helper.
+
+    This is functionally a duplicate of
+    ``mak2_model.pre_estimate_background``. The local copy was added
+    before the modules were aligned; keeping both paths in sync is
+    a Phase-1 task. See CLAUDE.md.
+    """
     bg_c = cycles[bl_start_idx:bl_end_idx + 1]
     bg_f = fluor[bl_start_idx:bl_end_idx + 1]
     if len(bg_c) >= 2:
@@ -82,7 +130,30 @@ def pre_estimate_background(cycles, fluor, bl_start_idx, bl_end_idx):
 
 
 def smart_start(fluor_data, cycles, floor_idx, cycles_before_max):
-    """Right-to-left inflection search — identical to app.py logic."""
+    """Locate the qPCR sigmoid inflection by scanning the smoothed gradient right-to-left.
+
+    Why right-to-left: the inflection (max-slope cycle) of a real
+    qPCR sigmoid is a *unique* peak in the smoothed gradient, but
+    early-cycle baseline noise can produce spurious local maxima
+    that an argmax over the full array would prefer. Scanning from
+    the right finds the rightmost sustained gradient peak — the
+    real inflection — and stops there.
+
+    The peak is recognised when the running max has dropped to <50%
+    of its peak value (and the peak itself exceeds 5% of the
+    signal's gradient range, filtering out flat noise). If no peak
+    is found, falls back to argmax over the whole gradient.
+
+    The fit-window start is then set to ``cycles_before_max`` cycles
+    upstream of the inflection (or the floor, whichever is larger).
+
+    Also duplicated in ``app.py`` per the unification task in
+    CLAUDE.md.
+
+    Returns:
+        ``(fit_start_idx, max_slope_idx)`` 0-based indices into
+        ``cycles`` / ``fluor_data``.
+    """
     full_seg = fluor_data[floor_idx:]
     if len(full_seg) >= 5:
         raw_grad = np.gradient(full_seg)
@@ -112,7 +183,28 @@ def smart_start(fluor_data, cycles, floor_idx, cycles_before_max):
 
 def adaptive_window_extension(fluor_data, cycles, fit_start_idx, max_slope_idx,
                               floor_idx, cycles_before_max, bg_slope, bg_int):
-    """Extend fit window backward until ≥3 baseline cycles included."""
+    """Walk the fit window's start cycle back until ≥3 baseline cycles are inside it.
+
+    Why this matters: the optimizer needs *some* baseline cycles
+    inside the fit window to constrain the background parameters
+    against — if the window starts mid-amplification, the
+    optimizer can't distinguish baseline drift from real signal and
+    background ends up absorbing what should be D0 information.
+    The MAK2 model fits cleanly when at least 3 of the early
+    in-window cycles are below the projected background (within
+    3σ noise).
+
+    The procedure: extend ``fit_start_idx`` backward by 2 cycles at
+    a time, recount baseline-region cycles, stop when ≥3 are found
+    or the floor is reached. After the extension, refit the local
+    background regression on the wider window so the bounds carried
+    forward reflect the new starting point.
+
+    A short-circuit: if the data immediately before
+    ``fit_start_idx`` is essentially zero (background-subtracted
+    plates), there's nothing to detect and the count is set to 3
+    so no extension happens.
+    """
     bg_pre_start = max(floor_idx, fit_start_idx - 8)
     bg_f = fluor_data[bg_pre_start:fit_start_idx]
     bl_noise = float(np.std(bg_f)) if len(bg_f) >= 2 else 0.0
@@ -157,7 +249,36 @@ def adaptive_window_extension(fluor_data, cycles, fit_start_idx, max_slope_idx,
 def compute_ct(optimizer_obj, cycles, fluor_data, sample_name, sample_metadata,
                rox_by_well, channel_thresholds, global_threshold,
                channel_baseline_means, global_baseline_mean):
-    """Compute Ct value — same logic as app.py Pass 1."""
+    """Compute the Ct value for one well via the MAK2 optimizer's threshold method.
+
+    Wraps ``MAK2Optimizer.calculate_ct`` with the right per-well
+    inputs:
+
+    - **Threshold**: per-channel from ``channel_thresholds`` (or the
+      global fallback) — matches the instrument's Ct so the MAK2
+      Ct is comparable.
+    - **Baseline cycles**: extracted from the well's metadata
+      (``Baseline Start`` / ``Baseline End``) so the baseline
+      subtraction matches what the instrument did.
+    - **ROX normalisation**: when the well has a ROX trace,
+      fluorescence is divided by ROX before threshold-crossing
+      detection; this corrects per-well volume variation.
+    - **Instrument-Undetermined respect**: if the metadata says the
+      instrument couldn't determine a Ct (NaN ``Ct_instrument``),
+      we return NaN too rather than reporting a fitted Ct that the
+      user might over-trust.
+
+    The ``optimizer_obj.cycles_fit`` / ``fluorescence_fit`` fields
+    are temporarily swapped to the full curve here (the optimizer
+    normally holds the truncated fit window) so the Ct calculation
+    sees the entire trace; they're restored before return.
+
+    Returns:
+        ``(ct_value, ct_baseline_val, ct_bl_slope, ct_bl_intercept,
+        ct_rox_mean)``. Any failure path returns NaN ``ct_value``
+        and zeroed baseline params rather than raising — failed Ct
+        is a per-well outcome, not a pipeline error.
+    """
     ct_value = np.nan
     ct_baseline_val = 0.0
     ct_bl_slope = 0.0
@@ -226,8 +347,31 @@ def compute_ct(optimizer_obj, cycles, fluor_data, sample_name, sample_metadata,
 
 
 def load_plate_data(mc_file, meta_file):
-    """Load multicomponent CSV and metadata CSV for a plate.
-    Returns: (cycles, all_samples, channels, rox_by_well, sample_metadata, abi_results_meta)
+    """Load and assemble both halves of an ABI plate's data files.
+
+    A QuantStudio plate splits its export into two CSVs that have to
+    be loaded together:
+
+    - **Multicomponent CSV** (``mc_file``): per-channel fluorescence
+      and the ROX passive reference for normalisation.
+    - **Metadata CSV** (``meta_file``): per-well sample names, task
+      types (UNKNOWN / STANDARD / NTC), known quantities for
+      standards, baseline-window cycles, and instrument-reported
+      Ct values.
+
+    This function loads both, fans out the multicomponent data into
+    a flat ``{f"{channel}_{well}": fluor_array}`` dict (the format
+    the rest of the pipeline expects), and pulls the ROX trace into
+    a separate ``{well: rox_array}`` dict.
+
+    Args:
+        mc_file: Path to the Multicomponent CSV.
+        meta_file: Path to the Sample Setup / Results CSV.
+
+    Returns:
+        Six-tuple:
+            ``(cycles, all_samples, channels, rox_by_well,
+              sample_metadata, abi_results_meta)``.
     """
     converter = QPCRDataConverter()
 
@@ -266,7 +410,62 @@ def load_plate_data(mc_file, meta_file):
 def run_pass1(all_samples_to_fit, cycles, sample_metadata, rox_by_well,
               channel_thresholds, global_threshold, channel_baseline_means,
               global_baseline_mean):
-    """Pass 1: Fit all samples — identical to app.py logic."""
+    """First-pass MAK2 fitting over every survivor of the no-signal triage.
+
+    For each well:
+
+      1. **No-amplification pre-check.** A second, per-well-local
+         test (the plate-wide one ran in
+         ``detect_no_signal_samples``); compares signal range to
+         baseline SD with a 5σ threshold and a tail-vs-baseline
+         comparison. Failures are recorded with ``Tier=None`` and
+         ``error='No amplification detected'`` and skipped without
+         calling the optimizer.
+      2. **Background pre-estimation** from the metadata baseline
+         window when available (``Baseline Start`` / ``Baseline End``).
+      3. **Smart-start inflection search** (``smart_start``) +
+         **adaptive window extension** (``adaptive_window_extension``)
+         to determine the fit window's start cycle.
+      4. **Safety-net check**: if the truncated fit window's
+         fluorescence range is < 70% of the full trace range, the
+         smart-start probably missed the sigmoid (e.g. very late
+         amplifier) — fall back to the floor cycle and recompute
+         background.
+      5. **Build per-well bounds** from the local background
+         regression (slope and intercept ± data-driven margins).
+      6. **Call the MAK2 optimizer** with fixed-background mode
+         seeded by the per-well background estimate.
+      7. **Compute Ct** via ``compute_ct``.
+      8. **Classify the tier** (T1-Full / T1-Fixed / T2-LHS / T3-DE)
+         based on which optimizer escalation tier produced the fit.
+
+    Per-well failures are caught and recorded with
+    ``Success='✗ Error: ...'`` rather than propagating, so one bad
+    well doesn't kill the batch.
+
+    The function preserves the per-well code path of ``app.py``'s
+    batch mode line-for-line (see CLAUDE.md Phase-1 unification).
+
+    Args:
+        all_samples_to_fit: ``{sample_name: fluorescence_array}``
+            for every survivor of the triage.
+        cycles: Cycle-number array shared across all wells.
+        sample_metadata: Per-well metadata dict from the Results
+            CSV (keyed by composite ``"{channel}_{well}"`` name).
+        rox_by_well: ``{well_pos: rox_array}`` for ROX-aware Ct.
+        channel_thresholds: Per-channel Ct thresholds from the
+            instrument metadata.
+        global_threshold: Plate-wide fallback threshold.
+        channel_baseline_means: Per-channel baseline-fluorescence
+            mean (currently unused in fitting; passed for
+            future per-channel features).
+        global_baseline_mean: Plate-wide fallback baseline mean.
+
+    Returns:
+        List of per-well result dicts (every well in
+        ``all_samples_to_fit`` produces exactly one entry, including
+        failures).
+    """
     results_list = []
     total = len(all_samples_to_fit)
 
@@ -523,7 +722,35 @@ def run_pass1(all_samples_to_fit, cycles, sample_metadata, rox_by_well,
 def run_pass2(results_list, cycles, sample_metadata, rox_by_well,
               channel_thresholds, global_threshold, channel_baseline_means,
               global_baseline_mean):
-    """Pass 2: Channel-aware retry — identical to app.py logic."""
+    """Channel-aware retry pass for borderline-quality fits.
+
+    Why a second pass exists: Pass 1 fits each well in isolation
+    against generic data-driven bounds. After Pass 1 finishes, we
+    know the channel-typical k and P0 distributions across the
+    whole plate. Wells with poor R² (or otherwise suspect fits) are
+    re-fit using the channel medians as priors — this rescues wells
+    where Pass 1 landed in a bad local minimum without distorting
+    fits that were already good.
+
+    The retry replicates Pass 1's preprocessing (smart-start,
+    adaptive window, background re-estimation) but uses tighter
+    bounds anchored at the channel-typical values. Whichever fit
+    has lower SSR (Pass 1 vs Pass 2) wins.
+
+    Like ``run_pass1``, mirrors ``app.py`` line-for-line — see
+    CLAUDE.md Phase-1 unification for the eventual extraction.
+
+    Args:
+        results_list: Output of ``run_pass1``. Mutated in place
+            (the entries are replaced with retry results when the
+            retry wins).
+        cycles, sample_metadata, rox_by_well, channel_thresholds,
+            global_threshold, channel_baseline_means, global_baseline_mean:
+            Same meaning as in ``run_pass1``.
+
+    Returns:
+        The (mutated) ``results_list``.
+    """
     last_cyc = float(cycles[-1])
 
     # Step 1: collect per-channel stats
@@ -1002,7 +1229,44 @@ def run_pass2(results_list, cycles, sample_metadata, rox_by_well,
 
 
 def run_quality_gates(results_list, cycles):
-    """Pass 3: Quality gates — identical to app.py logic."""
+    """Apply the per-well quality gates and assign final ``Status``.
+
+    After Pass 1+2 leave each well with its best available fit, this
+    pass evaluates a series of quality gates and stamps each well
+    with one of:
+
+    - ``'PASS'``: cleared every applicable gate.
+    - ``'FAIL'``: hit a hard rejection criterion (no amplification,
+      a tier escalation that didn't recover, an obviously bad fit
+      in some specific way).
+    - ``'INDETERMINATE'``: the fit didn't pass cleanly but didn't
+      fail outright — the result is reported but with reduced
+      confidence and the failing gate reason in the Status.
+
+    Gates evaluated (full list lives in the optimizer; this function
+    just drives them and writes the verdict):
+
+      - **Gate 0** (R² floor): R² ≥ 0.999 (relaxed for late
+        amplifiers).
+      - **Gate 2** (fit-window width): at least 12 cycles in the
+        fitted window.
+      - **Gate 2b** (sigmoid vs linear): MAK2 R² must be appreciably
+        better than a linear fit on the same window — protects
+        against the "any monotone curve fits both models" trap.
+      - **Gate 3** (sigmoid shape): the second derivative of the
+        fitted curve must change sign in the window — confirms the
+        S-shape.
+      - **Late-amplifier relaxation**: when the fit window's last
+        cycle is the last data cycle, gate thresholds relax.
+
+    Args:
+        results_list: Output of ``run_pass2``. Mutated in place.
+        cycles: Cycle-number array shared across wells.
+
+    Returns:
+        The mutated ``results_list``, with ``Status`` and
+        ``status_detail`` populated.
+    """
     for pf_idx, pf_r in enumerate(results_list):
         if pf_r.get('error') is not None:
             continue
@@ -1136,7 +1400,27 @@ def run_quality_gates(results_list, cycles):
 
 
 def build_replicate_groups(results_list, sample_metadata, channels):
-    """Build replicate groups from Sample Name in metadata."""
+    """Aggregate per-well results into per-(channel, sample-name) replicate stats.
+
+    Replicates are identified by matching ``Sample Name`` in the
+    metadata: wells that share a name within the same channel are
+    treated as technical replicates. For each replicate group, the
+    function reports mean, SD, and CV% for D0 and Ct.
+
+    The replicate-CV% number is what the UI surfaces as the headline
+    precision metric — it's the empirical answer to "how
+    reproducible is this assay?" for the user's particular plate.
+
+    Args:
+        results_list: Per-well results (post-quality-gates).
+        sample_metadata: Per-well metadata dict (keyed by composite
+            ``"{channel}_{well}"`` name); ``Sample Name`` is the
+            grouping key.
+        channels: List of channels present on the plate.
+
+    Returns:
+        DataFrame with one row per (channel, sample-name) group.
+    """
     # Map sample keys to their sample names
     results_df = pd.DataFrame([{k: v for k, v in r.items() if k != 'fluor_data'} for r in results_list])
     if results_df.empty:
@@ -1184,7 +1468,12 @@ def build_replicate_groups(results_list, sample_metadata, channels):
 
 def _make_scatter_series(ws, x_col, y_col, data_rows, title="Data",
                          color="4472C4"):
-    """Create a scatter series with circle markers, no connecting line."""
+    """Build an openpyxl scatter ``Series`` with marker styling.
+
+    Markers only (no connecting line) — appropriate for standard-curve
+    point plots where a separate trendline carries the regression.
+    Also defined identically in ``app.py``; see CLAUDE.md.
+    """
     from openpyxl.chart import Reference, Series as XlSeries
     from openpyxl.chart.marker import Marker
 
@@ -1198,7 +1487,7 @@ def _make_scatter_series(ws, x_col, y_col, data_rows, title="Data",
 
 
 def _style_axis(axis, title, num_fmt="General"):
-    """Configure an axis with visible labels and no gridlines."""
+    """Apply title, number format, and tick/gridline styling to an openpyxl chart axis."""
     axis.title = title
     axis.delete = False
     axis.numFmt = num_fmt
@@ -1207,7 +1496,12 @@ def _style_axis(axis, title, num_fmt="General"):
 
 
 def _add_std_curve_d0_chart(ws, df, data_rows):
-    """Add D0 standard curve scatter chart with trendline to worksheet."""
+    """Embed the D0 power-law standard-curve scatter+trendline into ``ws``.
+
+    Companion to ``_add_std_curve_ct_chart``; the two charts let the
+    user compare D0-vs-Ct calibration linearity directly inside the
+    Excel output without re-running the app.
+    """
     from openpyxl.chart import ScatterChart
     from openpyxl.chart.trendline import Trendline
     from openpyxl.utils import get_column_letter
@@ -1234,7 +1528,11 @@ def _add_std_curve_d0_chart(ws, df, data_rows):
 
 
 def _add_std_curve_ct_chart(ws, df, data_rows):
-    """Add Ct standard curve scatter chart with trendline to worksheet."""
+    """Embed the Ct standard-curve scatter+trendline into ``ws``.
+
+    Ct convention: x = Ct, y = log10(Known Copies). Companion to
+    ``_add_std_curve_d0_chart``.
+    """
     from openpyxl.chart import ScatterChart
     from openpyxl.chart.trendline import Trendline
     from openpyxl.utils import get_column_letter
@@ -1264,7 +1562,28 @@ def build_excel(results_list, cycles, all_samples, no_signal_samples,
                 no_signal_fluor, sample_metadata, channels, batch_settings,
                 replicate_stats_df=None, precision_comparison_df=None,
                 std_curve_sheets=None, chart_sheets=None):
-    """Build the Excel file matching the app's format exactly.
+    """Write the multi-sheet Excel result file for one plate.
+
+    The output is intentionally byte-comparable to what the
+    Streamlit app produces — once written, the file can be loaded
+    back into the app via "Load Previous Results" for visualization.
+    Keeping the format identical between offline and interactive
+    paths is a deliberate design choice; see CLAUDE.md.
+
+    Sheets written (in order):
+
+    - ``Batch Results``: per-well fit parameters + status (the
+      authoritative results table).
+    - ``No Signal Samples``: wells flagged before fitting + reason.
+    - ``Replicate Statistics``: per-(channel, sample-name)
+      replicate aggregates.
+    - ``Standard Curve``: per-channel D0 calibration regressions.
+    - ``Ct Standard Curve``: per-channel Ct calibration regressions
+      (for comparison only).
+    - ``Settings``: the configuration values used for this run
+      (FIRST_FIT_CYCLE, CYCLES_BEFORE_MAX, …).
+    - ``Metadata``: plate-level info (file paths, channels, well count).
+
 
     chart_sheets: dict of {sheet_name: {data: DataFrame, summary: dict,
                   chart_type: str}} for tabs with native Excel charts.
@@ -1411,7 +1730,32 @@ def build_excel(results_list, cycles, all_samples, no_signal_samples,
 
 
 def process_plate(mc_file, meta_file, plate_name):
-    """Process a single plate end-to-end."""
+    """Run the full per-plate pipeline and write the Excel result file.
+
+    The end-to-end orchestration:
+
+    ``load_plate_data`` → ``detect_no_signal_samples`` → ``run_pass1``
+    → ``run_pass2`` → ``run_quality_gates`` → ``build_replicate_groups``
+    → ``compare_precision`` → ``build_standard_curve`` (per channel)
+    → ``apply_calibration`` (per channel) → ``build_ct_standard_curve``
+    (per channel) → ``apply_ct_calibration`` (per channel) →
+    ``build_excel``.
+
+    Per-step timing is printed so the user can see which step
+    dominates wall-clock for their plate. All exceptions in any
+    step bubble up and terminate this plate; the top-level
+    ``__main__`` driver catches them so a single bad plate doesn't
+    abort the whole batch.
+
+    Args:
+        mc_file: Path to the Multicomponent CSV.
+        meta_file: Path to the Sample Setup / Results CSV.
+        plate_name: Display name and stem for the output file
+            (``Results/{plate_name}_MAK2Plus_Results.xlsx``).
+
+    Returns:
+        ``Path`` to the written Excel file.
+    """
     print(f"\n{'='*70}")
     print(f"  PLATE: {plate_name}")
     print(f"  Data:  {mc_file.name}")
