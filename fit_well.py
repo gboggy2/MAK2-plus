@@ -56,7 +56,7 @@ def fit_well(
     fluor_data,
     *,
     first_fit_cycle: float = 3.0,
-    cycles_before_max: int = 10,
+    cycles_before_max: int = 15,
     cycles_after_max: int = 4,
     auto_truncate: bool = True,
     truncate_cycle: float | None = None,

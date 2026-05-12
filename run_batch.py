@@ -76,7 +76,15 @@ for letter in "ABCDEFGHI":
 
 # Default settings (matching app sidebar defaults)
 FIRST_FIT_CYCLE = 3
-CYCLES_BEFORE_MAX = 10
+# CYCLES_BEFORE_MAX: cycles of baseline retained before the inflection (1st
+# derivative max) in the fit window. Increased from 10 to 15 after PCRedux
+# false-FAIL inspection showed late amplifiers (inflection at cycle ~38)
+# were getting only 2-3 baseline cycles in the fit window, which starved
+# Gate 2b's MAK2-vs-linear discriminator: with too little baseline, a pure
+# linear fit and a MAK2 sigmoid fit score equally well on the short
+# pre-inflection window. Adding ~5 more baseline cycles widens the
+# discrimination gap and recovers the borderline late amplifiers.
+CYCLES_BEFORE_MAX = 15
 CYCLES_AFTER_MAX = 4
 AUTO_TRUNCATE = True
 TRUNCATE_CYCLE = None
