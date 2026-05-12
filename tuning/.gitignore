@@ -1,0 +1,5 @@
+# Per-curve fit cache — large, reproducible from score_gates.py
+_score_cache.pkl
+
+# Tuning run artefacts — reproducible from tune_gates.py against a given fit cache
+results/
