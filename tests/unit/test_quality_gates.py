@@ -162,7 +162,9 @@ def test_gate_0_late_amplifier_relaxed_threshold():
     against real data in the regression test.)
     """
     cycles = np.arange(1, 41, dtype=float)
-    r = _make_result(R2=0.90, fit_start_cycle=20, fit_end_cycle=40)
+    # R²=0.95 is below the 0.98 standard floor but above the 0.92 late-amp
+    # floor; the test confirms the late path applies and accepts.
+    r = _make_result(R2=0.95, fit_start_cycle=20, fit_end_cycle=40)
     r["fluor_data"] = None  # skip Gates 2b and 3
     out = _grade([r], cycles=cycles)
     assert _passed(out[0]), (

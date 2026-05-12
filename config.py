@@ -65,8 +65,23 @@ class QualityGateConfig:
     # ``r2_floor_late_amplifier`` for a well whose fit window ended within
     # ``late_amplifier_tail_window`` cycles of the last data cycle. Late
     # amplifiers have less plateau information so the threshold relaxes.
-    r2_floor_standard: float = 0.99
-    r2_floor_late_amplifier: float = 0.85
+    #
+    # Floors were tuned against the PCRedux labelled dataset under the
+    # restored fit_well preprocessing pipeline:
+    #
+    #   - ``r2_floor_standard = 0.98``: PCRedux's lowest-R² real amplifier
+    #     among non-late wells is 0.984, so 0.98 admits every real
+    #     amplifier (including dual-stage curves like maro1.299 whose
+    #     single-sigmoid fit honestly maxes out at ~0.98). The original
+    #     0.99 was set under the broken-pipeline regime where fits were
+    #     artificially "perfect" because the long baseline dominated SSR.
+    #
+    #   - ``r2_floor_late_amplifier = 0.92``: PCRedux's lowest-R² real
+    #     late amplifier is 0.946. 0.92 keeps every real late amp while
+    #     rejecting the obvious "decreasing-then-rising" false PASSes
+    #     (e.g., maro1.356, R²=0.908) that the old 0.85 floor admitted.
+    r2_floor_standard: float = 0.98
+    r2_floor_late_amplifier: float = 0.92
     late_amplifier_tail_window: int = 5
 
     # ── Gate 2: fit-window width ────────────────────────────────────────
