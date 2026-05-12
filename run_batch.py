@@ -56,6 +56,7 @@ from data_processing import detect_no_signal_samples, estimate_baseline_end
 from qpcr_data_converter import QPCRDataConverter, load_abi_results_csv
 from replicate_analysis import calculate_replicate_stats, compare_precision
 from calibration import build_standard_curve, build_ct_standard_curve, apply_calibration, apply_ct_calibration
+from config import DEFAULT_GATES, QualityGateConfig
 
 # ── Configuration ───────��────────────────────────────��────────────────────────
 DATA_DIR = Path("/Users/boggy/Desktop/Desktop031424/Personal/InputDataFiles")
@@ -1231,7 +1232,7 @@ def run_pass2(results_list, cycles, sample_metadata, rox_by_well,
     return results_list
 
 
-def run_quality_gates(results_list, cycles):
+def run_quality_gates(results_list, cycles, gates=None):
     """Apply the per-well quality gates and assign final ``Status``.
 
     After Pass 1+2 leave each well with its best available fit, this
@@ -1265,11 +1266,23 @@ def run_quality_gates(results_list, cycles):
     Args:
         results_list: Output of ``run_pass2``. Mutated in place.
         cycles: Cycle-number array shared across wells.
+        gates: Optional ``QualityGateConfig`` instance. Defaults to
+            ``config.DEFAULT_GATES`` (the production thresholds).
+            Tuning experiments pass alternative configs to score
+            different gate parameterisations against PCRedux labels;
+            tests can use a custom config to exercise specific gate
+            edge cases.
 
     Returns:
         The mutated ``results_list``, with ``Status`` and
         ``status_detail`` populated.
     """
+    # Thresholds + late-bypasses come from a single config so the tuning
+    # driver can sweep over them. ``gates=None`` means "use production
+    # defaults" — the active QualityGateConfig in config.DEFAULT_GATES.
+    if gates is None:
+        gates = DEFAULT_GATES
+
     for pf_idx, pf_r in enumerate(results_list):
         if pf_r.get('error') is not None:
             continue
@@ -1282,11 +1295,16 @@ def run_quality_gates(results_list, cycles):
         pf_is_late = (
             pf_fe_g0 is not None
             and not (isinstance(pf_fe_g0, float) and np.isnan(pf_fe_g0))
-            and pf_fe_g0 >= float(cycles[-1]) - min(max(1, CYCLES_AFTER_MAX), 5)
+            and pf_fe_g0 >= float(cycles[-1]) - min(
+                max(1, CYCLES_AFTER_MAX), gates.late_amplifier_tail_window
+            )
         )
 
         # Gate 0: R² threshold
-        pf_r2_thresh = 0.85 if pf_is_late else 0.99
+        pf_r2_thresh = (
+            gates.r2_floor_late_amplifier if pf_is_late
+            else gates.r2_floor_standard
+        )
         if pf_r2 is not None and pf_r2 < pf_r2_thresh:
             pf_reject = True
             pf_reason = f'R² = {pf_r2:.4f} < {pf_r2_thresh}'
@@ -1296,12 +1314,18 @@ def run_quality_gates(results_list, cycles):
             pf_fs2 = pf_r.get('fit_start_cycle')
             pf_fe2 = pf_r.get('fit_end_cycle')
             if (pf_fs2 is not None and pf_fe2 is not None
-                    and pf_fe2 - pf_fs2 < 10):
+                    and pf_fe2 - pf_fs2 < gates.min_fit_window_cycles):
                 pf_reject = True
-                pf_reason = f'Fit window {pf_fe2 - pf_fs2:.0f} cycles < 10'
+                pf_reason = (
+                    f'Fit window {pf_fe2 - pf_fs2:.0f} cycles '
+                    f'< {gates.min_fit_window_cycles}'
+                )
 
         # Gate 2b: linear vs MAK2
-        pf_late_bypass_2b = pf_is_late and pf_r2 is not None and pf_r2 >= 0.995
+        pf_late_bypass_2b = (
+            pf_is_late and pf_r2 is not None
+            and pf_r2 >= gates.gate_2b_late_bypass_r2
+        )
         if (not pf_reject and not pf_late_bypass_2b
                 and pf_r.get('D0') is not None
                 and not (isinstance(pf_r['D0'], float) and np.isnan(pf_r['D0']))
@@ -1342,7 +1366,7 @@ def run_quality_gates(results_list, cycles):
                             pf_mak2_pre = pf_pred_win2b[pf_pre_mask]
                             pf_ss_res_mak = float(np.sum((pf_fluor_pre - pf_mak2_pre)**2))
                             pf_r2_mak = 1.0 - pf_ss_res_mak / pf_ss_tot
-                            if pf_r2_mak - pf_r2_lin < 0.05:
+                            if pf_r2_mak - pf_r2_lin < gates.min_r2_gap_mak2_vs_linear:
                                 pf_reject = True
                                 pf_reason = (
                                     f'MAK2 not better than linear in growth region '
@@ -1356,8 +1380,15 @@ def run_quality_gates(results_list, cycles):
             (pf_r.get('fit_end_cycle') or 0)
             - (pf_r.get('fit_start_cycle') or 0)
         )
-        pf_high_r2 = pf_r2 is not None and pf_r2 >= 0.999 and pf_fit_width >= 10
-        pf_late_bypass_3 = pf_is_late and pf_r2 is not None and pf_r2 >= 0.995
+        pf_high_r2 = (
+            pf_r2 is not None
+            and pf_r2 >= gates.gate_3_high_r2_bypass_r2
+            and pf_fit_width >= gates.gate_3_high_r2_bypass_min_window
+        )
+        pf_late_bypass_3 = (
+            pf_is_late and pf_r2 is not None
+            and pf_r2 >= gates.gate_3_late_bypass_r2
+        )
         if (not pf_reject and not pf_late_bypass_3 and not pf_high_r2
                 and pf_r.get('D0') is not None
                 and not (isinstance(pf_r['D0'], float) and np.isnan(pf_r['D0']))
@@ -1380,7 +1411,7 @@ def run_quality_gates(results_list, cycles):
                         pf_d1 = np.gradient(pf_pred_win)
                         pf_d2 = np.gradient(pf_d1)
                         pf_pred_range = float(np.max(pf_pred_win) - np.min(pf_pred_win))
-                        pf_d2_thresh = pf_pred_range * 0.01
+                        pf_d2_thresh = pf_pred_range * gates.inflection_threshold_pct_of_range
                         pf_has_inflection = (
                             np.any(pf_d2 > pf_d2_thresh)
                             and np.any(pf_d2 < -pf_d2_thresh)

@@ -31,6 +31,76 @@ exploration). See ``optimizer.py`` for the per-site offsets.
 """
 
 import os
+from dataclasses import dataclass
 
 _seed_env = os.environ.get("MAK2_RANDOM_SEED")
 RANDOM_SEED = int(_seed_env) if _seed_env is not None else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Quality-gate thresholds
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Each per-well fit is run through a series of gates that decide whether the
+# fit's status is PASS / FAIL / INDETERMINATE. See ARCHITECTURE.md §7 for
+# what each gate does and why; this module is the single place every
+# threshold is *named*.
+#
+# Defaults below match the historical hardcoded values in run_batch.py at
+# the moment QualityGateConfig was introduced — replacing those literals
+# with reads from this config must be a no-op on existing fixtures. The
+# subsequent gate-tuning work (see tuning/) will derive new defaults from
+# the PCRedux labelled dataset and replace the values below.
+#
+# Tests and tuning experiments construct alternative configs; production
+# code reads ``DEFAULT_GATES`` unless explicitly overridden.
+
+
+@dataclass(frozen=True)
+class QualityGateConfig:
+    """Numeric and structural knobs for the per-well quality gates."""
+
+    # ── Gate 0: R² floor ────────────────────────────────────────────────
+    # The fitted R² must clear ``r2_floor_standard`` for a normal well, or
+    # ``r2_floor_late_amplifier`` for a well whose fit window ended within
+    # ``late_amplifier_tail_window`` cycles of the last data cycle. Late
+    # amplifiers have less plateau information so the threshold relaxes.
+    r2_floor_standard: float = 0.99
+    r2_floor_late_amplifier: float = 0.85
+    late_amplifier_tail_window: int = 5
+
+    # ── Gate 2: fit-window width ────────────────────────────────────────
+    # The fit window must include at least this many cycles. Below this,
+    # the 5-parameter MAK2 fit becomes over-determined in the wrong
+    # direction (many parameter combinations fit equally well).
+    min_fit_window_cycles: int = 10
+
+    # ── Gate 2b: MAK2 vs linear discriminator ───────────────────────────
+    # On the pre-inflection portion of the fit window, the MAK2 fit's R²
+    # must beat a pure-linear fit by at least this much. Catches the case
+    # where any monotone curve fits both models passably well.
+    min_r2_gap_mak2_vs_linear: float = 0.05
+    # Late amplifiers bypass Gate 2b when R² is at least this high (the
+    # discriminator is unreliable in the short pre-inflection windows
+    # late amplifiers produce).
+    gate_2b_late_bypass_r2: float = 0.995
+
+    # ── Gate 3: sigmoid-shape (second-derivative sign change) ──────────
+    # The fitted curve's second derivative must change sign within the
+    # fit window — confirms there's an inflection point. The threshold
+    # for "significant" magnitude is expressed as a fraction of the
+    # in-window fluorescence range.
+    inflection_threshold_pct_of_range: float = 0.01
+    # High-R² wells with a wide-enough window bypass Gate 3 (the sigmoid
+    # shape is implied by the fit quality).
+    gate_3_high_r2_bypass_r2: float = 0.999
+    gate_3_high_r2_bypass_min_window: int = 10
+    # Late amplifiers bypass Gate 3 when R² is at least this high.
+    gate_3_late_bypass_r2: float = 0.995
+
+
+# The active gate parameters used by run_batch.run_quality_gates() and any
+# downstream caller. Tuning experiments construct alternative
+# QualityGateConfig instances and pass them explicitly; production reads
+# this default.
+DEFAULT_GATES = QualityGateConfig()
