@@ -65,7 +65,13 @@ class QualityGateConfig:
     # ``r2_floor_late_amplifier`` for a well whose fit window ended within
     # ``late_amplifier_tail_window`` cycles of the last data cycle. Late
     # amplifiers have less plateau information so the threshold relaxes.
-    r2_floor_standard: float = 0.99
+    #
+    # ``r2_floor_standard`` was lowered from 0.99 → 0.97 after PCRedux gate
+    # tuning: the 0.99 threshold was rejecting late/low-copy amplifiers
+    # with R² in [0.97, 0.99] that human raters labelled positive. The
+    # change recovered ~25% of false FAILs at zero added false-PASS cost
+    # (see tuning/sweep_gate3.py).
+    r2_floor_standard: float = 0.97
     r2_floor_late_amplifier: float = 0.85
     late_amplifier_tail_window: int = 5
 
@@ -93,7 +99,15 @@ class QualityGateConfig:
     inflection_threshold_pct_of_range: float = 0.01
     # High-R² wells with a wide-enough window bypass Gate 3 (the sigmoid
     # shape is implied by the fit quality).
-    gate_3_high_r2_bypass_r2: float = 0.999
+    #
+    # ``gate_3_high_r2_bypass_r2`` was lowered from 0.999 → 0.995 after
+    # PCRedux gate tuning: Gate 3 was rejecting 18 of 24 false-FAIL
+    # curves whose fits had R² in [0.995, 0.999) — excellent fits whose
+    # narrow pre-plateau window meant d²f/dx² didn't fully cross zero
+    # inside the gate's check region. Relaxing the bypass recovered most
+    # of these at zero added false-PASS cost (FP fits rarely reach R²
+    # 0.995). See tuning/sweep_gate3.py for the sweep that picked this.
+    gate_3_high_r2_bypass_r2: float = 0.995
     gate_3_high_r2_bypass_min_window: int = 10
     # Late amplifiers bypass Gate 3 when R² is at least this high.
     gate_3_late_bypass_r2: float = 0.995

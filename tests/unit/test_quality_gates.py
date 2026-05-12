@@ -98,8 +98,8 @@ def test_gate_0_high_r2_passes():
 
 
 def test_gate_0_low_r2_fails():
-    """R² = 0.97 (below the 0.99 threshold for non-late wells) is rejected."""
-    r = _make_result(R2=0.97, fit_start_cycle=10, fit_end_cycle=30)
+    """R² = 0.90 (below the 0.97 threshold for non-late wells) is rejected."""
+    r = _make_result(R2=0.90, fit_start_cycle=10, fit_end_cycle=30)
     out = _grade([r])
     assert not _passed(out[0])
     assert "R²" in out[0]["error"]
