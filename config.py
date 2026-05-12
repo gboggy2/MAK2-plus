@@ -76,12 +76,17 @@ class QualityGateConfig:
     #     0.99 was set under the broken-pipeline regime where fits were
     #     artificially "perfect" because the long baseline dominated SSR.
     #
-    #   - ``r2_floor_late_amplifier = 0.92``: PCRedux's lowest-R² real
-    #     late amplifier is 0.946. 0.92 keeps every real late amp while
-    #     rejecting the obvious "decreasing-then-rising" false PASSes
-    #     (e.g., maro1.356, R²=0.908) that the old 0.85 floor admitted.
+    #   - ``r2_floor_late_amplifier = 0.94``: PCRedux's lowest-R² real
+    #     late amplifier is 0.946; 0.94 keeps every real late amp with
+    #     a small margin while rejecting the obvious "decreasing-then-
+    #     rising" false PASSes (e.g., maro1.356, R²=0.908) that the old
+    #     0.85 floor admitted. Anything in [0.92, 0.945] gives identical
+    #     PCRedux results; 0.94 was chosen as the tightest defensible
+    #     value — every PCRedux real late amp clears it, while leaving
+    #     the floor closer to the standard 0.98 for defense against
+    #     future bad fits that might slip past Gates 2b / 3 / 4.
     r2_floor_standard: float = 0.98
-    r2_floor_late_amplifier: float = 0.92
+    r2_floor_late_amplifier: float = 0.94
     late_amplifier_tail_window: int = 5
 
     # ── Gate 2: fit-window width ────────────────────────────────────────
