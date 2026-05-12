@@ -18,7 +18,7 @@ from mak2_model import MAK2Model, calculate_amplification_efficiency, pre_estima
 from optimizer import MAK2Optimizer
 from bootstrap import bootstrap_parameter_uncertainty, BootstrapAnalyzer
 from example_data_loader import ExampleDataLoader
-from qpcr_data_converter import load_qpcr_file, QPCRDataConverter, load_abi_results_csv
+from qpcr_data_converter import QPCRDataConverter, load_abi_results_csv
 from sample_selector_ui import create_sample_selector_widget
 from replicate_analysis import (
     parse_sample_groups,
