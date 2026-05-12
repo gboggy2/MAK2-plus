@@ -60,7 +60,10 @@ from calibration import build_standard_curve, build_ct_standard_curve, apply_cal
 # ── Configuration ───────��────────────────────────────��────────────────────────
 DATA_DIR = Path("/Users/boggy/Desktop/Desktop031424/Personal/InputDataFiles")
 OUTPUT_DIR = DATA_DIR / "Results"
-OUTPUT_DIR.mkdir(exist_ok=True)
+# NOTE: OUTPUT_DIR is created lazily in the ``__main__`` block below,
+# not at module-import time. Importing this module (e.g. from tests
+# or from the Phase 1 FastAPI layer) must not have filesystem side
+# effects against a developer-specific path.
 
 # Plates to process: (multicomponent_csv, metadata_csv, output_name)
 PLATES = []
@@ -2085,6 +2088,10 @@ def process_plate(mc_file, meta_file, plate_name):
 # ── Main ────────���────────────────────���────────────────────────────────────────
 
 if __name__ == '__main__':
+    # Lazy mkdir — only when this module is invoked as a script.
+    # Module imports (tests, FastAPI, etc.) must remain side-effect-free.
+    OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
+
     print("=" * 70)
     print("  MAK2+ Offline Batch Fitting")
     print(f"  {len(PLATES)} plates to process")

@@ -11,7 +11,7 @@ Date: December 21, 2024
 import pandas as pd
 import json
 from pathlib import Path
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple
 import numpy as np
 
 

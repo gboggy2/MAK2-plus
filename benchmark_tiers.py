@@ -14,7 +14,6 @@ Usage:
 import sys
 import time
 import json
-import numpy as np
 import pandas as pd
 from pathlib import Path
 from collections import defaultdict

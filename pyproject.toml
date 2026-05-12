@@ -1,0 +1,30 @@
+[tool.ruff]
+# Skip directories that are local-only (worktrees) or generated.
+extend-exclude = [
+    ".claude",
+    "benchmark_results",
+    # app.py is the Streamlit UI; per CLAUDE.md it gets replaced wholesale
+    # by Next.js + FastAPI in Phase 1. Lint-cleaning it now would mean
+    # editing thousands of lines that are about to be deleted.
+    "app.py",
+]
+
+[tool.ruff.lint]
+# We only run ruff for CI to catch real bugs, not for code-style policing.
+# Phase 0 honestly documented the cosmetic issues in the codebase (f-strings
+# without placeholders in __main__ blocks, bare excepts in defensive guards,
+# etc.); Phase 1 will rewrite the UI layer wholesale, at which point a
+# stricter ruleset becomes worth enforcing. For now we keep ruff focused on
+# the categories that are most likely to surface actual problems:
+#
+#   F401  unused import (frequently signals stale dependencies)
+#   F811  redefined name (almost always a bug)
+#   F821  undefined name (always a bug)
+#   E9*   syntax errors (always a bug)
+#
+# Everything else is opted out by selecting only this subset.
+select = ["F401", "F811", "F821", "E9"]
+
+# Test files routinely import pytest for fixture detection only. That's fine.
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["F401"]

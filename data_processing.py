@@ -14,9 +14,8 @@ Neither function knows anything about the MAK2 model itself; both
 work directly on the raw fluorescence trace.
 """
 
-import pandas as pd
 import numpy as np
-from typing import Tuple, Optional, Dict
+from typing import Tuple, Dict
 
 
 
