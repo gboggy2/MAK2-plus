@@ -87,6 +87,48 @@ def _passed(result: dict) -> bool:
     return result.get("Success") == "✓" and not result.get("error")
 
 
+# ── Gate 4: Direction (raw-data rise) ────────────────────────────────────────
+
+
+def test_gate_4_monotonically_decreasing_fails():
+    """A monotonically decreasing curve (no amp + photobleaching) is rejected.
+
+    Models the false-PASS pattern observed in PCRedux scoring: a
+    near-linear decay with no amplification was producing R² > 0.995
+    fits whose tiny D0 was spurious. Gate 4 catches this on raw data
+    so the optimizer can't game it.
+    """
+    # Linearly decreasing fluorescence from 2.0 down to 1.3 over 40 cycles
+    decreasing = np.linspace(2.0, 1.3, 40)
+    r = _make_result(R2=0.995, fit_start_cycle=1, fit_end_cycle=40,
+                     fluor_data=decreasing)
+    out = _grade([r])
+    assert not _passed(out[0])
+    assert "does not rise" in out[0]["error"]
+
+
+def test_gate_4_real_sigmoid_passes():
+    """A normal MAK2 sigmoid passes Gate 4 (end fluorescence >> baseline)."""
+    sig = _synthetic_sigmoid_curve(n_cycles=40)
+    r = _make_result(R2=0.999, fit_start_cycle=10, fit_end_cycle=35,
+                     fluor_data=sig)
+    out = _grade([r])
+    assert _passed(out[0])
+
+
+def test_gate_4_flat_curve_fails():
+    """A flat NTC trace (no growth at all) is rejected."""
+    flat = np.full(40, 1.5) + np.random.default_rng(0).normal(0, 0.005, 40)
+    r = _make_result(R2=0.5, fit_start_cycle=1, fit_end_cycle=40,
+                     fluor_data=flat)
+    out = _grade([r])
+    assert not _passed(out[0])
+    # Could fail either Gate 4 (no growth) or Gate 0 (low R²) depending on
+    # which fires first; both are valid failure modes for a flat NTC.
+    assert any(s in out[0]["error"]
+               for s in ("does not rise", "R²", "monotone"))
+
+
 # ── Gate 0: R² floor ─────────────────────────────────────────────────────────
 
 
@@ -98,8 +140,8 @@ def test_gate_0_high_r2_passes():
 
 
 def test_gate_0_low_r2_fails():
-    """R² = 0.90 (below the 0.97 threshold for non-late wells) is rejected."""
-    r = _make_result(R2=0.90, fit_start_cycle=10, fit_end_cycle=30)
+    """R² = 0.97 (below the 0.99 threshold for non-late wells) is rejected."""
+    r = _make_result(R2=0.97, fit_start_cycle=10, fit_end_cycle=30)
     out = _grade([r])
     assert not _passed(out[0])
     assert "R²" in out[0]["error"]

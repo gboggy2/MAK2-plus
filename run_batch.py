@@ -1290,6 +1290,28 @@ def run_quality_gates(results_list, cycles, gates=None):
         pf_reject = False
         pf_reason = ''
 
+        # Gate 4: Direction — raw fluorescence must end above its start.
+        # Computed on the median of the first/last N cycles for noise
+        # robustness; immune to model-parameter laundering (e.g., a real
+        # downward trend absorbed into F_bg_slope to produce a high-R²
+        # spurious fit on a non-amplifying well).
+        pf_fluor_g4 = pf_r.get('fluor_data')
+        if pf_fluor_g4 is not None and len(pf_fluor_g4) >= 2 * gates.direction_anchor_window:
+            pf_n_g4 = gates.direction_anchor_window
+            pf_first = float(np.median(pf_fluor_g4[:pf_n_g4]))
+            pf_last  = float(np.median(pf_fluor_g4[-pf_n_g4:]))
+            pf_range_g4 = float(np.max(pf_fluor_g4) - np.min(pf_fluor_g4))
+            pf_growth = pf_last - pf_first
+            if pf_range_g4 > 0:
+                pf_growth_pct = pf_growth / pf_range_g4
+                if pf_growth_pct < gates.min_growth_pct_of_range:
+                    pf_reject = True
+                    pf_reason = (
+                        f'Curve does not rise '
+                        f'(growth = {pf_growth_pct:+.1%} of range, '
+                        f'min {gates.min_growth_pct_of_range:.1%})'
+                    )
+
         # Late amplifier detection
         pf_fe_g0 = pf_r.get('fit_end_cycle')
         pf_is_late = (
@@ -1305,7 +1327,7 @@ def run_quality_gates(results_list, cycles, gates=None):
             gates.r2_floor_late_amplifier if pf_is_late
             else gates.r2_floor_standard
         )
-        if pf_r2 is not None and pf_r2 < pf_r2_thresh:
+        if not pf_reject and pf_r2 is not None and pf_r2 < pf_r2_thresh:
             pf_reject = True
             pf_reason = f'R² = {pf_r2:.4f} < {pf_r2_thresh}'
 
