@@ -39,7 +39,7 @@ os.environ.setdefault("MAK2_RANDOM_SEED", "42")
 
 from config import DEFAULT_GATES, QualityGateConfig  # noqa: E402
 from tuning.score_gates import (  # noqa: E402
-    CACHE_PATH, FIXTURE_DIR, LABELS_CSV, CURVES_CSV,
+    CACHE_PATH, LABELS_CSV, CURVES_CSV,
     _build_cache, score_config,
 )
 

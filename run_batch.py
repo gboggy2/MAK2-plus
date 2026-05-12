@@ -56,7 +56,7 @@ from data_processing import detect_no_signal_samples, estimate_baseline_end
 from qpcr_data_converter import QPCRDataConverter, load_abi_results_csv
 from replicate_analysis import calculate_replicate_stats, compare_precision
 from calibration import build_standard_curve, build_ct_standard_curve, apply_calibration, apply_ct_calibration
-from config import DEFAULT_GATES, QualityGateConfig
+from config import DEFAULT_GATES
 
 # ── Configuration ───────��────────────────────────────��────────────────────────
 DATA_DIR = Path("/Users/boggy/Desktop/Desktop031424/Personal/InputDataFiles")
