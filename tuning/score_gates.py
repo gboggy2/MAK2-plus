@@ -42,8 +42,7 @@ sys.path.insert(0, str(ROOT))
 os.environ.setdefault("MAK2_RANDOM_SEED", "42")
 
 from config import DEFAULT_GATES, QualityGateConfig  # noqa: E402
-from mak2_model import MAK2Model  # noqa: E402
-from optimizer import MAK2Optimizer  # noqa: E402
+from fit_well import fit_well  # noqa: E402
 from run_batch import run_quality_gates  # noqa: E402
 
 LABEL_MAP = {"y": "PASS", "n": "FAIL", "a": "INDETERMINATE"}
@@ -56,38 +55,26 @@ CACHE_PATH  = Path(__file__).resolve().parent / "_score_cache.pkl"
 
 
 def fit_curve(cycles: np.ndarray, fluor: np.ndarray) -> dict | None:
-    """Fit a single curve. Returns the per-well result dict ready for the gates.
+    """Fit a single curve via the production preprocessing pipeline.
 
-    Returns None if the optimizer raised. The gates skip curves whose
-    ``error`` field is non-None, so the caller can treat None as
-    "this curve produced no fit; predict FAIL".
+    Delegates to ``fit_well.fit_well`` so PCRedux scoring uses the
+    *same* smart-start window selection + background pre-estimation
+    that ``run_batch.run_pass1`` applies in production. An earlier
+    version of this function called ``MAK2Optimizer.fit`` directly
+    with raw cycles + fluor, which skipped the left-trim and produced
+    visibly worse fits on late amplifiers (long baseline dominated
+    the SSR; F_bg_slope absorbed what should have been growth
+    signal). See ``fit_well.py`` for the pipeline details.
+
+    Returns None on hard failure (no fit produced). The gates already
+    skip curves with non-None ``error`` and treat them as FAIL.
     """
     buf = io.StringIO()
-    try:
-        with contextlib.redirect_stdout(buf):
-            opt = MAK2Optimizer(MAK2Model())
-            params = opt.fit(cycles, fluor, verbose=False)
-            metrics = opt.calculate_fit_metrics()
-        return {
-            "Sample": "x",
-            "R2": metrics["r_squared"],
-            "D0": params["D0"],
-            "k": params["k"],
-            "P0": params["P0"],
-            "F_bg_intercept": params["F_bg_intercept"],
-            "F_bg_slope": params["F_bg_slope"],
-            "fit_start_cycle": (
-                float(opt.cycles_fit[0]) if opt.cycles_fit is not None else float(cycles[0])
-            ),
-            "fit_end_cycle": (
-                float(opt.cycles_fit[-1]) if opt.cycles_fit is not None else float(cycles[-1])
-            ),
-            "fluor_data": fluor,
-            "error": None,
-            "Success": "✓",
-        }
-    except Exception:
+    with contextlib.redirect_stdout(buf):
+        result = fit_well(cycles, fluor, verbose=False)
+    if result.get("error") is not None:
         return None
+    return result
 
 
 def _build_cache(labels: pd.DataFrame, curves: pd.DataFrame) -> dict[str, dict | None]:
