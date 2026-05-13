@@ -1,0 +1,7 @@
+# Per-dataset MAK2+ fit caches — large, regenerable via
+# `python tuning/score_extended.py --fresh`
+*/_fit_cache.pkl
+
+# Per-dataset prediction outputs — regenerable via
+# `python tuning/score_extended.py`
+*/predictions.csv

@@ -1,0 +1,3 @@
+"dataset","source","n_curves","n_cycles","n_raters","consensus"
+"kbqPCR","PCRedux::kbqPCR + decision_res_kbqPCR",400,40,7,"PCRedux conformity flag (all 7 agree → label, else 'a')"
+"RAS002","PCRedux::RAS002 + RAS002_decisions",192,40,1,"single decision"
