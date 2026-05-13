@@ -152,11 +152,20 @@ def fit_well(
             bg_slope_est = float(coeffs[0])
             bg_int_est = float(coeffs[1])
 
-    # Algorithmic bounds for D0 + tight bounds around pre-estimated background.
+    # Tight bounds around the window-based background pre-estimate. We
+    # intentionally do *not* set a D0 bound here: the optimizer treats
+    # 'D0' in bounds as a signal to skip its own analytical bounds
+    # estimation (see optimizer.py:383 `use_analytical_init = 'D0' not
+    # in bounds`), and that estimation is where the sophisticated
+    # background-subtracted-data handling lives (statistical σ-based
+    # bg bounds via `slope_uncertainty`, baseline threshold detection
+    # for near-zero-fluorescence data, negative-intercept allowance).
+    # By omitting D0, we get the analytical D0/k/P0 bounds *plus* our
+    # tighter window-based F_bg_slope/F_bg_intercept (the merge loop in
+    # optimizer.py preserves bounds already present in `bounds`).
     slope_delta = max(abs(bg_slope_est) * 0.40, F_range * 0.002)
     int_delta = max(abs(bg_int_est) * 0.005, F_range * 0.03)
     bg_bounds = {
-        'D0':             (1e-15, max(F_range, 1.0)),
         'F_bg_slope':     (bg_slope_est - slope_delta, bg_slope_est + slope_delta),
         'F_bg_intercept': (bg_int_est - int_delta,    bg_int_est + int_delta),
     }
