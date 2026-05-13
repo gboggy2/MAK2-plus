@@ -52,6 +52,75 @@ from data_processing import estimate_baseline_end
 from run_batch import smart_start, adaptive_window_extension
 
 
+def find_take_off_idx(cycles, fluor_data, floor_idx):
+    """Return the index where amplification begins (= baseline end).
+
+    Conceptually: the "baseline" is the last stable region before the
+    curve starts rising into the sigmoid. We find it by walking
+    *backward* from the inflection cycle (max d1), looking for the
+    nearest 5-cycle window whose polyfit residual is small (≤ 0.5% of
+    F_range). The cycle immediately after that window is the take-off.
+
+    Why backward-from-inflection: it handles three regimes that
+    ``estimate_baseline_end`` (forward signal-vs-noise) gets wrong —
+
+    1. **Sharp early amplifiers** (rutledge X1, boggy F1, maro1.42):
+       forward signal-vs-noise overshoots into the rise because the
+       noise floor is tiny. Backward scan from inflection lands inside
+       the truly flat pre-elbow cycles.
+
+    2. **Biphasic baselines** (maro3.116: early hump then sag then
+       amplification). Forward scan locks onto whichever pseudo-stable
+       region appears first (the early hump) and reports a positive bg
+       slope that doesn't reflect the local drift near the elbow.
+       Backward scan finds the *last* stable region before the real
+       take-off, even if there's a hump earlier in the curve.
+
+    3. **Long drifting baselines** (media-1 maro2.*): both methods land
+       in similar places; this approach gives a tighter answer because
+       it walks until residual stays low.
+
+    Returns inflection_idx if no clean stable region exists (failure
+    fallback — caller can use ``estimate_baseline_end`` as a backup).
+    """
+    cycles = np.asarray(cycles, dtype=float)
+    fluor_data = np.asarray(fluor_data, dtype=float)
+    n = len(cycles)
+    if n - floor_idx < 8:
+        return n - 1
+
+    # Locate the inflection cycle as the max-slope point. Use a small
+    # smoothing to reduce noise sensitivity.
+    d1 = np.gradient(fluor_data, cycles)
+    # Restrict argmax to cycles past floor_idx so leading noise can't win.
+    inflection_idx = int(np.argmax(d1[floor_idx:])) + floor_idx
+    if inflection_idx - floor_idx < 5:
+        return inflection_idx
+
+    F_range = float(np.max(fluor_data) - np.min(fluor_data))
+    if F_range <= 0:
+        return inflection_idx
+
+    # Walk backward from inflection_idx - 1. At each candidate ``k``,
+    # check whether cycles [k-4 : k+1] (5 cycles ending at k) form a
+    # stable region — small residual_std on a linear fit. The first k
+    # (largest, closest to inflection) satisfying that is the last
+    # baseline cycle; take-off = k + 1.
+    threshold = 0.005  # 0.5% of F_range
+    take_off = None
+    for k in range(inflection_idx - 1, floor_idx + 3, -1):
+        bg_c = cycles[k - 4:k + 1]
+        bg_f = fluor_data[k - 4:k + 1]
+        coeffs = np.polyfit(bg_c, bg_f, 1)
+        resid = bg_f - np.polyval(coeffs, bg_c)
+        rn = float(np.std(resid)) / F_range
+        if rn <= threshold:
+            take_off = k + 1
+            break
+
+    return take_off if take_off is not None else inflection_idx
+
+
 def fit_well(
     cycles,
     fluor_data,
@@ -126,9 +195,19 @@ def fit_well(
     # place the fit window, which matters because for some curves
     # adaptive extension can collapse ``fit_start_idx`` all the way
     # back to ``floor_idx``, leaving only the noisiest early cycles.
-    baseline_end_idx = estimate_baseline_end(
-        cycles, fluor_data, first_cycle_idx=floor_idx,
-    )
+    # Locate the take-off cycle (= baseline_end) by backward-from-
+    # inflection scan. See ``find_take_off_idx`` docstring for why this
+    # is more reliable than ``estimate_baseline_end``'s forward
+    # signal-vs-noise rule on sharp early amplifiers, biphasic
+    # baselines, and drifting baselines. Fall back to the legacy
+    # detector if the take-off search can't find a stable region.
+    take_off_idx = find_take_off_idx(cycles, fluor_data, floor_idx)
+    if take_off_idx is None or take_off_idx - floor_idx < 4:
+        baseline_end_idx = estimate_baseline_end(
+            cycles, fluor_data, first_cycle_idx=floor_idx,
+        )
+    else:
+        baseline_end_idx = take_off_idx
     # Curvature-based safety-cap: ``estimate_baseline_end`` can overshoot
     # in two distinct regimes — on sharp early amplifiers (rutledge X1,
     # tiny noise + steep take-off) it lands deep inside the rise; on
