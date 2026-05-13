@@ -1442,9 +1442,19 @@ def run_quality_gates(results_list, cycles, gates=None):
                         pf_d2 = np.gradient(pf_d1)
                         pf_pred_range = float(np.max(pf_pred_win) - np.min(pf_pred_win))
                         pf_d2_thresh = pf_pred_range * gates.inflection_threshold_pct_of_range
+                        # Inflection criterion is asymmetric in magnitude:
+                        # the positive (acceleration) side must clearly
+                        # exceed noise via the relative threshold, but the
+                        # negative (deceleration) side only needs to be
+                        # negative — slow-k sigmoids decelerate gradually
+                        # over many cycles, so |d²| stays small on the
+                        # negative side even though d² is genuinely
+                        # crossing zero. Requiring symmetric magnitudes
+                        # rejected real slow amplifiers (k = 0.04–0.07
+                        # range; observed on 4 of 7 kbqPCR false-FAILs).
                         pf_has_inflection = (
                             np.any(pf_d2 > pf_d2_thresh)
-                            and np.any(pf_d2 < -pf_d2_thresh)
+                            and np.any(pf_d2 < 0)
                         )
                         if not pf_has_inflection:
                             pf_reject = True
