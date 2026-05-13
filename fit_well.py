@@ -174,10 +174,23 @@ def fit_well(
             bg_pre_start = floor_idx + 1
             bg_c = cycles[bg_pre_start:early_end]
             bg_f = fluor_data[bg_pre_start:early_end]
+            # The early window can ITSELF be contaminated for very
+            # early/sharp amplifiers (boggy F1.1, rutledge X1) where
+            # take-off begins before cycle 13. Iteratively trim the
+            # upper end while the polyfit residual_norm stays elevated.
+            for _shrink in range(bg_window_size - 4):
+                if len(bg_c) < 5:
+                    break
+                coeffs_chk = np.polyfit(bg_c, bg_f, 1)
+                rd_chk = bg_f - np.polyval(coeffs_chk, bg_c)
+                if float(np.std(rd_chk)) / F_range_full <= 0.01:
+                    break
+                bg_c = bg_c[:-1]
+                bg_f = bg_f[:-1]
             # Update baseline_end_idx so downstream code sees the right
             # boundary (used by adaptive_window_extension for the
             # baseline-cycles check).
-            baseline_end_idx = early_end
+            baseline_end_idx = bg_pre_start + len(bg_c)
     if len(bg_c) >= 2:
         coeffs = np.polyfit(bg_c, bg_f, 1)
         bg_slope_est = float(coeffs[0])
