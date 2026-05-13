@@ -1,3 +1,16 @@
-"dataset","source","n_curves","n_cycles","n_raters","consensus"
-"kbqPCR","PCRedux::kbqPCR + decision_res_kbqPCR",400,40,7,"PCRedux conformity flag (all 7 agree → label, else 'a')"
-"RAS002","PCRedux::RAS002 + RAS002_decisions",192,40,1,"single decision"
+"dataset","n_curves","n_y","n_n","n_a"
+"batsch1",15,15,0,0
+"boggy",12,12,0,0
+"C126EG595",96,96,0,0
+"competimer",147,62,85,0
+"dil4reps94",375,375,0,0
+"guescini1",84,84,0,0
+"karlen1",80,55,25,0
+"kbqPCR",400,231,106,63
+"lievens1",90,90,0,0
+"RAS002",192,42,150,0
+"reps384",379,379,0,0
+"rutledge",120,120,0,0
+"testdat",24,12,12,0
+"vermeulen1",1200,1188,12,0
+"VIMCFX96_60",96,96,0,0
