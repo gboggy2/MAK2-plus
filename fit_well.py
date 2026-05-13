@@ -103,10 +103,16 @@ def find_take_off_idx(cycles, fluor_data, floor_idx):
 
     # Walk backward from inflection_idx - 1. At each candidate ``k``,
     # check whether cycles [k-4 : k+1] (5 cycles ending at k) form a
-    # stable region — small residual_std on a linear fit. The first k
-    # (largest, closest to inflection) satisfying that is the last
-    # baseline cycle; take-off = k + 1.
+    # stable region — small residual_std on a linear fit AND a slope
+    # much shallower than the inflection slope. The two-part test
+    # rejects the *linear middle of the sigmoid* — five consecutive
+    # cycles around the inflection cycle are approximately linear
+    # (slope ≈ d1_max/2), so they pass a residual-only test, but
+    # they're clearly not baseline. Real baselines have slope ≈ 0 or
+    # just photobleach drift, both well below 20% of d1_max.
     threshold = 0.005  # 0.5% of F_range
+    d1_max = float(d1[inflection_idx])
+    slope_cap = 0.20 * abs(d1_max) if d1_max != 0 else None
     take_off = None
     for k in range(inflection_idx - 1, floor_idx + 3, -1):
         bg_c = cycles[k - 4:k + 1]
@@ -114,9 +120,12 @@ def find_take_off_idx(cycles, fluor_data, floor_idx):
         coeffs = np.polyfit(bg_c, bg_f, 1)
         resid = bg_f - np.polyval(coeffs, bg_c)
         rn = float(np.std(resid)) / F_range
-        if rn <= threshold:
-            take_off = k + 1
-            break
+        if rn > threshold:
+            continue
+        if slope_cap is not None and abs(coeffs[0]) > slope_cap:
+            continue
+        take_off = k + 1
+        break
 
     return take_off if take_off is not None else inflection_idx
 
