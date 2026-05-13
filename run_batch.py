@@ -52,6 +52,11 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from mak2_model import MAK2Model, estimate_MAK2_params_from_exponential
 from optimizer import MAK2Optimizer
+# ``prepare_fit_inputs`` is imported lazily inside ``run_pass1`` to avoid
+# a circular dependency: ``fit_well`` imports ``smart_start`` /
+# ``adaptive_window_extension`` from this module. A follow-up commit
+# should move those helpers into ``fit_well`` (or a shared module) so
+# the lazy import can become a top-level one.
 from data_processing import detect_no_signal_samples, estimate_baseline_end
 from qpcr_data_converter import QPCRDataConverter, load_abi_results_csv
 from replicate_analysis import calculate_replicate_stats, compare_precision
@@ -549,73 +554,23 @@ def run_pass1(all_samples_to_fit, cycles, sample_metadata, rox_by_well,
                     except (ValueError, TypeError):
                         pass
 
-            # Algorithmic baseline end
-            well_pos = _get_well_pos(sample_name)
-            rox_arr = rox_by_well.get(well_pos, None)
-            if rox_arr is not None and len(rox_arr) == len(fluor_data):
-                fluor_for_bl = fluor_data / np.maximum(rox_arr, 1e-10)
-            else:
-                fluor_for_bl = fluor_data
-            est_bl_end_idx = estimate_baseline_end(cycles, fluor_for_bl, first_cycle_idx=floor_idx)
-            est_bl_end_cycle = float(cycles[min(est_bl_end_idx, len(cycles) - 1)])
-
-            fit_start_idx, max_slope_idx = smart_start(
-                fluor_data, cycles, floor_idx, CYCLES_BEFORE_MAX
+            # Preprocessing (take-off detection, bg pre-estimation, window
+            # selection, bound construction) shared with fit_well. Routes
+            # both fitting paths through one implementation so any future
+            # improvement automatically lands in production batch runs.
+            from fit_well import prepare_fit_inputs  # noqa: E402
+            prep = prepare_fit_inputs(
+                cycles, fluor_data,
+                first_fit_cycle=FIRST_FIT_CYCLE,
+                cycles_before_max=CYCLES_BEFORE_MAX,
+                fit_bounds=fit_bounds,
             )
-
-            # Background pre-estimation (window-based)
-            bg_pre_start = max(floor_idx, fit_start_idx - 8)
-            bg_c = cycles[bg_pre_start:fit_start_idx]
-            bg_f = fluor_data[bg_pre_start:fit_start_idx]
-            if len(bg_c) >= 2:
-                bg_coeffs = np.polyfit(bg_c, bg_f, 1)
-                _bg_slope_est = float(bg_coeffs[0])
-                _bg_int_est = float(bg_coeffs[1])
-            else:
-                _bg_slope_est = 0.0
-                _bg_int_est = float(fluor_data[fit_start_idx]) if fit_start_idx < len(fluor_data) else 0.0
-
-            # Adaptive window extension
-            fit_start_idx, _bg_slope_est, _bg_int_est = adaptive_window_extension(
-                fluor_data, cycles, fit_start_idx, max_slope_idx,
-                floor_idx, CYCLES_BEFORE_MAX, _bg_slope_est, _bg_int_est
-            )
-
-            cycles_fit = cycles[fit_start_idx:]
-            fluor_fit = fluor_data[fit_start_idx:]
-            F_range = float(np.max(fluor_fit) - np.min(fluor_fit))
-
-            # Safety net: detect if smart-start missed the sigmoid
-            total_range = float(np.max(fluor_data) - np.min(fluor_data))
-            if total_range > 0 and F_range < 0.7 * total_range:
-                fit_start_idx = floor_idx
-                cycles_fit = cycles[fit_start_idx:]
-                fluor_fit = fluor_data[fit_start_idx:]
-                F_range = float(np.max(fluor_fit) - np.min(fluor_fit))
-                bg_pre_start = floor_idx
-                bg_c = cycles[bg_pre_start:bg_pre_start + 8]
-                bg_f = fluor_data[bg_pre_start:bg_pre_start + 8]
-                if len(bg_c) >= 2:
-                    bg_coeffs = np.polyfit(bg_c, bg_f, 1)
-                    _bg_slope_est = float(bg_coeffs[0])
-                    _bg_int_est = float(bg_coeffs[1])
-
-            # Build bounds
-            slope_delta = max(abs(_bg_slope_est) * 0.40, F_range * 0.002)
-            s_min = _bg_slope_est - slope_delta
-            s_max = _bg_slope_est + slope_delta
-            int_delta = max(abs(_bg_int_est) * 0.005, F_range * 0.03)
-            int_lo = _bg_int_est - int_delta
-            int_hi = _bg_int_est + int_delta
-
-            bg_bounds = {
-                'D0': (1e-15, max(F_range, 1.0)),
-                'F_bg_slope': (s_min, s_max),
-                'F_bg_intercept': (int_lo, int_hi),
-            }
-            non_bg_bounds = {k: v for k, v in (fit_bounds or {}).items()
-                            if k not in ('F_bg_slope', 'F_bg_intercept')}
-            merged_bounds = {**bg_bounds, **non_bg_bounds}
+            cycles_fit = prep['cycles_fit']
+            fluor_fit = prep['fluor_fit']
+            _bg_slope_est = prep['bg_slope_est']
+            _bg_int_est = prep['bg_int_est']
+            fit_start_idx = prep['fit_start_idx']
+            est_bl_end_cycle = prep['baseline_end_cycle']
 
             # Fit
             params_batch = optimizer_batch.fit(
@@ -623,11 +578,8 @@ def run_pass1(all_samples_to_fit, cycles, sample_metadata, rox_by_well,
                 cycles_after_max=CYCLES_AFTER_MAX,
                 auto_truncate=AUTO_TRUNCATE,
                 truncate_cycle=TRUNCATE_CYCLE,
-                bounds=merged_bounds,
-                fixed_background_values={
-                    'F_bg_slope': _bg_slope_est,
-                    'F_bg_intercept': _bg_int_est,
-                },
+                bounds=prep['merged_bounds'],
+                fixed_background_values=prep['fixed_background_values'],
                 verbose=False,
             )
 
