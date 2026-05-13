@@ -58,7 +58,7 @@ def fit_well(
     *,
     first_fit_cycle: float = 3.0,
     cycles_before_max: int = 15,
-    cycles_after_max: int = 4,
+    cycles_after_max: int = 8,
     auto_truncate: bool = True,
     truncate_cycle: float | None = None,
     fit_bounds: dict | None = None,
@@ -129,26 +129,47 @@ def fit_well(
     baseline_end_idx = estimate_baseline_end(
         cycles, fluor_data, first_cycle_idx=floor_idx,
     )
-    # Magnitude safety-cap: ``estimate_baseline_end`` can overshoot on
-    # early/low-noise amplifiers (e.g. rutledge X1 dilution series) when
-    # noise is tiny and the take-off is gradual — every cycle reads as
-    # "significantly above noise" yet fluor is already deep into the rise.
-    # If any cycle inside the proposed bg window has fluor above
-    # ``min + 5% × F_range``, pull the upper endpoint back to the last
-    # cycle below that threshold. Keeps the bg polyfit inside the truly
-    # flat region of the curve.
-    F_range_full = float(np.max(fluor_data) - np.min(fluor_data))
-    if F_range_full > 0:
-        bg_cap = float(np.min(fluor_data)) + 0.05 * F_range_full
-        # Walk back from baseline_end_idx until fluor drops below cap.
-        capped = baseline_end_idx
-        while capped > floor_idx + 1 and fluor_data[capped - 1] > bg_cap:
-            capped -= 1
-        baseline_end_idx = capped
+    # Curvature-based safety-cap: ``estimate_baseline_end`` can overshoot
+    # in two distinct regimes — on sharp early amplifiers (rutledge X1,
+    # tiny noise + steep take-off) it lands deep inside the rise; on
+    # gradually-drifting baselines (media-1 maro2.*, photobleaching) it
+    # may overshoot by a few cycles but most of the window is genuine
+    # drift we want to capture.
+    #
+    # A pure magnitude cap (e.g. min + 5% F_range) can't tell these
+    # apart: it collapses the media-1 window to 2–3 cycles because the
+    # drift itself crosses 5% of range. So instead: take the proposed
+    # 12-cycle window, fit a line, identify cycles whose residual is
+    # >3σ from the line. Those are the growth-contaminated cycles —
+    # walk the upper endpoint back past them. A clean linear drift
+    # leaves no outliers, so the window stays wide.
     bg_window_size = 12
     bg_pre_start = max(floor_idx, baseline_end_idx - bg_window_size)
     bg_c = cycles[bg_pre_start:baseline_end_idx]
     bg_f = fluor_data[bg_pre_start:baseline_end_idx]
+    F_range_full = float(np.max(fluor_data) - np.min(fluor_data))
+    if len(bg_c) >= 5 and F_range_full > 0:
+        # Detect growth contamination by linearity. Genuine baseline
+        # drift (photobleaching) is straight — polyfit residuals are
+        # small. Growth contamination shows up as a parabolic curve —
+        # polyfit residual_std is large relative to F_range.
+        coeffs_tmp = np.polyfit(bg_c, bg_f, 1)
+        resid = bg_f - np.polyval(coeffs_tmp, bg_c)
+        resid_norm = float(np.std(resid)) / F_range_full
+        # Threshold: 1% of F_range. Linear drift on media-1 maro2.*
+        # comes in at ~0.1%; rutledge X1 contamination at ~3-5%.
+        if resid_norm > 0.01:
+            # Window is contaminated. Walk back until fluor at the upper
+            # endpoint drops below ``min + 5% × F_range`` (the
+            # magnitude cap from commit fca17fc).
+            bg_cap = float(np.min(fluor_data)) + 0.05 * F_range_full
+            capped = baseline_end_idx
+            while capped > floor_idx + 1 and fluor_data[capped - 1] > bg_cap:
+                capped -= 1
+            baseline_end_idx = capped
+            bg_pre_start = max(floor_idx, baseline_end_idx - bg_window_size)
+            bg_c = cycles[bg_pre_start:baseline_end_idx]
+            bg_f = fluor_data[bg_pre_start:baseline_end_idx]
     if len(bg_c) >= 2:
         coeffs = np.polyfit(bg_c, bg_f, 1)
         bg_slope_est = float(coeffs[0])
