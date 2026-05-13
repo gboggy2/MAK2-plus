@@ -44,6 +44,7 @@ import numpy as np
 
 from mak2_model import MAK2Model
 from optimizer import MAK2Optimizer
+from data_processing import estimate_baseline_end
 # smart_start and adaptive_window_extension currently live in run_batch
 # alongside the run_pass1 driver. Importing them keeps this extraction
 # bit-equivalent to the inlined run_pass1 path; a later commit can move
@@ -104,28 +105,58 @@ def fit_well(
 
     floor_idx = int(np.searchsorted(cycles, first_fit_cycle))
 
-    # Inflection search + initial left-trim.
-    fit_start_idx, max_slope_idx = smart_start(
-        fluor_data, cycles, floor_idx, cycles_before_max
+    # ── Background pre-estimation in a near-elbow window ──────────────
+    # We use ``estimate_baseline_end`` (iterative 5σ signal-vs-noise
+    # detection) to locate where the baseline ends, then fit bg on a
+    # window of up to ``bg_window_size`` cycles ending at that index.
+    # Anchoring at the genuine baseline-end is what matters; the window
+    # size is a tradeoff:
+    #   - Too narrow (e.g., 8 cycles): polyfit slope is dominated by
+    #     local noise and may be ~0 even when a real bleach trend exists.
+    #   - Too wide (entire baseline from cycle 3): early cycles get
+    #     disproportionate weight. Cycles 1-5 are often unreliable
+    #     (dye equilibration) and dye photobleaching is typically
+    #     exponential — a long-window linear fit overestimates the
+    #     decay rate near the elbow.
+    #   - 12 cycles: enough for a statistically stable polyfit, short
+    #     enough that exp ≈ linear holds, and skips most of the dye-
+    #     equilibration noise on a 40-cycle assay (baseline_end ~25,
+    #     window = cycles 14-24).
+    # Independent of where smart_start / adaptive_window_extension
+    # place the fit window, which matters because for some curves
+    # adaptive extension can collapse ``fit_start_idx`` all the way
+    # back to ``floor_idx``, leaving only the noisiest early cycles.
+    baseline_end_idx = estimate_baseline_end(
+        cycles, fluor_data, first_cycle_idx=floor_idx,
     )
-
-    # Background pre-estimation on the ≤8 cycles just before the window.
-    bg_pre_start = max(floor_idx, fit_start_idx - 8)
-    bg_c = cycles[bg_pre_start:fit_start_idx]
-    bg_f = fluor_data[bg_pre_start:fit_start_idx]
+    bg_window_size = 12
+    bg_pre_start = max(floor_idx, baseline_end_idx - bg_window_size)
+    bg_c = cycles[bg_pre_start:baseline_end_idx]
+    bg_f = fluor_data[bg_pre_start:baseline_end_idx]
     if len(bg_c) >= 2:
         coeffs = np.polyfit(bg_c, bg_f, 1)
         bg_slope_est = float(coeffs[0])
         bg_int_est = float(coeffs[1])
     else:
+        # Fallback: not enough baseline cycles. Use the median of whatever
+        # baseline we have and assume flat slope.
         bg_slope_est = 0.0
         bg_int_est = (
-            float(fluor_data[fit_start_idx])
-            if fit_start_idx < len(fluor_data) else 0.0
+            float(np.median(fluor_data[floor_idx:baseline_end_idx]))
+            if baseline_end_idx > floor_idx else 0.0
         )
 
-    # Extend window backward until ≥3 baseline cycles are inside.
-    fit_start_idx, bg_slope_est, bg_int_est = adaptive_window_extension(
+    # ── Fit window placement (smart_start finds inflection) ───────────
+    fit_start_idx, max_slope_idx = smart_start(
+        fluor_data, cycles, floor_idx, cycles_before_max
+    )
+
+    # Extend window backward until ≥3 baseline cycles are inside. We
+    # pass our stable bg estimate so the "baseline-like" check uses the
+    # right reference; we then *discard* the recomputed bg values, since
+    # they'd revert to the old "tiny pre-window polyfit" behaviour we're
+    # trying to avoid.
+    fit_start_idx, _, _ = adaptive_window_extension(
         fluor_data, cycles, fit_start_idx, max_slope_idx,
         floor_idx, cycles_before_max, bg_slope_est, bg_int_est,
     )
@@ -136,21 +167,15 @@ def fit_well(
 
     # Safety net: if the chosen window contains <70% of the total
     # fluorescence range, smart-start missed the sigmoid. Fall back to
-    # using the whole curve from floor_idx and re-estimate background
-    # on the leading 8 cycles.
+    # using the whole curve from floor_idx. We keep the bg estimate
+    # anchored to the algorithmic baseline-end (above), not re-fit on
+    # the leading cycles.
     total_range = float(np.max(fluor_data) - np.min(fluor_data))
     if total_range > 0 and F_range < 0.7 * total_range:
         fit_start_idx = floor_idx
         cycles_fit = cycles[fit_start_idx:]
         fluor_fit = fluor_data[fit_start_idx:]
         F_range = float(np.max(fluor_fit) - np.min(fluor_fit))
-        bg_pre_start = floor_idx
-        bg_c = cycles[bg_pre_start:bg_pre_start + 8]
-        bg_f = fluor_data[bg_pre_start:bg_pre_start + 8]
-        if len(bg_c) >= 2:
-            coeffs = np.polyfit(bg_c, bg_f, 1)
-            bg_slope_est = float(coeffs[0])
-            bg_int_est = float(coeffs[1])
 
     # Tight bounds around the window-based background pre-estimate. We
     # intentionally do *not* set a D0 bound here: the optimizer treats
