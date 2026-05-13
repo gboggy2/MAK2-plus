@@ -129,6 +129,22 @@ def fit_well(
     baseline_end_idx = estimate_baseline_end(
         cycles, fluor_data, first_cycle_idx=floor_idx,
     )
+    # Magnitude safety-cap: ``estimate_baseline_end`` can overshoot on
+    # early/low-noise amplifiers (e.g. rutledge X1 dilution series) when
+    # noise is tiny and the take-off is gradual — every cycle reads as
+    # "significantly above noise" yet fluor is already deep into the rise.
+    # If any cycle inside the proposed bg window has fluor above
+    # ``min + 5% × F_range``, pull the upper endpoint back to the last
+    # cycle below that threshold. Keeps the bg polyfit inside the truly
+    # flat region of the curve.
+    F_range_full = float(np.max(fluor_data) - np.min(fluor_data))
+    if F_range_full > 0:
+        bg_cap = float(np.min(fluor_data)) + 0.05 * F_range_full
+        # Walk back from baseline_end_idx until fluor drops below cap.
+        capped = baseline_end_idx
+        while capped > floor_idx + 1 and fluor_data[capped - 1] > bg_cap:
+            capped -= 1
+        baseline_end_idx = capped
     bg_window_size = 12
     bg_pre_start = max(floor_idx, baseline_end_idx - bg_window_size)
     bg_c = cycles[bg_pre_start:baseline_end_idx]
