@@ -1298,6 +1298,47 @@ def run_quality_gates(results_list, cycles, gates=None):
         pf_reject = False
         pf_reason = ''
 
+        # Gate 5: Amplification amplitude — the model's growth component
+        # (MAK2 prediction minus the fitted background line) must
+        # account for a meaningful fraction of the observed fluorescence
+        # range. Catches fits like media-1 maro2.69: a non-amplifying
+        # curve with continuous gradual rise interpreted as a tiny
+        # amplification (D0=4e-3, P0=5e-2) on top of bg_slope=+0.01.
+        # The MAK2 fit explains the data via the bg line, not via
+        # amplification — the growth component is only ~14% of F_range.
+        # Real amplifiers have growth ≥ ~50% of F_range.
+        pf_fluor_g5 = pf_r.get('fluor_data')
+        pf_d0_g5 = pf_r.get('D0')
+        if (not pf_reject and pf_fluor_g5 is not None
+                and pf_d0_g5 is not None
+                and not (isinstance(pf_d0_g5, float) and np.isnan(pf_d0_g5))
+                and len(pf_fluor_g5) >= 10):
+            pf_c_g5 = cycles[:len(pf_fluor_g5)]
+            try:
+                pf_model_g5 = MAK2Model().simulate_to_cycle(
+                    D0=pf_r['D0'], k=pf_r['k'], P0=pf_r['P0'],
+                    cycles=pf_c_g5,
+                    F_bg_intercept=pf_r['F_bg_intercept'],
+                    F_bg_slope=pf_r['F_bg_slope'],
+                )
+                pf_bg_line_g5 = (
+                    pf_r['F_bg_intercept'] + pf_r['F_bg_slope'] * pf_c_g5
+                )
+                pf_growth_amp = float(np.max(pf_model_g5 - pf_bg_line_g5))
+                pf_range_g5 = float(np.max(pf_fluor_g5) - np.min(pf_fluor_g5))
+                if pf_range_g5 > 0:
+                    pf_amp_pct = pf_growth_amp / pf_range_g5
+                    if pf_amp_pct < 0.30:
+                        pf_reject = True
+                        pf_reason = (
+                            f'Amplification amplitude too small '
+                            f'({pf_amp_pct:.1%} of F_range, '
+                            f'min 30%) — fit dominated by '
+                            f'background line'
+                        )
+            except Exception:
+                pass
+
         # Gate 4: Direction — raw fluorescence must end above its start.
         # Computed on the median of the first/last N cycles for noise
         # robustness; immune to model-parameter laundering (e.g., a real
@@ -1352,8 +1393,14 @@ def run_quality_gates(results_list, cycles, gates=None):
                 )
 
         # Gate 2b: linear vs MAK2
+        # The high-R² bypass applies universally: for clean sigmoids the
+        # pre-inflection region inside the fit window is short (2–3
+        # cycles for a sharp rise), so MAK2 and linear necessarily fit
+        # similarly there even though the overall fit is excellent.
+        # vermeulen1 NM23A.1500 (R²=0.9992 textbook sigmoid) was being
+        # rejected by this gate because it wasn't classified "late".
         pf_late_bypass_2b = (
-            pf_is_late and pf_r2 is not None
+            pf_r2 is not None
             and pf_r2 >= gates.gate_2b_late_bypass_r2
         )
         if (not pf_reject and not pf_late_bypass_2b
