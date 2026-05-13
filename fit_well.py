@@ -157,19 +157,27 @@ def fit_well(
         resid = bg_f - np.polyval(coeffs_tmp, bg_c)
         resid_norm = float(np.std(resid)) / F_range_full
         # Threshold: 1% of F_range. Linear drift on media-1 maro2.*
-        # comes in at ~0.1%; rutledge X1 contamination at ~3-5%.
+        # comes in at ~0.1%; rutledge X1 / media-1 maro2.66
+        # contamination at ~3%.
         if resid_norm > 0.01:
-            # Window is contaminated. Walk back until fluor at the upper
-            # endpoint drops below ``min + 5% × F_range`` (the
-            # magnitude cap from commit fca17fc).
-            bg_cap = float(np.min(fluor_data)) + 0.05 * F_range_full
-            capped = baseline_end_idx
-            while capped > floor_idx + 1 and fluor_data[capped - 1] > bg_cap:
-                capped -= 1
-            baseline_end_idx = capped
-            bg_pre_start = max(floor_idx, baseline_end_idx - bg_window_size)
-            bg_c = cycles[bg_pre_start:baseline_end_idx]
-            bg_f = fluor_data[bg_pre_start:baseline_end_idx]
+            # Window is contaminated. ``estimate_baseline_end`` has
+            # overshot into the take-off. Fall back to the *early*
+            # portion of the baseline (cycles floor_idx+1 to
+            # floor_idx+13). This skips most of the dye-equilibration
+            # noise of cycles 1-2 while staying well inside the truly
+            # flat region for both sharp early amplifiers (rutledge X1
+            # take-off ~cyc 14) and gradually-drifting late amplifiers
+            # (media-1 maro2.66 bend starts ~cyc 30). Wider window than
+            # the previous magnitude-cap fallback gave (2-5 cycles),
+            # which kept the polyfit noisy.
+            early_end = min(baseline_end_idx, floor_idx + 1 + bg_window_size)
+            bg_pre_start = floor_idx + 1
+            bg_c = cycles[bg_pre_start:early_end]
+            bg_f = fluor_data[bg_pre_start:early_end]
+            # Update baseline_end_idx so downstream code sees the right
+            # boundary (used by adaptive_window_extension for the
+            # baseline-cycles check).
+            baseline_end_idx = early_end
     if len(bg_c) >= 2:
         coeffs = np.polyfit(bg_c, bg_f, 1)
         bg_slope_est = float(coeffs[0])
