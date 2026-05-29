@@ -41,6 +41,8 @@ outputs across this refactor; ``fit_well`` and the unified
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 from mak2_model import MAK2Model
@@ -51,6 +53,14 @@ from data_processing import estimate_baseline_end
 # bit-equivalent to the inlined run_pass1 path; a later commit can move
 # them here and have run_batch import from this module instead.
 from run_batch import smart_start, adaptive_window_extension
+from toe_prefit import (
+    stage0_ct_from_inflection,
+    stage1_toe_fit,
+    stage3_toe_gate,
+    baseline_std_from_prefit,
+    TOE_FIT_R2_MIN,
+    TOE_D0_BOUND_FACTOR,
+)
 
 
 def find_take_off_idx(cycles, fluor_data, floor_idx):
@@ -249,6 +259,8 @@ def prepare_fit_inputs(
         'bg_int_est':     bg_int_est,
         'fit_start_idx':  fit_start_idx,
         'max_slope_idx':  max_slope_idx,
+        'floor_idx':      floor_idx,
+        'baseline_end_idx': baseline_end_idx,
         'fit_start_cycle': float(cycles[fit_start_idx]),
         'baseline_end_cycle': float(cycles[min(baseline_end_idx, len(cycles) - 1)]),
         'F_range': F_range,
@@ -313,23 +325,117 @@ def fit_well(
         fit_bounds=fit_bounds,
     )
 
-    try:
+    # Bypass for A/B comparison and pre-Stage-0-1-2-3 regression diagnosis.
+    # Setting MAK2_DISABLE_TOE=1 reverts fit_well to its previous behaviour:
+    # no D0 anchor from the toe, no toe gate, no retry. The result dict
+    # still carries the new field names with None values so callers don't
+    # need conditional shape handling.
+    _toe_disabled = os.environ.get("MAK2_DISABLE_TOE") == "1"
+
+    # Stage 0 + Stage 1 pre-fitting. Cheap; always runs (Stage 1 self-skips
+    # on low SNR). Outputs attached to the result dict regardless of whether
+    # Stage 2 uses D0_toe to bound the optimizer.
+    if _toe_disabled:
+        from toe_prefit import Stage0Result  # local import — keep bypass cheap
+        s0 = Stage0Result(success=False, reason="disabled via MAK2_DISABLE_TOE")
+    else:
+        s0 = stage0_ct_from_inflection(
+            cycles, inflection_idx=prep['max_slope_idx'],
+        )
+    if s0.success:
+        bl_std = baseline_std_from_prefit(
+            cycles, fluor_data,
+            prep['bg_int_est'], prep['bg_slope_est'],
+            prep['floor_idx'], prep['baseline_end_idx'],
+        )
+        s1 = stage1_toe_fit(
+            cycles, fluor_data,
+            bg_int=prep['bg_int_est'],
+            bg_slope=prep['bg_slope_est'],
+            Ct_stage0=s0.Ct_stage0,
+            baseline_std=bl_std,
+        )
+    else:
+        s1 = None
+
+    # Stage 2: if Stage 1 succeeded with sufficient toe-fit quality, tighten
+    # the optimizer's D0 search to a narrow window around D0_toe. The MAK2
+    # toe-region doubling limit makes D0_toe a physics-justified prior, so
+    # bounding ±factor (default 4x) around it eliminates the vast-empty
+    # parameter regions that drive most toe-misfit failures while still
+    # giving the optimizer room to correct for noise in the toe estimate.
+    bounds_for_fit = prep['merged_bounds']
+    if s1 is not None and s1.success and s1.toe_fit_r2 is not None \
+            and s1.toe_fit_r2 >= TOE_FIT_R2_MIN \
+            and 'D0' not in bounds_for_fit:
+        D0_lo = s1.D0_toe / TOE_D0_BOUND_FACTOR
+        D0_hi = s1.D0_toe * TOE_D0_BOUND_FACTOR
+        bounds_for_fit = {**bounds_for_fit, 'D0': (D0_lo, D0_hi)}
+
+    def _run_fit(bounds):
         opt = MAK2Optimizer(MAK2Model())
         params = opt.fit(
             prep['cycles_fit'], prep['fluor_fit'],
             cycles_after_max=cycles_after_max,
             auto_truncate=auto_truncate,
             truncate_cycle=truncate_cycle,
-            bounds=prep['merged_bounds'],
+            bounds=bounds,
             fixed_background_values=prep['fixed_background_values'],
             verbose=verbose,
         )
         metrics = opt.calculate_fit_metrics()
-        fit_end_cycle = (
+        end_cycle = (
             float(opt.cycles_fit[-1])
             if opt.cycles_fit is not None and len(opt.cycles_fit) > 0
             else float(cycles[-1])
         )
+        return params, metrics, end_cycle
+
+    try:
+        params, metrics, fit_end_cycle = _run_fit(bounds_for_fit)
+
+        # Stage 3: toe residual gate. Only meaningful when we have a Ct_stage0
+        # to define the toe window. One retry with widened D0 bounds on the
+        # side suggested by the residual sign; if it still fails the gate is
+        # advisory (TOE_MISFIT flag), not a hard reject.
+        s3 = None
+        toe_misfit = False
+        if s0 is not None and s0.success:
+            s3 = stage3_toe_gate(
+                cycles, fluor_data, params, Ct_stage0=s0.Ct_stage0,
+            )
+            if (s3.evaluated and not s3.passed
+                    and s1 is not None and s1.success
+                    and s1.toe_fit_r2 is not None
+                    and s1.toe_fit_r2 >= TOE_FIT_R2_MIN):
+                # Widen D0 on the side that the residual sign implicates.
+                factor_sq = TOE_D0_BOUND_FACTOR ** 2
+                if s3.sign > 0:
+                    # Model below data => D0 likely too low. Drop the floor.
+                    D0_lo = s1.D0_toe / factor_sq
+                    D0_hi = s1.D0_toe * TOE_D0_BOUND_FACTOR
+                else:
+                    # Model above data => D0 likely too high. Raise the cap.
+                    D0_lo = s1.D0_toe / TOE_D0_BOUND_FACTOR
+                    D0_hi = s1.D0_toe * factor_sq
+                retry_bounds = {**bounds_for_fit, 'D0': (D0_lo, D0_hi)}
+                try:
+                    p2, m2, fe2 = _run_fit(retry_bounds)
+                    s3_retry = stage3_toe_gate(
+                        cycles, fluor_data, p2, Ct_stage0=s0.Ct_stage0,
+                    )
+                    # Accept the retry if it passed the toe gate OR (gate
+                    # still fails but the global fit didn't regress).
+                    if s3_retry.evaluated and (
+                        s3_retry.passed or m2['r_squared'] >= metrics['r_squared']
+                    ):
+                        params, metrics, fit_end_cycle = p2, m2, fe2
+                        s3 = s3_retry
+                except Exception:
+                    pass  # Keep the first-pass result if retry blows up.
+            if s3.evaluated and not s3.passed:
+                toe_misfit = True
+
         return {
             'Sample': 'x',
             'R2': metrics['r_squared'],
@@ -343,6 +449,7 @@ def fit_well(
             'fluor_data':      fluor_data,
             'error':           None,
             'Success':         '✓',
+            **_toe_fields(s0, s1, s3, toe_misfit),
         }
     except Exception as e:
         return {
@@ -354,4 +461,32 @@ def fit_well(
             'fluor_data':      fluor_data,
             'error':           str(e),
             'Success':         '',
+            **_toe_fields(s0, s1, None, False),
         }
+
+
+def _toe_fields(s0, s1, s3, toe_misfit: bool) -> dict:
+    """Pack Stage 0/1/3 diagnostics into the per-well result dict."""
+    out = {
+        'Ct_stage0':   s0.Ct_stage0 if s0 and s0.success else None,
+        'D0_toe':      None,
+        'toe_fit_r2':  None,
+        'toe_snr':     None,
+        'toe_skipped_reason': None,
+        'toe_mean_residual':  None,
+        'toe_rel_residual':   None,
+        'TOE_MISFIT':         bool(toe_misfit),
+    }
+    if s1 is None:
+        out['toe_skipped_reason'] = 'stage0 failed'
+    elif s1.success:
+        out['D0_toe']     = s1.D0_toe
+        out['toe_fit_r2'] = s1.toe_fit_r2
+        out['toe_snr']    = s1.snr
+    else:
+        out['toe_skipped_reason'] = s1.reason
+        out['toe_snr']    = s1.snr
+    if s3 is not None and s3.evaluated:
+        out['toe_mean_residual'] = s3.mean_residual
+        out['toe_rel_residual']  = s3.rel_residual
+    return out
