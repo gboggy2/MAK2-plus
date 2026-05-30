@@ -560,95 +560,15 @@ def run_pass2(results_list, cycles, sample_metadata, rox_by_well,
     Returns:
         The (mutated) ``results_list``.
     """
+    from pass2_helpers import compute_channel_priors, identify_retry_candidates
     last_cyc = float(cycles[-1])
 
-    # Step 1: collect per-channel stats
-    ch_k = {}; ch_P0 = {}; ch_Fbg = {}; ch_slope = {}
-    for r in results_list:
-        if (r['k'] is not None and r['R2'] is not None
-                and r['R2'] > 0.95 and r['k'] < 0.5
-                and str(r['Success']).startswith('✓')):
-            ch = _ch(r['Sample'])
-            ch_k.setdefault(ch, []).append(r['k'])
-            ch_P0.setdefault(ch, []).append(r['P0'])
-            ch_Fbg.setdefault(ch, []).append(r['F_bg_intercept'])
-            if r['F_bg_slope'] is not None:
-                ch_slope.setdefault(ch, []).append(r['F_bg_slope'])
-
-    channel_medians = {}
-    for ch in ch_k:
-        if len(ch_k[ch]) >= 2:
-            channel_medians[ch] = {
-                'k': np.median(ch_k[ch]),
-                'P0': np.median(ch_P0[ch]),
-                'F_bg_intercept': np.median(ch_Fbg[ch]),
-                'F_bg_slope': np.median(ch_slope.get(ch, [0.0])),
-                'n': len(ch_k[ch]),
-            }
-
-    all_k_vals = [v for lst in ch_k.values() for v in lst]
-    all_P0_vals = [v for lst in ch_P0.values() for v in lst]
-    all_fbg_vals = [v for lst in ch_Fbg.values() for v in lst]
-    all_sl_vals = [v for lst in ch_slope.values() for v in lst]
-    plate_medians = {
-        'k': np.median(all_k_vals) if all_k_vals else 0.15,
-        'P0': np.median(all_P0_vals) if all_P0_vals else 1e5,
-        'F_bg_intercept': np.median(all_fbg_vals) if all_fbg_vals else 1e5,
-        'F_bg_slope': np.median(all_sl_vals) if all_sl_vals else 0.0,
-    }
-
-    # Step 2: identify retry candidates
-    retry_indices = set()
-    for i, r in enumerate(results_list):
-        fd = r.get('fluor_data')
-        if (r['SSR'] is not None and fd is not None
-                and (r['R2'] is None or r['R2'] < 0.999)):
-            F_rng = np.max(fd) - np.min(fd)
-            if r['SSR'] > 0.01 * F_rng ** 2:
-                retry_indices.add(i)
-        if r['k'] is None:
-            retry_indices.add(i)
-        if (r['k'] is not None and r['k'] > 0.5
-                and (r['R2'] is None or r['R2'] < 0.999)):
-            retry_indices.add(i)
-        if r['R2'] is not None and r['R2'] < 0.999:
-            retry_indices.add(i)
-        # Tail overshoot check
-        if (r.get('R2') is not None and r['R2'] < 0.999
-                and fd is not None and r.get('error') is None):
-            try:
-                fe = r.get('fit_end_cycle')
-                fs = r.get('fit_start_cycle')
-                if fe is not None and fs is not None and not (isinstance(fe, float) and np.isnan(fe)):
-                    c_arr = cycles[:len(fd)] if len(cycles) >= len(fd) else np.arange(1, len(fd)+1, dtype=float)
-                    win_mask = (c_arr >= fs) & (c_arr <= fe)
-                    fd_win = fd[win_mask]
-                    if r.get('D0') is not None and not np.isnan(r['D0']):
-                        m_tmp = MAK2Model()
-                        f_pred_win = m_tmp.simulate_to_cycle(
-                            D0=r['D0'], k=r['k'], P0=r['P0'],
-                            cycles=c_arr[win_mask],
-                            F_bg_intercept=r['F_bg_intercept'],
-                            F_bg_slope=r['F_bg_slope'],
-                        )
-                        resid_win = fd_win - f_pred_win
-                        last3_mean = float(np.mean(resid_win[-3:])) if len(resid_win) >= 3 else 0.0
-                        F_rng = float(np.max(fd) - np.min(fd))
-                        if F_rng > 0 and last3_mean < -0.03 * F_rng:
-                            retry_indices.add(i)
-            except Exception:
-                pass
-
-    # Skip hopeless wells
-    for i in list(retry_indices):
-        r2_i = results_list[i].get('R2')
-        if r2_i is not None and r2_i < 0.85:
-            fe_i = results_list[i].get('fit_end_cycle')
-            is_late = (fe_i is not None and fe_i >= last_cyc - min(max(1, CYCLES_AFTER_MAX), 5))
-            if not is_late:
-                retry_indices.discard(i)
-
-    retry_indices = sorted(retry_indices)
+    # Channel-prior stats + retry-candidate identification — shared
+    # canonical implementation used by both this driver and app.py.
+    channel_medians, plate_medians = compute_channel_priors(results_list)
+    retry_indices, _skipped = identify_retry_candidates(
+        results_list, cycles, CYCLES_AFTER_MAX,
+    )
     if not retry_indices:
         print("  Pass 2: No samples need retry")
         return results_list

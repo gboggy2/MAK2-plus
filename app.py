@@ -2176,126 +2176,20 @@ if cycles is not None and fluorescence is not None:
 
             # _ch() is defined above the threshold block and reused here.
 
-            # ── Step 1: collect per-channel stats from reliable pass-1 fits ────
-            # "Reliable" = fit succeeded, R² > 0.95, k physically reasonable (< 0.5)
-            ch_k = {}; ch_P0 = {}; ch_Fbg = {}; ch_slope = {}
-            for r in results_list:
-                if (r['k'] is not None and r['R2'] is not None
-                        and r['R2'] > 0.95 and r['k'] < 0.5
-                        and str(r['Success']).startswith('✓')):
-                    ch = _ch(r['Sample'])
-                    ch_k.setdefault(ch, []).append(r['k'])
-                    ch_P0.setdefault(ch, []).append(r['P0'])
-                    ch_Fbg.setdefault(ch, []).append(r['F_bg_intercept'])
-                    if r['F_bg_slope'] is not None:
-                        ch_slope.setdefault(ch, []).append(r['F_bg_slope'])
-
-            # Compute per-channel medians (need ≥ 2 reliable fits to trust them)
-            channel_medians = {}
-            for ch in ch_k:
-                if len(ch_k[ch]) >= 2:
-                    channel_medians[ch] = {
-                        'k':             np.median(ch_k[ch]),
-                        'P0':            np.median(ch_P0[ch]),
-                        'F_bg_intercept': np.median(ch_Fbg[ch]),
-                        'F_bg_slope':    np.median(ch_slope.get(ch, [0.0])),
-                        'n':             len(ch_k[ch]),
-                    }
-
-            # Plate-wide fallback (used only when a channel has no reliable fits)
-            all_k_vals   = [v for lst in ch_k.values()    for v in lst]
-            all_P0_vals  = [v for lst in ch_P0.values()   for v in lst]
-            all_fbg_vals = [v for lst in ch_Fbg.values()  for v in lst]
-            all_sl_vals  = [v for lst in ch_slope.values() for v in lst]
-            plate_medians = {
-                'k':             np.median(all_k_vals)   if all_k_vals   else 0.15,
-                'P0':            np.median(all_P0_vals)  if all_P0_vals  else 1e5,
-                'F_bg_intercept': np.median(all_fbg_vals) if all_fbg_vals else 1e5,
-                'F_bg_slope':    np.median(all_sl_vals)  if all_sl_vals  else 0.0,
-            }
-
-            # ── Step 2: identify all samples that need a retry ───────────────────
-            retry_indices = set()
-            for i, r in enumerate(results_list):
-                fd = r.get('fluor_data')
-                # (a) high SSR relative to fluorescence range
-                #     Only retry if R² is also below target; SSR scales with
-                #     fluorescence magnitude and isn't meaningful on its own.
-                if (r['SSR'] is not None and fd is not None
-                        and (r['R2'] is None or r['R2'] < 0.999)):
-                    F_rng = np.max(fd) - np.min(fd)
-                    if r['SSR'] > 0.01 * F_rng ** 2:
-                        retry_indices.add(i)
-                # (b) optimisation failed entirely (no k fitted)
-                if r['k'] is None:
-                    retry_indices.add(i)
-                # (c) degenerate k — physically unrealistic for qPCR
-                #     BUT only retry if R² is also below target; a high-k fit
-                #     with R² ≥ 0.999 is capturing the data well.
-                if (r['k'] is not None and r['k'] > 0.5
-                        and (r['R2'] is None or r['R2'] < 0.999)):
-                    retry_indices.add(i)
-                # (d) R² below target — always try for 0.999 first.
-                # Late amplifiers may accept 0.995 at the end, but we
-                # retry with extended baseline before relaxing.
-                _last_cyc = float(cycles[-1]) if len(cycles) > 0 else 42.0
-                if r['R2'] is not None and r['R2'] < 0.999:
-                    retry_indices.add(i)
-                # (e) tail overshoot: model consistently above data at end of fit window.
-                # This happens when smart truncation cuts the window before the plateau,
-                # leaving the optimizer without the data needed to constrain k.  The retry
-                # uses extended truncation to expose that data.  Detected as: mean of the
-                # last 3 fit-window residuals < −3% of the fluorescence range.
-                if (r.get('R2') is not None and r['R2'] < 0.999
-                        and fd is not None and r.get('error') is None):
-                    try:
-                        _fe = r.get('fit_end_cycle')
-                        _fs = r.get('fit_start_cycle')
-                        if _fe is not None and _fs is not None and not (
-                            isinstance(_fe, float) and np.isnan(_fe)
-                        ):
-                            # Use the shared cycles array (same length as fd)
-                            _c_arr    = cycles[:len(fd)] if len(cycles) >= len(fd) else np.arange(1, len(fd) + 1, dtype=float)
-                            _win_mask = (_c_arr >= _fs) & (_c_arr <= _fe)
-                            _fd_win   = fd[_win_mask]
-                            # Reconstruct model prediction for fit window
-                            if r.get('D0') is not None and not np.isnan(r['D0']):
-                                _m_tmp = MAK2Model()
-                                _f_pred_win = _m_tmp.simulate_to_cycle(
-                                    D0=r['D0'], k=r['k'], P0=r['P0'],
-                                    cycles=_c_arr[_win_mask],
-                                    F_bg_intercept=r['F_bg_intercept'],
-                                    F_bg_slope=r['F_bg_slope']
-                                )
-                                _resid_win = _fd_win - _f_pred_win
-                                _last3_mean = float(np.mean(_resid_win[-3:])) if len(_resid_win) >= 3 else 0.0
-                                _F_rng = float(np.max(fd) - np.min(fd))
-                                if _F_rng > 0 and _last3_mean < -0.03 * _F_rng:
-                                    retry_indices.add(i)
-                    except Exception:
-                        pass
-
-            # ── Skip retries for truly hopeless wells (R² < 0.85) ──
-            # Wells with R² 0.85-0.99 are worth retrying — higher-tier
-            # optimizers (T2-LHS, T3-DE) frequently push them above 0.99.
-            # Wells below 0.85 are noise/drift with no chance of recovery,
-            # UNLESS they are late amplifiers — those benefit from analytical
-            # exponential priors in the retry path.
-            _last_cycle = float(cycles[-1])
-            _skip_count = 0
-            for i in list(retry_indices):
-                _r2_i = results_list[i].get('R2')
-                if _r2_i is not None and _r2_i < 0.85:
-                    # Don't skip late amplifiers — they can be rescued
-                    _fe_i = results_list[i].get('fit_end_cycle')
-                    _is_late_i = (_fe_i is not None and _fe_i >= _last_cycle - min(max(1, cycles_after_max), 5))
-                    if not _is_late_i:
-                        retry_indices.discard(i)
-                        _skip_count += 1
+            # Channel-prior stats + retry-candidate identification — shared
+            # canonical implementation in pass2_helpers, used by both this
+            # app and run_batch.run_pass2.
+            from pass2_helpers import compute_channel_priors, identify_retry_candidates
+            channel_medians, plate_medians = compute_channel_priors(results_list)
+            retry_indices, _skip_count = identify_retry_candidates(
+                results_list, cycles, cycles_after_max,
+            )
             if _skip_count > 0:
-                status_text.text(f"Skipped {_skip_count} wells below R² 0.90 threshold")
-
-            retry_indices = sorted(retry_indices)
+                status_text.text(f"Skipped {_skip_count} wells below R² 0.85 threshold")
+            # ``all_k_vals`` is still referenced by the gating condition just
+            # below ("if retry_indices and (channel_medians or all_k_vals):"),
+            # so synthesise an equivalent from the channel medians.
+            all_k_vals = [m['k'] for m in channel_medians.values()]
 
             # Save retry indices to checkpoint
             _checkpoint['retry_indices'] = retry_indices
