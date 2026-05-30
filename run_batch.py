@@ -50,14 +50,12 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from mak2_model import MAK2Model, estimate_MAK2_params_from_exponential
-from optimizer import MAK2Optimizer
-# ``prepare_fit_inputs`` is imported lazily inside ``run_pass1`` to avoid
-# a circular dependency: ``fit_well`` imports ``smart_start`` /
-# ``adaptive_window_extension`` from this module. A follow-up commit
-# should move those helpers into ``fit_well`` (or a shared module) so
-# the lazy import can become a top-level one.
-from data_processing import detect_no_signal_samples, estimate_baseline_end
+from mak2_model import MAK2Model
+# MAK2Optimizer / estimate_MAK2_params_from_exponential / estimate_baseline_end
+# moved into pass2_helpers.retry_one_well when Pass 1/2 unified through
+# fit_well; only MAK2Model is still used at module scope (by run_quality_gates,
+# which simulates predictions via MAK2Model().simulate_to_cycle).
+from data_processing import detect_no_signal_samples
 from qpcr_data_converter import QPCRDataConverter, load_abi_results_csv
 from replicate_analysis import calculate_replicate_stats, compare_precision
 from calibration import build_standard_curve, build_ct_standard_curve, apply_calibration, apply_ct_calibration

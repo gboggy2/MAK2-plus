@@ -30,8 +30,6 @@ these two functions produce.
 """
 from __future__ import annotations
 
-from typing import Iterable
-
 import numpy as np
 
 
