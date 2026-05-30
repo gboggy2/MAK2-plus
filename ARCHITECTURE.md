@@ -188,18 +188,73 @@ phase. Lines in parentheses are post-Phase-0-cleanup file sizes.
   model on each resample, returns the per-parameter CI. Optional
   diagnostic; not used by the production batch path.
 
-### Application code (out of scope for the Phase-1 port)
+### Workflow-canonical files (must not be duplicated downstream)
 
-- **`app.py`** (~6000 lines) — Streamlit UI. Will be replaced by a
-  Next.js front-end in Phase 1. The per-well preprocessing logic
-  duplicated here is one of the major sources of tech debt to be
-  resolved during the unification work; see CLAUDE.md.
-- **`run_batch.py`** (1777 lines) — Headless batch driver. Same per-well
-  preprocessing as `app.py`'s batch mode, plus Excel writing and
-  multi-plate orchestration. Will be replaced by the FastAPI batch
-  endpoint in Phase 1.
+Per-well fitting was historically copy-pasted across three callers
+(`app.py` batch, `app.py` single-sample, `run_batch.run_pass1`) and
+drifted independently for years. As of the Phase-1 unification
+(May 2026), the canonical implementations live in four files, and
+**every caller imports from them rather than re-implementing**:
+
+- **`fit_well.py`** (~750 lines) — The single per-well fitting entry
+  point. Owns no-amplification pre-check, take-off detection,
+  background pre-estimation, fit-window placement, the optimizer call,
+  toe-prefit Stages 0–3, Ct + Ct_baseline regression, tier
+  classification, and instrument status. Returns the full per-well
+  result schema. Called by `app.py` batch, `app.py` single-sample,
+  `run_batch.run_pass1`, and the PCRedux scoring driver.
+- **`pass2_helpers.py`** (~680 lines) — The Pass 2 channel-aware
+  retry. `compute_channel_priors`, `identify_retry_candidates`, and
+  `retry_one_well` are the canonical implementations. Both `app.py`
+  batch and `run_batch.run_pass2` import from here.
+- **`toe_prefit.py`** (~240 lines) — Stage 0/1/3 of the toe pipeline.
+  Used only by `fit_well`.
+- **`run_batch.run_quality_gates`** — The canonical post-fit
+  quality-gate evaluator, driven by `config.DEFAULT_GATES`. `app.py`
+  batch imports and calls it directly; the gate-tuning driver in
+  `tuning/` uses it with alternate configs.
+
+### Driver code (uses the canonical files; does not duplicate)
+
+- **`app.py`** (~4770 lines) — Streamlit UI. Both batch and
+  single-sample modes call `fit_well`; batch mode additionally calls
+  `retry_one_well` and `run_quality_gates`. **No inline fit logic** —
+  if you find yourself instantiating `MAK2Optimizer` here, the change
+  belongs in `fit_well` instead.
+- **`run_batch.py`** (~1600 lines) — Headless CLI / library driver.
+  `run_pass1` calls `fit_well`; `run_pass2` calls `retry_one_well`;
+  `run_quality_gates` lives here (it is the canonical implementation).
+  Excel writing and multi-plate orchestration also live here — those
+  *are* legitimate driver-level concerns.
 - **`benchmark_tiers.py`**, **`example_data_loader.py`**,
   **`sample_selector_ui.py`** — Tooling and UI helpers. Out of scope.
+
+### The no-divergence rule
+
+> **When changing fitting behavior, change the canonical file — never
+> the caller.**
+
+The fitting logic was unified in May 2026 across nine staged commits.
+Re-introducing duplication (inline preprocessing in `app.py`, a fresh
+per-well retry loop in `run_batch.py`, a copy of the gates in a new
+driver) silently un-does that work and re-creates the divergence we
+just spent the better part of a week fixing. The unit test
+`tests/unit/test_canonical_workflow.py` scans the source tree for
+known patterns of re-introduced duplication and fails CI when one
+appears. If you have a real reason to bypass the canonical file
+(probably you don't), update the test's allowlist with a comment
+explaining why.
+
+Where to put which kind of change:
+
+| Change | Goes in |
+|---|---|
+| New preprocessing step / window-placement heuristic | `fit_well.prepare_fit_inputs` |
+| New per-well postprocessing field (e.g. derived metric) | `fit_well.fit_well` return dict |
+| Toe-stage tuning (window size, threshold, gate logic) | `toe_prefit.py` |
+| New retry strategy / additional retry variant | `pass2_helpers.retry_one_well` |
+| New quality gate, new threshold | `run_batch.run_quality_gates` + `config.QualityGateConfig` |
+| New UI affordance, new plate metadata | `app.py` (UI) or `run_batch.py` (CLI) — these are the driver layers |
 
 ### Call graph (engine only)
 

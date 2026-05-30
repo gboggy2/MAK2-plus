@@ -405,7 +405,13 @@ def run_pass1(all_samples_to_fit, cycles, sample_metadata, rox_by_well,
               global_baseline_mean):
     """First-pass MAK2 fitting over every survivor of the no-signal triage.
 
-    For each well:
+    Each well is fit by ``fit_well.fit_well`` — the canonical per-well
+    entry point shared with the Streamlit app and the PCRedux scoring
+    driver. Do not inline preprocessing or optimizer logic here;
+    changes belong in ``fit_well``. See ARCHITECTURE.md § "The
+    no-divergence rule".
+
+    For each well, fit_well handles:
 
       1. **No-amplification pre-check.** A second, per-well-local
          test (the plate-wide one ran in
@@ -508,6 +514,12 @@ def run_pass2(results_list, cycles, sample_metadata, rox_by_well,
               channel_thresholds, global_threshold, channel_baseline_means,
               global_baseline_mean):
     """Channel-aware retry pass for borderline-quality fits.
+
+    Each per-well retry runs ``pass2_helpers.retry_one_well`` — the
+    canonical retry implementation shared with the Streamlit app's
+    batch loop. Do not inline retry variants here; new retry strategies
+    belong in ``retry_one_well`` so both drivers pick them up. See
+    ARCHITECTURE.md § "The no-divergence rule".
 
     Why a second pass exists: Pass 1 fits each well in isolation
     against generic data-driven bounds. After Pass 1 finishes, we

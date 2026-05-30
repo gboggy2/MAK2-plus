@@ -2106,6 +2106,11 @@ if cycles is not None and fluorescence is not None:
 
             # Pass 1: Fit all samples normally
             # (if resuming into Pass 2, skip Pass 1 entirely)
+            #
+            # The per-well fit is fit_well() — DO NOT inline new preprocessing
+            # or optimizer logic here. Changes to fitting behavior belong in
+            # fit_well.py (or toe_prefit.py for toe stages). See
+            # ARCHITECTURE.md § "The no-divergence rule".
             _skip_pass1 = (_is_resuming and _resume_cp is not None
                            and _cp_current_pass == 'pass2')
             for i, (sample_name, fluor_data) in enumerate(all_samples_to_fit.items()):
@@ -2156,6 +2161,12 @@ if cycles is not None and fluorescence is not None:
             # Strategy: learn per-channel priors from reliable pass-1 fits, then
             # retry every sample that is: (a) high SSR, (b) errored, or
             # (c) has a degenerate k > 0.5 (unrealistic for real qPCR).
+            #
+            # The per-well retry is pass2_helpers.retry_one_well() — DO NOT
+            # inline a new retry variant or bound-construction logic here.
+            # Add new retry strategies inside retry_one_well so the offline
+            # batch (run_batch.run_pass2) gets them too. See ARCHITECTURE.md
+            # § "The no-divergence rule".
             #
             # Key fix vs. the old pass-2:
             #  • F_bg_slope bounds are now data-scale-aware (raw ABI slopes ~2000-5000,
