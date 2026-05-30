@@ -3189,92 +3189,47 @@ if cycles is not None and fluorescence is not None:
                 sys.stdout = captured_output
 
                 try:
-                    _s_floor  = int(np.searchsorted(cycles, first_fit_cycle))
-                    # Same smoothed right-to-left inflection search as batch
-                    _s_full_seg = fluorescence[_s_floor:]
-                    if len(_s_full_seg) >= 5:
-                        _s_raw_g   = np.gradient(_s_full_seg)
-                        _s_kern    = np.ones(5) / 5.0
-                        _s_smooth  = np.convolve(_s_raw_g, _s_kern, mode='same')
-                        _s_gr = float(np.max(_s_smooth) - np.min(_s_smooth))
-                        _s_gf = _s_gr * 0.05
-                        _s_bv = _s_smooth[-1]
-                        _s_bi = len(_s_smooth) - 1
-                        _s_fp = False
-                        for _sj in range(len(_s_smooth) - 2, -1, -1):
-                            if _s_smooth[_sj] > _s_bv:
-                                _s_bv = _s_smooth[_sj]
-                                _s_bi = _sj
-                            elif (_s_bv > _s_gf
-                                  and _s_smooth[_sj] < _s_bv * 0.5):
-                                _s_fp = True
-                                break
-                        _s_ms_off = _s_bi if _s_fp else int(np.argmax(_s_smooth))
-                    elif len(_s_full_seg) >= 2:
-                        _s_ms_off = int(np.argmax(np.gradient(_s_full_seg)))
-                    else:
-                        _s_ms_off = 0
-                    _s_max_sl = _s_floor + _s_ms_off
-                    _single_start = max(_s_floor, _s_max_sl - cycles_before_max)
-                    # Estimate background from purely pre-window cycles
-                    _s_bg_pre  = max(_s_floor, _single_start - 8)
-                    _s_bg_c = cycles[_s_bg_pre:_single_start]
-                    _s_bg_f = fluorescence[_s_bg_pre:_single_start]
-                    if len(_s_bg_c) >= 2:
-                        _s_bg_coeffs = np.polyfit(_s_bg_c, _s_bg_f, 1)
-                        _s_bg_slope  = float(_s_bg_coeffs[0])
-                        _s_bg_int    = float(_s_bg_coeffs[1])
-                    else:
-                        _s_bg_slope = 0.0
-                        _s_bg_int   = float(fluorescence[_single_start]) if _single_start < len(fluorescence) else 0.0
-
-                    # Adaptive extension: extend until at least 3 baseline cycles
-                    # Skip for background-subtracted data (noise ≈ 0)
-                    _s_bl_noise = float(np.std(_s_bg_f)) if len(_s_bg_f) >= 2 else 0.0
-                    _s_bg_mean_abs = float(np.mean(np.abs(_s_bg_f))) if len(_s_bg_f) >= 2 else 0.0
-                    _s_skip_ext = (_s_bl_noise < 1e-6 and _s_bg_mean_abs < 1e-6)
-                    _s_n_bl = 0
-                    if not _s_skip_ext:
-                        for _sbi in range(_single_start, min(_single_start + 6, len(cycles))):
-                            _s_bg_lev = _s_bg_slope * cycles[_sbi] + _s_bg_int
-                            if fluorescence[_sbi] <= _s_bg_lev + 3.0 * _s_bl_noise:
-                                _s_n_bl += 1
-                    else:
-                        _s_n_bl = 3  # skip extension
-                    if _s_n_bl < 3:
-                        _s_try = cycles_before_max
-                        while _s_n_bl < 3 and _s_try < _s_max_sl - _s_floor:
-                            _s_try += 2
-                            _s_try_start = max(_s_floor, _s_max_sl - _s_try)
-                            if _s_try_start == _single_start:
-                                break
-                            _s_n_bl = 0
-                            for _sbi in range(_s_try_start, min(_s_try_start + 6, len(cycles))):
-                                _s_bg_lev = _s_bg_slope * cycles[_sbi] + _s_bg_int
-                                if fluorescence[_sbi] <= _s_bg_lev + 3.0 * _s_bl_noise:
-                                    _s_n_bl += 1
-                            _single_start = _s_try_start
-                        _s_bg_pre = max(_s_floor, _single_start - 8)
-                        _s_bg_c = cycles[_s_bg_pre:_single_start]
-                        _s_bg_f = fluorescence[_s_bg_pre:_single_start]
-                        if len(_s_bg_c) >= 2:
-                            _s_bg_coeffs = np.polyfit(_s_bg_c, _s_bg_f, 1)
-                            _s_bg_slope  = float(_s_bg_coeffs[0])
-                            _s_bg_int    = float(_s_bg_coeffs[1])
-
-                    fitted_params = optimizer.fit(
-                        cycles[_single_start:],
-                        fluorescence[_single_start:],
+                    # Phase-1 unified pipeline. Single-sample mode now runs the
+                    # full per-well fit (no-amp pre-check, take-off detection,
+                    # bg pre-estimation, optimizer, toe stages, Ct, tier). The
+                    # gates below operate on the reconstructed optimizer state.
+                    from fit_well import fit_well as _fit_well_single
+                    _result = _fit_well_single(
+                        cycles, fluorescence,
+                        first_fit_cycle=first_fit_cycle,
+                        cycles_before_max=cycles_before_max,
                         cycles_after_max=cycles_after_max,
                         auto_truncate=auto_truncate,
                         truncate_cycle=truncate_cycle,
-                        bounds=custom_bounds_dict,  # None for automatic, or custom dict
-                        fixed_background_values={
-                            'F_bg_slope': _s_bg_slope,
-                            'F_bg_intercept': _s_bg_int,
-                        },
-                        verbose=True  # Enable progress output
+                        fit_bounds=dict(custom_bounds_dict) if custom_bounds_dict else None,
+                        sample_name='single_sample',
                     )
+                    if _result.get('error') == 'No amplification detected':
+                        sys.stdout = old_stdout
+                        st.warning("No amplification detected in this sample — "
+                                   "signal range is within baseline noise.")
+                        st.stop()
+                    if _result.get('error'):
+                        raise RuntimeError(_result['error'])
+
+                    # Pack fit_well's result into the {fitted_params, optimizer}
+                    # shape the display code at the bottom of this file expects.
+                    fitted_params = {
+                        'D0': _result['D0'], 'k': _result['k'], 'P0': _result['P0'],
+                        'F_bg_intercept': _result['F_bg_intercept'],
+                        'F_bg_slope':     _result['F_bg_slope'],
+                        'tier':           _result['Tier'],
+                    }
+                    _fs_i = int(np.searchsorted(cycles, _result['fit_start_cycle']))
+                    _fe_i = int(np.searchsorted(cycles, _result['fit_end_cycle'])) + 1
+                    optimizer.cycles_fit = cycles[_fs_i:_fe_i]
+                    optimizer.fluorescence_fit = fluorescence[_fs_i:_fe_i]
+                    optimizer.optimal_params = fitted_params
+                    optimizer.metrics = {
+                        'r_squared': _result['R2'], 'rmse': _result['RMSE'],
+                        'ssr': _result['SSR'],
+                        'nrmse': (_result['NRMSE'] / 100.0) if _result['NRMSE'] is not None else None,
+                    }
 
                     # ── Post-fit quality gates (same as batch mode) ──
                     _sq_warnings = []
