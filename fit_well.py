@@ -278,45 +278,77 @@ def fit_well(
     truncate_cycle: float | None = None,
     fit_bounds: dict | None = None,
     verbose: bool = False,
+    # --- per-well metadata / postprocessing inputs (all optional) ---
+    sample_name: str = 'x',
+    metadata: dict | None = None,
+    rox: np.ndarray | None = None,
+    channel_threshold: float | None = None,
+    skip_no_amp_check: bool = False,
 ) -> dict:
-    """Fit one well end-to-end: window selection + bg pre-estimation + MAK2 fit.
+    """Fit one well end-to-end and emit the full per-well result schema.
 
-    Mirrors the inline pipeline in ``run_batch.run_pass1`` (lines
-    ~530-625 as of writing). Returns a per-well result dict shaped
-    like the one ``score_gates.fit_curve`` and ``run_pass1`` produce,
-    so existing gate-application and scoring code can consume it
-    unchanged.
+    This is the *one* per-well fitting entry point — every caller
+    (offline batch, Streamlit batch, Streamlit single-sample, PCRedux
+    scoring) routes through here, so improvements land everywhere at
+    once. Stages:
 
-    Args:
-        cycles: 1-D array of cycle numbers (typically 1..45).
-        fluor_data: 1-D array of fluorescence values, same length as
-            ``cycles``.
-        first_fit_cycle: Smallest cycle that's eligible to be the
-            fit-window start. Defaults to 3 (matches run_batch's
-            ``FIRST_FIT_CYCLE``).
-        cycles_before_max: Default span from the inflection back to
-            the fit-window start. ``adaptive_window_extension``
-            extends this if needed to include ≥3 baseline cycles.
-        cycles_after_max: Cycles past the inflection retained in the
-            fit window (the optimizer's right-truncation knob).
-        auto_truncate: Forwarded to ``optimizer.fit``. Defaults True.
-        truncate_cycle: Optional manual right-truncation cycle.
-        fit_bounds: User-supplied bounds dict merged with the
-            algorithmically-derived ``F_bg_slope`` / ``F_bg_intercept``
-            / ``D0`` bounds (the merge prefers algorithmic for the
-            background pair).
-        verbose: Forwarded to ``optimizer.fit``.
+      1. **No-amp pre-check** (skippable). If signal range < 5 × baseline
+         SD and the tail isn't above baseline + 2σ, the well is recorded
+         with ``error='No amplification detected'`` and skipped.
+      2. **Preprocessing** via ``prepare_fit_inputs`` — take-off detector,
+         background pre-estimate, fit-window placement, bound construction.
+      3. **Toe-prefit Stages 0/1/2** — derive ``D0_toe`` and (if quality
+         clears ``TOE_FIT_R2_MIN``) tighten the optimizer's D0 bounds.
+      4. **MAK2 optimizer** via ``MAK2Optimizer.fit``.
+      5. **Stage 3 toe gate** with one D0-bound-widened retry.
+      6. **Tier classification** (T1-Full / T1-Fixed / T2-LHS / T3-DE).
+      7. **Ct computation** via ``MAK2Optimizer.calculate_ct``, with
+         baseline cycles drawn from ``metadata`` when supplied and ROX
+         normalisation applied when ``rox`` is supplied.
+      8. **Instrument status** ("Determined" / "Undetermined" + NOAMP /
+         EXPFAIL / HIGHSD flags) derived from ``metadata``.
+
+    Args (existing):
+        cycles, fluor_data, first_fit_cycle, cycles_before_max,
+        cycles_after_max, auto_truncate, truncate_cycle, fit_bounds,
+        verbose — see prior docstring.
+
+    Args (postprocessing inputs):
+        sample_name: Recorded in the result dict's ``Sample`` field.
+        metadata: Per-well metadata dict (``{Baseline Start, Baseline
+            End, Ct_instrument, NOAMP, EXPFAIL, HIGHSD}``). When
+            provided, ``Baseline Start``/``End`` anchor Ct's baseline
+            window; ``Ct_instrument`` being NaN forces our Ct to NaN
+            (we don't claim a Ct the instrument couldn't determine).
+        rox: Optional ROX trace (same length as ``cycles``). When
+            provided, fluorescence is divided by ROX before
+            threshold-crossing detection in Ct, correcting per-well
+            volume variation.
+        channel_threshold: Per-channel Ct threshold to pass to
+            ``calculate_ct``. ``None`` lets the optimizer pick.
+        skip_no_amp_check: When True, callers that have already
+            screened for no-amplification suppress the redundant
+            per-well check.
 
     Returns:
-        Per-well result dict matching the shape used downstream by
-        ``run_quality_gates`` and the PCRedux scoring driver:
-        ``R2, D0, k, P0, F_bg_intercept, F_bg_slope,
-        fit_start_cycle, fit_end_cycle, fluor_data, error, Success``.
-        On failure, parameter fields are ``None`` and ``error``
-        carries the exception message.
+        Per-well result dict carrying the full schema run_pass1 and
+        the Streamlit app emit (Sample, Ct, Ct_baseline_*, D0, k, P0,
+        F_bg_intercept, F_bg_slope, R2, RMSE, NRMSE, SSR, Tier,
+        Instrument, Success, FixedBG, Fallback, FallbackOK,
+        bg_slope_est, bg_intercept_est, bl_end_meta, bl_end_est,
+        fit_start_cycle, fit_end_cycle, ct_rox_mean, error,
+        fluor_data) plus the toe-stage diagnostics.
     """
     cycles = np.asarray(cycles, dtype=float)
     fluor_data = np.asarray(fluor_data, dtype=float)
+
+    # Stage 1: no-amplification pre-check. A sigmoid can technically
+    # fit to noise; without this guard low-signal wells produce
+    # meaningless D0 / Ct values that downstream tools take seriously.
+    if not skip_no_amp_check and _is_no_amplification(fluor_data):
+        return _no_amp_result(sample_name, fluor_data)
+
+    bl_end_meta = _baseline_end_from_metadata(cycles, metadata)
 
     prep = prepare_fit_inputs(
         cycles, fluor_data,
@@ -436,33 +468,257 @@ def fit_well(
             if s3.evaluated and not s3.passed:
                 toe_misfit = True
 
+        # Ct + tier + instrument status — the postprocessing that turns
+        # an optimizer dict into a row of the per-well results table.
+        ct_value, ct_baseline, ct_slope, ct_intercept, ct_rox_mean = _compute_ct(
+            cycles, fluor_data, params, metadata, rox, channel_threshold,
+            cycles_after_max=cycles_after_max,
+        )
+        tier = _classify_tier(params)
+        inst_status = _instrument_status(metadata)
+
         return {
-            'Sample': 'x',
-            'R2': metrics['r_squared'],
+            'Sample': sample_name,
+            'Ct': ct_value,
+            'Ct_baseline_mean':      ct_baseline,
+            'Ct_baseline_slope':     ct_slope,
+            'Ct_baseline_intercept': ct_intercept,
             'D0': params['D0'],
             'k':  params['k'],
             'P0': params['P0'],
             'F_bg_intercept': params['F_bg_intercept'],
             'F_bg_slope':     params['F_bg_slope'],
-            'fit_start_cycle': prep['fit_start_cycle'],
-            'fit_end_cycle':   fit_end_cycle,
-            'fluor_data':      fluor_data,
-            'error':           None,
-            'Success':         '✓',
+            'R2':    metrics['r_squared'],
+            'RMSE':  metrics['rmse'],
+            'NRMSE': metrics['nrmse'] * 100,
+            'SSR':   metrics['ssr'],
+            'Tier':       tier,
+            'Instrument': inst_status,
+            'Success':    '✓',
+            'FixedBG':    '✓' if params.get('used_fixed_background', False) else '',
+            'Fallback':   '✓' if params.get('fallback_attempted', False) else '',
+            'FallbackOK': '✓' if params.get('fallback_succeeded', False) else '',
+            'bg_slope_est':     prep['bg_slope_est'],
+            'bg_intercept_est': prep['bg_int_est'],
+            'bl_end_meta':      bl_end_meta,
+            'bl_end_est':       prep['baseline_end_cycle'],
+            'fit_start_cycle':  prep['fit_start_cycle'],
+            'fit_end_cycle':    fit_end_cycle,
+            'ct_rox_mean':      ct_rox_mean,
+            'fluor_data':       fluor_data,
+            'error':            None,
             **_toe_fields(s0, s1, s3, toe_misfit),
         }
     except Exception as e:
-        return {
-            'Sample': 'x',
-            'R2': None, 'D0': None, 'k': None, 'P0': None,
-            'F_bg_intercept': None, 'F_bg_slope': None,
-            'fit_start_cycle': float('nan'),
-            'fit_end_cycle':   float('nan'),
-            'fluor_data':      fluor_data,
-            'error':           str(e),
-            'Success':         '',
-            **_toe_fields(s0, s1, None, False),
-        }
+        return _failed_fit_result(sample_name, fluor_data, e, s0, s1, bl_end_meta)
+
+
+def _is_no_amplification(fluor_data: np.ndarray) -> bool:
+    """Detect wells with no real amplification.
+
+    Two complementary tests: (a) signal range below 5 × baseline SD
+    (the curve hasn't risen meaningfully out of noise), AND (b) the
+    last-5-cycle tail isn't more than 2 σ above the baseline mean (no
+    late-amplifier rescue available). Both must hold to fail the well.
+    """
+    n = len(fluor_data)
+    sd_window = min(12, n // 4)
+    if sd_window < 3:
+        return False
+    bl_sd = float(np.std(fluor_data[:sd_window]))
+    rng   = float(np.max(fluor_data) - np.min(fluor_data))
+    if bl_sd <= 0 or rng >= 5.0 * bl_sd:
+        return False
+    bl_mean   = float(np.mean(fluor_data[:sd_window]))
+    tail_mean = float(np.mean(fluor_data[-5:])) if n >= 5 else 0.0
+    # If the tail is clearly rising above baseline noise we let the well
+    # through — late amplifiers have small overall range but a rising end.
+    return tail_mean <= bl_mean + 2.0 * bl_sd
+
+
+def _baseline_end_from_metadata(cycles: np.ndarray, metadata: dict | None) -> float | None:
+    """Pull the instrument-reported Baseline End cycle from metadata."""
+    if not metadata:
+        return None
+    try:
+        return float(metadata.get('Baseline End'))
+    except (TypeError, ValueError):
+        return None
+
+
+def _baseline_window_from_metadata(
+    cycles: np.ndarray, metadata: dict | None,
+) -> tuple[int, int] | None:
+    """Return (start_idx, end_idx) for the metadata baseline window, or None."""
+    if not metadata:
+        return None
+    try:
+        bl_start = float(metadata.get('Baseline Start'))
+        bl_end   = float(metadata.get('Baseline End'))
+    except (TypeError, ValueError):
+        return None
+    bl_si = int(np.searchsorted(cycles, bl_start))
+    bl_ei = int(np.searchsorted(cycles, bl_end))
+    if bl_ei <= bl_si + 1:
+        return None
+    return (bl_si, bl_ei)
+
+
+def _compute_ct(
+    cycles: np.ndarray,
+    fluor_data: np.ndarray,
+    params: dict,
+    metadata: dict | None,
+    rox: np.ndarray | None,
+    channel_threshold: float | None,
+    *,
+    cycles_after_max: int,
+) -> tuple[float, float, float, float, float | None]:
+    """Compute Ct + baseline params for one well.
+
+    Mirrors ``run_batch.compute_ct``. The fit needs to be re-run on the
+    full trace (the optimizer normally holds only the truncated fit
+    window) so the Ct threshold crossing has access to the entire
+    curve. We refit cheaply using the already-converged parameters as
+    the initial guess.
+
+    Returns ``(ct, ct_baseline_mean, ct_baseline_slope,
+    ct_baseline_intercept, ct_rox_mean)``. Any failure returns NaN ct
+    and zeroed baseline values; a failed Ct is a per-well outcome,
+    not a pipeline error.
+    """
+    try:
+        baseline_cycles = _baseline_window_from_metadata(cycles, metadata)
+
+        if rox is not None and len(rox) == len(fluor_data):
+            fluor_for_ct = fluor_data / np.maximum(rox, 1e-10)
+            ct_rox_mean = float(np.mean(rox))
+            threshold   = channel_threshold
+        else:
+            fluor_for_ct = fluor_data
+            ct_rox_mean  = None
+            # When no ROX, the optimizer picks its own threshold rather
+            # than honouring the channel-specific one (which is calibrated
+            # against ROX-normalised fluorescence on this instrument).
+            threshold = None
+
+        # Re-bind the optimizer to the full trace so calculate_ct sees
+        # every cycle. Using a fresh optimizer + seeding from the
+        # converged params (via bounds collapsed around them) keeps Ct
+        # consistent with the fitted curve.
+        opt = MAK2Optimizer(MAK2Model())
+        opt.cycles_fit = cycles
+        opt.fluorescence_fit = fluor_for_ct
+        opt.optimal_params = params
+
+        ct_results = opt.calculate_ct(
+            method='threshold',
+            threshold=threshold,
+            baseline_cycles=baseline_cycles,
+        )
+
+        # Respect the instrument's "Undetermined" verdict. If the
+        # instrument couldn't pick a Ct, we don't claim one either —
+        # the fitted curve might cross the threshold by accident but
+        # the underlying signal is too weak to trust.
+        if metadata and 'Ct_instrument' in metadata:
+            inst_ct = metadata['Ct_instrument']
+            if inst_ct is None or (isinstance(inst_ct, float) and np.isnan(inst_ct)):
+                return (
+                    float('nan'),
+                    ct_results.get('baseline_mean', 0.0),
+                    ct_results.get('baseline_slope', 0.0),
+                    ct_results.get('baseline_intercept', 0.0),
+                    ct_rox_mean,
+                )
+
+        return (
+            float(ct_results['ct']),
+            float(ct_results.get('baseline_mean', 0.0)),
+            float(ct_results.get('baseline_slope', 0.0)),
+            float(ct_results.get('baseline_intercept', 0.0)),
+            ct_rox_mean,
+        )
+    except Exception:
+        return (float('nan'), 0.0, 0.0, 0.0, None)
+
+
+def _classify_tier(params: dict) -> str:
+    """Map optimizer escalation flags to a tier label."""
+    if params.get('de_used', False):
+        return 'T3-DE'
+    if params.get('fallback_succeeded', False):
+        return 'T2-LHS'
+    if params.get('used_fixed_background', False):
+        return 'T1-Fixed'
+    return 'T1-Full'
+
+
+def _instrument_status(metadata: dict | None) -> str:
+    """Build the 'Determined/Undetermined (FLAG1,FLAG2)' string from metadata."""
+    if not metadata or 'Ct_instrument' not in metadata:
+        return ''
+    inst_ct = metadata['Ct_instrument']
+    undetermined = (
+        inst_ct is None
+        or (isinstance(inst_ct, float) and np.isnan(inst_ct))
+    )
+    flags = [name for name in ('NOAMP', 'EXPFAIL', 'HIGHSD') if metadata.get(name)]
+    status = 'Undetermined' if undetermined else 'Determined'
+    if flags:
+        status += ' (' + ','.join(flags) + ')'
+    return status
+
+
+# Schema fields returned by every fit_well path — used by the no-amp and
+# failed-fit short-return helpers to keep their dict shape in sync with
+# the success path.
+_NAN_FIT_FIELDS = {
+    'Ct': float('nan'),
+    'Ct_baseline_mean': 0.0,
+    'Ct_baseline_slope': 0.0,
+    'Ct_baseline_intercept': 0.0,
+    'D0': None, 'k': None, 'P0': None,
+    'F_bg_intercept': None, 'F_bg_slope': None,
+    'R2': None, 'RMSE': None, 'NRMSE': None, 'SSR': None,
+    'Tier': None, 'Instrument': '',
+    'FixedBG': '', 'Fallback': '', 'FallbackOK': '',
+    'bg_slope_est': None, 'bg_intercept_est': None,
+    'bl_end_est': None,
+    'fit_start_cycle': float('nan'),
+    'fit_end_cycle':   float('nan'),
+    'ct_rox_mean':     None,
+}
+
+
+def _no_amp_result(sample_name: str, fluor_data: np.ndarray) -> dict:
+    """Result dict for wells caught by the no-amplification pre-check."""
+    return {
+        'Sample': sample_name,
+        **_NAN_FIT_FIELDS,
+        'bl_end_meta': None,
+        'Success': '',
+        'error':   'No amplification detected',
+        'fluor_data': fluor_data,
+        # Toe stages didn't run for no-amp wells; emit empty placeholders.
+        **_toe_fields(None, None, None, False),
+    }
+
+
+def _failed_fit_result(
+    sample_name: str, fluor_data: np.ndarray, exc: Exception,
+    s0, s1, bl_end_meta,
+) -> dict:
+    """Result dict for wells whose optimizer raised."""
+    return {
+        'Sample': sample_name,
+        **_NAN_FIT_FIELDS,
+        'bl_end_meta': bl_end_meta,
+        'Success': f'✗ Error: {str(exc)[:30]}',
+        'error':   str(exc),
+        'fluor_data': fluor_data,
+        **_toe_fields(s0, s1, None, False),
+    }
 
 
 def _toe_fields(s0, s1, s3, toe_misfit: bool) -> dict:

@@ -483,202 +483,47 @@ def run_pass1(all_samples_to_fit, cycles, sample_metadata, rox_by_well,
         ``all_samples_to_fit`` produces exactly one entry, including
         failures).
     """
+    from fit_well import fit_well  # local import — fit_well imports back here
+
     results_list = []
     total = len(all_samples_to_fit)
+    fit_bounds_template = dict(CUSTOM_BOUNDS_DICT) if CUSTOM_BOUNDS_DICT else None
 
     for i, (sample_name, fluor_data) in enumerate(all_samples_to_fit.items()):
         print(f"  Pass 1: [{i+1}/{total}] {sample_name}", end="")
         t0 = time.perf_counter()
 
-        try:
-            # No-amplification pre-check
-            na_sd_window = min(12, len(fluor_data) // 4)
-            na_baseline_sd = float(np.std(fluor_data[:na_sd_window])) if na_sd_window >= 3 else 1.0
-            na_range = float(np.max(fluor_data) - np.min(fluor_data))
-            if na_baseline_sd > 0 and na_range < 5.0 * na_baseline_sd:
-                na_baseline_mean = float(np.mean(fluor_data[:na_sd_window])) if na_sd_window >= 3 else 0.0
-                na_tail_mean = float(np.mean(fluor_data[-5:])) if len(fluor_data) >= 5 else 0.0
-                if not (na_tail_mean > na_baseline_mean + 2.0 * na_baseline_sd):
-                    results_list.append({
-                        'Sample': sample_name,
-                        'D0': np.nan, 'k': np.nan, 'P0': np.nan,
-                        'F_bg_intercept': np.nan, 'F_bg_slope': np.nan,
-                        'R2': np.nan, 'SSR': np.nan, 'RMSE': np.nan, 'NRMSE': np.nan,
-                        'Tier': None, 'Instrument': '',
-                        'Ct': np.nan, 'Ct_baseline_mean': np.nan,
-                        'Ct_baseline_slope': np.nan, 'Ct_baseline_intercept': np.nan,
-                        'fit_start_cycle': np.nan, 'fit_end_cycle': np.nan,
-                        'bl_end_meta': np.nan, 'bl_end_est': np.nan,
-                        'ct_rox_mean': np.nan,
-                        'Success': '', 'FixedBG': '', 'Fallback': '', 'FallbackOK': '',
-                        'bg_slope_est': None, 'bg_intercept_est': None,
-                        'error': 'No amplification detected',
-                        'fluor_data': fluor_data,
-                    })
-                    print(f"  → no amplification ({time.perf_counter()-t0:.1f}s)")
-                    continue
+        # Pull per-well postprocessing inputs and let fit_well handle the
+        # full pipeline (no-amp check, preprocessing, optimizer, toe stages,
+        # Ct, tier, instrument status). This is the canonical per-well call.
+        wm = sample_metadata.get(sample_name, {}) if sample_metadata else None
+        ch = _ch(sample_name)
+        ch_thresh = channel_thresholds.get(ch, global_threshold)
+        well_pos = _get_well_pos(sample_name)
+        rox = rox_by_well.get(well_pos) if rox_by_well else None
 
-            model_batch = MAK2Model()
-            optimizer_batch = MAK2Optimizer(model_batch)
+        result = fit_well(
+            cycles, fluor_data,
+            first_fit_cycle=FIRST_FIT_CYCLE,
+            cycles_before_max=CYCLES_BEFORE_MAX,
+            cycles_after_max=CYCLES_AFTER_MAX,
+            auto_truncate=AUTO_TRUNCATE,
+            truncate_cycle=TRUNCATE_CYCLE,
+            fit_bounds=fit_bounds_template,
+            sample_name=sample_name,
+            metadata=wm,
+            rox=rox,
+            channel_threshold=ch_thresh,
+        )
+        results_list.append(result)
 
-            # Background pre-estimation from metadata
-            bg_slope_est = None
-            bg_intercept_est = None
-            fit_bounds = dict(CUSTOM_BOUNDS_DICT) if CUSTOM_BOUNDS_DICT else {}
-
-            if sample_metadata:
-                wm_bg = sample_metadata.get(sample_name, {})
-                bl_start = wm_bg.get('Baseline Start')
-                bl_end = wm_bg.get('Baseline End')
-                try:
-                    bl_si = int(np.searchsorted(cycles, float(bl_start)))
-                    bl_ei = int(np.searchsorted(cycles, float(bl_end)))
-                    if bl_ei > bl_si + 2:
-                        bg_slope_est, bg_intercept_est = pre_estimate_background(
-                            cycles, fluor_data, bl_si, bl_ei
-                        )
-                except (TypeError, ValueError):
-                    pass
-
-            # Smart start
-            floor_idx = int(np.searchsorted(cycles, FIRST_FIT_CYCLE))
-
-            # Baseline-end cycle from metadata (recorded in result dict as bl_end_meta)
-            meta_bl_end_cycle = None
-            if sample_metadata:
-                wm = sample_metadata.get(sample_name, {})
-                meta_bl_end_val = wm.get('Baseline End', None)
-                if meta_bl_end_val is not None:
-                    try:
-                        meta_bl_end_cycle = float(meta_bl_end_val)
-                    except (ValueError, TypeError):
-                        pass
-
-            # Preprocessing (take-off detection, bg pre-estimation, window
-            # selection, bound construction) shared with fit_well. Routes
-            # both fitting paths through one implementation so any future
-            # improvement automatically lands in production batch runs.
-            from fit_well import prepare_fit_inputs  # noqa: E402
-            prep = prepare_fit_inputs(
-                cycles, fluor_data,
-                first_fit_cycle=FIRST_FIT_CYCLE,
-                cycles_before_max=CYCLES_BEFORE_MAX,
-                fit_bounds=fit_bounds,
-            )
-            cycles_fit = prep['cycles_fit']
-            fluor_fit = prep['fluor_fit']
-            _bg_slope_est = prep['bg_slope_est']
-            _bg_int_est = prep['bg_int_est']
-            fit_start_idx = prep['fit_start_idx']
-            est_bl_end_cycle = prep['baseline_end_cycle']
-
-            # Fit
-            params_batch = optimizer_batch.fit(
-                cycles_fit, fluor_fit,
-                cycles_after_max=CYCLES_AFTER_MAX,
-                auto_truncate=AUTO_TRUNCATE,
-                truncate_cycle=TRUNCATE_CYCLE,
-                bounds=prep['merged_bounds'],
-                fixed_background_values=prep['fixed_background_values'],
-                verbose=False,
-            )
-
-            fit_end_cycle = float(optimizer_batch.cycles_fit[-1]) \
-                if optimizer_batch.cycles_fit is not None and len(optimizer_batch.cycles_fit) > 0 \
-                else float(cycles[-1])
-
-            metrics_batch = optimizer_batch.calculate_fit_metrics()
-
-            # Ct computation
-            ct_value, ct_baseline_val, ct_bl_slope, ct_bl_intercept, ct_rox_mean = compute_ct(
-                optimizer_batch, cycles, fluor_data, sample_name, sample_metadata,
-                rox_by_well, channel_thresholds, global_threshold,
-                channel_baseline_means, global_baseline_mean
-            )
-
-            # Tier classification
-            if params_batch.get('de_used', False):
-                tier = 'T3-DE'
-            elif params_batch.get('fallback_succeeded', False):
-                tier = 'T2-LHS'
-            elif params_batch.get('used_fixed_background', False):
-                tier = 'T1-Fixed'
-            else:
-                tier = 'T1-Full'
-
-            # Instrument status
-            inst_status = ''
-            if sample_metadata:
-                wm = sample_metadata.get(sample_name, {})
-                if 'Ct_instrument' in wm:
-                    flags = []
-                    if wm.get('NOAMP'):   flags.append('NOAMP')
-                    if wm.get('EXPFAIL'): flags.append('EXPFAIL')
-                    if wm.get('HIGHSD'):  flags.append('HIGHSD')
-                    inst_ct = wm.get('Ct_instrument')
-                    inst_undetermined = (
-                        inst_ct is None
-                        or (isinstance(inst_ct, float) and np.isnan(inst_ct))
-                    )
-                    inst_status = ('Undetermined' if inst_undetermined else 'Determined')
-                    if flags:
-                        inst_status += ' (' + ','.join(flags) + ')'
-
-            r2 = metrics_batch['r_squared']
-            results_list.append({
-                'Sample': sample_name,
-                'Ct': ct_value,
-                'Ct_baseline_mean': ct_baseline_val,
-                'Ct_baseline_slope': ct_bl_slope,
-                'Ct_baseline_intercept': ct_bl_intercept,
-                'D0': params_batch['D0'],
-                'k': params_batch['k'],
-                'P0': params_batch['P0'],
-                'F_bg_intercept': params_batch['F_bg_intercept'],
-                'F_bg_slope': params_batch['F_bg_slope'],
-                'R2': r2,
-                'RMSE': metrics_batch['rmse'],
-                'NRMSE': metrics_batch['nrmse'] * 100,
-                'SSR': metrics_batch['ssr'],
-                'Tier': tier,
-                'Instrument': inst_status,
-                'Success': '✓',
-                'FixedBG': '✓' if params_batch.get('used_fixed_background', False) else '',
-                'Fallback': '✓' if params_batch.get('fallback_attempted', False) else '',
-                'FallbackOK': '✓' if params_batch.get('fallback_succeeded', False) else '',
-                'bg_slope_est': bg_slope_est,
-                'bg_intercept_est': bg_intercept_est,
-                'bl_end_meta': meta_bl_end_cycle,
-                'bl_end_est': est_bl_end_cycle,
-                'fit_start_cycle': float(cycles[fit_start_idx]),
-                'fit_end_cycle': fit_end_cycle,
-                'ct_rox_mean': ct_rox_mean,
-                'fluor_data': fluor_data,
-            })
-            elapsed = time.perf_counter() - t0
-            print(f"  → R²={r2:.4f} k={params_batch['k']:.4f} ({elapsed:.1f}s)")
-
-        except Exception as e:
-            results_list.append({
-                'Sample': sample_name,
-                'Ct': np.nan,
-                'Ct_baseline_mean': 0.0,
-                'Ct_baseline_slope': 0.0,
-                'Ct_baseline_intercept': 0.0,
-                'D0': None, 'k': None, 'P0': None,
-                'F_bg_intercept': None, 'F_bg_slope': None,
-                'R2': None, 'SSR': None, 'RMSE': None, 'NRMSE': None,
-                'Tier': None, 'Instrument': '',
-                'Success': f'✗ Error: {str(e)[:30]}',
-                'FixedBG': '', 'Fallback': '', 'FallbackOK': '',
-                'bg_slope_est': None, 'bg_intercept_est': None,
-                'bl_end_meta': None, 'bl_end_est': None,
-                'fit_start_cycle': np.nan, 'fit_end_cycle': np.nan,
-                'ct_rox_mean': np.nan,
-                'error': str(e),
-                'fluor_data': fluor_data,
-            })
-            print(f"  → ERROR: {e}")
+        elapsed = time.perf_counter() - t0
+        if result.get('error') == 'No amplification detected':
+            print(f"  → no amplification ({elapsed:.1f}s)")
+        elif result.get('Success') == '✓':
+            print(f"  → R²={result['R2']:.4f} k={result['k']:.4f} ({elapsed:.1f}s)")
+        else:
+            print(f"  → ERROR: {result.get('error', 'unknown')}")
 
     return results_list
 
