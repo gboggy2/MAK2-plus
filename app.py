@@ -471,19 +471,9 @@ def _add_dilution_chart(ws, df, data_rows):
 # HELPERS
 # ============================================================================
 
-def _ch(name):
-    """Return the channel prefix of a sample name.
-    'FAM_A1' → 'FAM', 'target::well' → 'target', else 'default'."""
-    if '::' in name: return name.split('::')[0]
-    if '_'  in name: return name.split('_')[0]
-    return 'default'
-
-def _get_well_pos(name):
-    """Extract bare well position from a sample name.
-    'FAM_A1' → 'A1', 'target::A1' → 'A1', 'A1' → 'A1'."""
-    if '::' in name: return name.split('::')[1] if len(name.split('::')) > 1 else name
-    if '_'  in name: return '_'.join(name.split('_')[1:]) if len(name.split('_')) > 1 else name
-    return name
+# Sample-name parsing helpers live in pass2_helpers (canonical implementation
+# shared with run_batch.py).
+from pass2_helpers import channel_of as _ch, well_pos_of as _get_well_pos  # noqa: E402
 
 
 # ============================================================================

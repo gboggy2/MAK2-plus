@@ -35,13 +35,37 @@ import numpy as np
 HOPELESS_R2 = 0.85
 
 
-def _channel_of(name: str) -> str:
-    """Channel prefix extraction matching app.py / run_batch.py helpers."""
+def channel_of(name: str) -> str:
+    """Extract the channel prefix from a composite sample name.
+
+    Sample names from multi-channel plates are ``"{channel}::{well}"`` or
+    ``"{channel}_{well}"``. Plain well names get ``'default'``. Canonical
+    implementation imported by both app.py and run_batch.
+    """
     if '::' in name:
         return name.split('::')[0]
     if '_' in name:
         return name.split('_')[0]
     return 'default'
+
+
+def well_pos_of(name: str) -> str:
+    """Extract the bare well position (``A1``, ``H12``…) from a composite name.
+
+    Inverse of ``channel_of``: returns the well part of
+    ``"{channel}::{well}"`` or ``"{channel}_{well}"``. Falls back to
+    the input itself for plain names.
+    """
+    if '::' in name:
+        parts = name.split('::')
+        return parts[1] if len(parts) > 1 else name
+    if '_' in name:
+        parts = name.split('_')
+        return '_'.join(parts[1:]) if len(parts) > 1 else name
+    return name
+
+
+_channel_of = channel_of  # internal alias used by compute_channel_priors below
 
 
 def compute_channel_priors(results_list: list[dict]) -> tuple[dict, dict]:

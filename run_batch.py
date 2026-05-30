@@ -101,34 +101,10 @@ REPLICATE_GROUPING = "sample_name"
 
 # ── Helper functions ───────────���──────────────────────────────────────────────
 
-def _ch(name):
-    """Extract the channel prefix from a composite sample name.
-
-    Sample names from multi-channel ABI plates are ``"{channel}::{well}"``
-    or ``"{channel}_{well}"``; this returns the channel part. Falls
-    back to ``'default'`` for plain well names.
-
-    NOTE: an identical helper is defined in ``app.py``. The
-    duplication is tracked as a Phase-1 unification task — see
-    CLAUDE.md.
-    """
-    if '::' in name: return name.split('::')[0]
-    if '_'  in name: return name.split('_')[0]
-    return 'default'
-
-def _get_well_pos(name):
-    """Extract the bare well position (``A1``, ``H12`` …) from a composite sample name.
-
-    Inverse of ``_ch``: returns the well part of
-    ``"{channel}::{well}"`` or ``"{channel}_{well}"``. Falls back to
-    the input itself for plain names.
-
-    Also duplicated in ``app.py`` — see CLAUDE.md Phase-1
-    unification.
-    """
-    if '::' in name: return name.split('::')[1] if len(name.split('::')) > 1 else name
-    if '_'  in name: return '_'.join(name.split('_')[1:]) if len(name.split('_')) > 1 else name
-    return name
+# Sample-name parsing helpers live in pass2_helpers (canonical implementation
+# shared with app.py). Re-exported under the legacy private names so that the
+# many call sites in this module don't need to be renamed.
+from pass2_helpers import channel_of as _ch, well_pos_of as _get_well_pos  # noqa: E402
 
 def pre_estimate_background(cycles, fluor, bl_start_idx, bl_end_idx):
     """Linear regression over a baseline window — local copy of the canonical helper.
