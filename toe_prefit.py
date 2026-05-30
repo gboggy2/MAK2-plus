@@ -133,30 +133,53 @@ def stage1_toe_fit(
             toe_window_start=float(cyc[0]), toe_window_end=float(cyc[-1]),
         )
 
-    pos = F_corr > 0
-    if int(pos.sum()) < 3:
+    # Linear-space one-parameter fit (was log-space until 2026-05).
+    #
+    # Model: F_corr(n) = D0_toe * 2^n, with r = 2 fixed by the MAK2 toe-
+    # limit physics. Linear-in-D0_toe → solved analytically by OLS
+    # through origin on the transformed variable m_i = 2^(n_i - n_ref):
+    #
+    #     F_corr_i = (D0_toe * 2^n_ref) * m_i  =:  beta * m_i
+    #     beta_hat = sum(F_corr_i * m_i) / sum(m_i^2)
+    #     D0_toe   = beta_hat / 2^n_ref
+    #
+    # The n_ref shift is purely for numerical hygiene (keeps m_i values
+    # in the range [1, 2^window_cycles] instead of [2^13, 2^17] for a
+    # typical toe). The estimator is mathematically identical.
+    #
+    # Why linear space (the old log-space fit's failure mode): log(F)
+    # amplifies low-signal noise enormously — a 0.005 RFU baseline-
+    # subtraction error on a F=0.01 point becomes a ±0.5 swing in
+    # log2(F), dominating the slope fit. In linear space the same error
+    # stays a 0.005 RFU residual with leverage proportional only to its
+    # distance from the fit line. The change also lets us include
+    # cycles where F_corr <= 0 (which log() can't represent), so n_pts
+    # equals the configured window size.
+    n = cyc
+    y = F_corr
+    n_ref = float(n[0])
+    m = np.power(2.0, n - n_ref)
+    denom = float(np.sum(m * m))
+    if denom <= 0:
         return Stage1Result(
-            success=False, snr=snr, reason="<3 positive bg-corrected toe points",
+            success=False, snr=snr, reason="degenerate fit window",
+            toe_window_start=float(cyc[0]), toe_window_end=float(cyc[-1]),
+        )
+    beta = float(np.sum(y * m) / denom)
+    D0_toe = beta / (2.0 ** n_ref)
+
+    # If the fit collapsed to a non-positive D0 (only possible when most
+    # toe-window points are negative — i.e. nearly pure noise), skip
+    # Stage 1 rather than hand the optimizer a bogus prior.
+    if not np.isfinite(D0_toe) or D0_toe <= 0:
+        return Stage1Result(
+            success=False, snr=snr, reason="fit returned non-positive D0",
             toe_window_start=float(cyc[0]), toe_window_end=float(cyc[-1]),
         )
 
-    n = cyc[pos]
-    # Model: F = D0_toe * 2^n, fit in log2 space with slope fixed at 1:
-    #   log2(F) = log2(D0_toe) + n  =>  log2(D0_toe) = mean(log2(F) - n).
-    # Subtracting n[0] before averaging keeps the arithmetic in a moderate
-    # magnitude range; the back-shift recovers D0_toe at n=0 so it is
-    # directly comparable to (and usable as a prior on) the MAK2 optimizer's
-    # D0, which is defined at cycle 0.
-    y = np.log2(F_corr[pos])
-    n_ref = float(n[0])
-    offset = n - n_ref
-    log2_D0_at_ref = float(np.mean(y - offset))
-    log2_D0 = log2_D0_at_ref - n_ref  # back-shift to n=0 reference frame
-    D0_toe = float(2.0 ** log2_D0)
-
-    # R^2 of the one-parameter fit in log2 space (computed at n_ref for
-    # numerical stability; the R^2 value itself is shift-invariant).
-    y_hat = log2_D0_at_ref + offset
+    # R^2 in linear F space — directly comparable to Stage 3's
+    # toe_rel_residual (both live in raw bg-corrected fluorescence units).
+    y_hat = beta * m
     ss_res = float(np.sum((y - y_hat) ** 2))
     ss_tot = float(np.sum((y - np.mean(y)) ** 2))
     toe_fit_r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 1.0
@@ -167,7 +190,7 @@ def stage1_toe_fit(
         toe_fit_r2=toe_fit_r2,
         toe_window_start=float(cyc[0]),
         toe_window_end=float(cyc[-1]),
-        n_points=int(pos.sum()),
+        n_points=int(len(n)),
         snr=snr,
     )
 
