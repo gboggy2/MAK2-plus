@@ -536,8 +536,10 @@ def run_pass2(results_list, cycles, sample_metadata, rox_by_well,
     Returns:
         The (mutated) ``results_list``.
     """
-    from pass2_helpers import compute_channel_priors, identify_retry_candidates
-    last_cyc = float(cycles[-1])
+    from pass2_helpers import (
+        compute_channel_priors, identify_retry_candidates, retry_one_well,
+    )
+    last_cyc = float(cycles[-1])  # noqa: F841 — kept for readability of summary line
 
     # Channel-prior stats + retry-candidate identification — shared
     # canonical implementation used by both this driver and app.py.
@@ -553,382 +555,37 @@ def run_pass2(results_list, cycles, sample_metadata, rox_by_well,
           f"({len(channel_medians)} channel(s) learned)")
 
     for idx in retry_indices:
-        retry_t0 = time.perf_counter()
         result = results_list[idx]
-        sample_name = result['Sample']
-        fluor_data = result['fluor_data']
-        if fluor_data is None:
-            continue
-
-        pass1_late = (
-            result.get('fit_end_cycle') is not None
-            and result['fit_end_cycle'] >= last_cyc - min(max(1, CYCLES_AFTER_MAX), 5)
-        )
-        RETRY_TIMEOUT = 10.0 if pass1_late else 30.0
+        sample_name = result.get('Sample', '?')
+        retry_t0 = time.perf_counter()
 
         ch = _ch(sample_name)
         priors = channel_medians.get(ch, plate_medians)
-        pk = priors['k']
-        pP0 = priors['P0']
-        pFbg = priors['F_bg_intercept']
-        pSlope = priors['F_bg_slope']
-
-        bg_slope_est_r = result.get('bg_slope_est')
-        bg_intercept_est_r = result.get('bg_intercept_est')
+        wm = sample_metadata.get(sample_name, {}) if sample_metadata else None
+        well_pos = _get_well_pos(sample_name)
+        rox = rox_by_well.get(well_pos) if rox_by_well else None
+        ch_thresh = (channel_thresholds.get(ch, global_threshold)
+                     if channel_thresholds else global_threshold)
 
         print(f"    [{idx}] {sample_name} (R²={result.get('R2', 'None')})", end="")
-
-        try:
-            model_retry = MAK2Model()
-            optimizer_retry = MAK2Optimizer(model_retry)
-
-            F_max = float(np.max(fluor_data))
-            F_range_r = float(np.max(fluor_data) - np.min(fluor_data))
-
-            # Background bounds
-            if bg_slope_est_r is not None and bg_intercept_est_r is not None:
-                slope_margin = max(abs(bg_slope_est_r) * 0.40, F_range_r * 0.01)
-                int_margin = max(abs(bg_intercept_est_r) * 0.15, F_max * 0.02)
-                bg_slope_bounds = (bg_slope_est_r - slope_margin, bg_slope_est_r + slope_margin)
-                bg_int_bounds = (max(0.0, bg_intercept_est_r - int_margin), bg_intercept_est_r + int_margin)
-            else:
-                slope_delta = max(abs(pSlope) * 3.0, F_range_r * 0.05)
-                bg_slope_bounds = (pSlope - slope_delta, pSlope + slope_delta)
-                fbg_lo = max(0.0, pFbg * 0.30)
-                fbg_hi = pFbg * 3.0 if pFbg > 0 else F_max
-                bg_int_bounds = (fbg_lo, fbg_hi)
-
-            informed_bounds = {
-                'k': (max(0.01, pk * 0.20), min(1.0, max(0.5, pk * 5.0))),
-                'P0': (max(pP0 * 0.05, F_range_r * 0.01), max(pP0 * 7.0, F_range_r * 2.0)),
-                'D0': (1e-15, F_range_r * 10),
-                'F_bg_intercept': bg_int_bounds,
-                'F_bg_slope': bg_slope_bounds,
-            }
-
-            # Smart start for retry
-            r_floor = int(np.searchsorted(cycles, FIRST_FIT_CYCLE))
-
-            # Metadata baseline-end cycle (recorded in result dict as bl_end_meta)
-            r_meta_bl_end_cycle = None
-            if sample_metadata:
-                r_wm = sample_metadata.get(sample_name, {})
-                r_meta_bl_end_val = r_wm.get('Baseline End', None)
-                if r_meta_bl_end_val is not None:
-                    try:
-                        r_meta_bl_end_cycle = float(r_meta_bl_end_val)
-                    except (ValueError, TypeError):
-                        pass
-
-            # Algorithmic baseline end for retry
-            well_pos = _get_well_pos(sample_name)
-            rox_arr = rox_by_well.get(well_pos, None)
-            if rox_arr is not None and len(rox_arr) == len(fluor_data):
-                fluor_for_bl = fluor_data / np.maximum(rox_arr, 1e-10)
-            else:
-                fluor_for_bl = fluor_data
-            r_est_bl_end_idx = estimate_baseline_end(cycles, fluor_for_bl, first_cycle_idx=r_floor)
-            r_est_bl_end_cycle = float(cycles[min(r_est_bl_end_idx, len(cycles) - 1)])
-
-            retry_start_idx, r_max_slope_idx = smart_start(
-                fluor_data, cycles, r_floor, CYCLES_BEFORE_MAX
-            )
-
-            # Background for retry
-            r_bg_pre_start = max(r_floor, retry_start_idx - 8)
-            r_bg_c = cycles[r_bg_pre_start:retry_start_idx]
-            r_bg_f = fluor_data[r_bg_pre_start:retry_start_idx]
-            if len(r_bg_c) >= 2:
-                r_bg_coeffs = np.polyfit(r_bg_c, r_bg_f, 1)
-                r_bg_slope_win = float(r_bg_coeffs[0])
-                r_bg_int_win = float(r_bg_coeffs[1])
-            else:
-                r_bg_slope_win = 0.0
-                r_bg_int_win = float(fluor_data[retry_start_idx]) if retry_start_idx < len(fluor_data) else 0.0
-
-            # Adaptive extension for retry
-            retry_start_idx, r_bg_slope_win, r_bg_int_win = adaptive_window_extension(
-                fluor_data, cycles, retry_start_idx, r_max_slope_idx,
-                r_floor, CYCLES_BEFORE_MAX, r_bg_slope_win, r_bg_int_win
-            )
-
-            cycles_retry = cycles[retry_start_idx:]
-            fluor_retry = fluor_data[retry_start_idx:]
-
-            r_sm = max(abs(r_bg_slope_win) * 0.40, F_range_r * 0.002)
-            r_s_min = r_bg_slope_win - r_sm
-            r_s_max = r_bg_slope_win + r_sm
-            r_int_delta = max(abs(r_bg_int_win) * 0.005, F_range_r * 0.03)
-            r_int_lo = r_bg_int_win - r_int_delta
-            r_int_hi = r_bg_int_win + r_int_delta
-            informed_bounds['D0'] = (1e-8, max(F_range_r, 1.0))
-            informed_bounds['F_bg_slope'] = (r_s_min, r_s_max)
-            informed_bounds['F_bg_intercept'] = (r_int_lo, r_int_hi)
-
-            # Late-amp enhancement
-            pass1_r2 = result.get('R2')
-            pass1_failed = (pass1_r2 is None
-                            or (isinstance(pass1_r2, float) and (np.isnan(pass1_r2) or pass1_r2 < 0.90)))
-            if pass1_late and pass1_failed:
-                try:
-                    la_est, la_bounds = estimate_MAK2_params_from_exponential(
-                        cycles_retry, fluor_retry,
-                        P0_assumed=pP0 if pP0 > 0 else 1.0,
-                        verbose=False,
-                    )
-                    if 'D0' in la_bounds:
-                        informed_bounds['D0'] = la_bounds['D0']
-                    if 'k' in la_bounds:
-                        la_k_lo = max(0.01, la_bounds['k'][0] * 0.5)
-                        la_k_hi = min(1.2, la_bounds['k'][1] * 2.0)
-                        informed_bounds['k'] = (la_k_lo, la_k_hi)
-                except Exception:
-                    pass
-
-            # Initial retry fit
-            retry_cam = CYCLES_AFTER_MAX + 3
-            params_retry = optimizer_retry.fit(
-                cycles_retry, fluor_retry,
-                cycles_after_max=retry_cam,
-                auto_truncate=AUTO_TRUNCATE,
-                truncate_cycle=TRUNCATE_CYCLE,
-                bounds=informed_bounds,
-                fixed_background_values={
-                    'F_bg_slope': r_bg_slope_win,
-                    'F_bg_intercept': r_bg_int_win,
-                },
-                verbose=False,
-            )
-            fit_end_cycle_r = float(optimizer_retry.cycles_fit[-1]) \
-                if optimizer_retry.cycles_fit is not None and len(optimizer_retry.cycles_fit) > 0 \
-                else float(cycles[-1])
-            metrics_retry = optimizer_retry.calculate_fit_metrics()
-
-            retry_is_late = (fit_end_cycle_r >= last_cyc - min(max(1, CYCLES_AFTER_MAX), 5))
-            r2_target = 0.999
-
-            # Ct for retry
-            ct_retry, ct_baseline_retry, ct_bl_slope_retry, ct_bl_intercept_retry, ct_rox_mean_r = compute_ct(
-                optimizer_retry, cycles, fluor_data, sample_name, sample_metadata,
-                rox_by_well, channel_thresholds, global_threshold,
-                channel_baseline_means, global_baseline_mean
-            )
-
-            # Track best result
-            original_r2 = result.get('R2')
-            retry_r2 = metrics_retry['r_squared']
-            best_r2 = original_r2 if original_r2 is not None else -999.0
-            best_result = None
-            retry_better = (
-                original_r2 is None
-                or (retry_r2 is not None and original_r2 is not None and retry_r2 > original_r2)
-            )
-
-            if retry_better:
-                best_r2 = retry_r2 if retry_r2 is not None else best_r2
-                best_result = {
-                    'params': params_retry, 'metrics': metrics_retry,
-                    'optimizer': optimizer_retry, 'start_idx': retry_start_idx,
-                    'fit_end': fit_end_cycle_r, 'ct': ct_retry,
-                    'ct_bl_mean': ct_baseline_retry, 'ct_bl_slope': ct_bl_slope_retry,
-                    'ct_bl_int': ct_bl_intercept_retry, 'ct_rox_mean': ct_rox_mean_r,
-                }
-
-            retry_stage = 'initial-retry'
-            retry_attempts = 1
-            retry_timed_out = False
-
-            # Window variations
-            if best_r2 < r2_target and time.perf_counter() - retry_t0 < RETRY_TIMEOUT:
-                retry_stage = 'window-variations'
-                win_variations = [
-                    (CYCLES_BEFORE_MAX, CYCLES_AFTER_MAX),
-                    (CYCLES_BEFORE_MAX, max(3, CYCLES_AFTER_MAX - 1)),
-                    (CYCLES_BEFORE_MAX + 4, CYCLES_AFTER_MAX),
-                    (CYCLES_BEFORE_MAX + 8, CYCLES_AFTER_MAX),
-                    (CYCLES_BEFORE_MAX, CYCLES_AFTER_MAX + 3),
-                    (CYCLES_BEFORE_MAX - 2, CYCLES_AFTER_MAX + 3),
-                    (CYCLES_BEFORE_MAX + 4, CYCLES_AFTER_MAX + 3),
-                    (CYCLES_BEFORE_MAX - 4, CYCLES_AFTER_MAX),
-                ]
-                for wv_before, wv_cam in win_variations:
-                    wv_before = max(3, wv_before)
-                    wv_start = max(r_floor, r_max_slope_idx - wv_before)
-                    wv_c = cycles[wv_start:]
-                    wv_f = fluor_data[wv_start:]
-
-                    wv_bg_pre = max(r_floor, wv_start - 6)
-                    wv_bg_post = min(len(cycles), wv_start + 2)
-                    wv_bg_c = cycles[wv_bg_pre:wv_bg_post]
-                    wv_bg_f = fluor_data[wv_bg_pre:wv_bg_post]
-                    if len(wv_bg_c) >= 2:
-                        wv_coeffs = np.polyfit(wv_bg_c, wv_bg_f, 1)
-                        wv_slope = float(wv_coeffs[0])
-                        wv_int = float(wv_coeffs[1])
-                    else:
-                        wv_slope = 0.0
-                        wv_int = float(wv_f[0]) if len(wv_f) else 0.0
-
-                    wv_sm = max(abs(wv_slope) * 0.40, F_range_r * 0.002)
-                    wv_id = max(abs(wv_int) * 0.005, F_range_r * 0.03)
-                    wv_bounds = dict(informed_bounds)
-                    wv_bounds['D0'] = (1e-8, max(F_range_r, 1.0))
-                    wv_bounds['F_bg_slope'] = (wv_slope - wv_sm, wv_slope + wv_sm)
-                    wv_bounds['F_bg_intercept'] = (wv_int - wv_id, wv_int + wv_id)
-
-                    try:
-                        wv_model = MAK2Model()
-                        wv_opt = MAK2Optimizer(wv_model)
-                        wv_params = wv_opt.fit(
-                            wv_c, wv_f,
-                            cycles_after_max=wv_cam,
-                            auto_truncate=AUTO_TRUNCATE,
-                            truncate_cycle=TRUNCATE_CYCLE,
-                            bounds=wv_bounds,
-                            fixed_background_values={
-                                'F_bg_slope': wv_slope,
-                                'F_bg_intercept': wv_int,
-                            },
-                            verbose=False,
-                        )
-                        wv_metrics = wv_opt.calculate_fit_metrics()
-                        wv_r2 = wv_metrics['r_squared']
-                        if wv_r2 is not None and wv_r2 > best_r2:
-                            best_r2 = wv_r2
-                            wv_fe = float(wv_opt.cycles_fit[-1]) \
-                                if wv_opt.cycles_fit is not None and len(wv_opt.cycles_fit) > 0 \
-                                else float(cycles[-1])
-                            best_result = {
-                                'params': wv_params, 'metrics': wv_metrics,
-                                'optimizer': wv_opt, 'start_idx': wv_start,
-                                'fit_end': wv_fe, 'ct': ct_retry,
-                                'ct_bl_mean': ct_baseline_retry,
-                                'ct_bl_slope': ct_bl_slope_retry,
-                                'ct_bl_int': ct_bl_intercept_retry,
-                                'ct_rox_mean': ct_rox_mean_r,
-                            }
-                            if best_r2 >= r2_target:
-                                break
-                    except Exception:
-                        pass
-                    retry_attempts += 1
-                    if time.perf_counter() - retry_t0 >= RETRY_TIMEOUT:
-                        retry_timed_out = True
-                        break
-
-            # k relaxation
-            if (best_r2 < r2_target and not retry_timed_out
-                    and time.perf_counter() - retry_t0 < RETRY_TIMEOUT):
-                retry_stage = 'k-relaxation'
-                retry_attempts += 1
-                cur_k = (best_result['params']['k'] if best_result else params_retry.get('k'))
-                k_lo = informed_bounds['k'][0]
-                if cur_k is not None and cur_k < k_lo * 1.5:
-                    relax_bounds = dict(informed_bounds)
-                    relax_bounds['k'] = (0.001, relax_bounds['k'][1])
-                    relax_bounds['D0'] = (1e-15, max(F_range_r * 10, 1.0))
-                    relax_bounds['F_bg_slope'] = (r_s_min, r_s_max)
-                    relax_bounds['F_bg_intercept'] = (r_int_lo, r_int_hi)
-                    try:
-                        rk_model = MAK2Model()
-                        rk_opt = MAK2Optimizer(rk_model)
-                        rk_params = rk_opt.fit(
-                            cycles_retry, fluor_retry,
-                            cycles_after_max=retry_cam,
-                            auto_truncate=AUTO_TRUNCATE,
-                            truncate_cycle=TRUNCATE_CYCLE,
-                            bounds=relax_bounds,
-                            fixed_background_values={
-                                'F_bg_slope': r_bg_slope_win,
-                                'F_bg_intercept': r_bg_int_win,
-                            },
-                            verbose=False,
-                        )
-                        rk_metrics = rk_opt.calculate_fit_metrics()
-                        rk_r2 = rk_metrics['r_squared']
-                        if rk_r2 is not None and rk_r2 > best_r2:
-                            best_r2 = rk_r2
-                            rk_fe = float(rk_opt.cycles_fit[-1]) \
-                                if rk_opt.cycles_fit is not None and len(rk_opt.cycles_fit) > 0 \
-                                else float(cycles[-1])
-                            best_result = {
-                                'params': rk_params, 'metrics': rk_metrics,
-                                'optimizer': rk_opt, 'start_idx': retry_start_idx,
-                                'fit_end': rk_fe, 'ct': ct_retry,
-                                'ct_bl_mean': ct_baseline_retry,
-                                'ct_bl_slope': ct_bl_slope_retry,
-                                'ct_bl_int': ct_bl_intercept_retry,
-                                'ct_rox_mean': ct_rox_mean_r,
-                            }
-                    except Exception:
-                        pass
-
-            # Accept best result
-            if best_result is not None and (original_r2 is None or best_r2 > original_r2):
-                br = best_result
-                results_list[idx] = {
-                    'Sample': sample_name,
-                    'Ct': br['ct'],
-                    'Ct_baseline_mean': br['ct_bl_mean'],
-                    'Ct_baseline_slope': br['ct_bl_slope'],
-                    'Ct_baseline_intercept': br['ct_bl_int'],
-                    'D0': br['params']['D0'],
-                    'k': br['params']['k'],
-                    'P0': br['params']['P0'],
-                    'F_bg_intercept': br['params']['F_bg_intercept'],
-                    'F_bg_slope': br['params']['F_bg_slope'],
-                    'R2': br['metrics']['r_squared'],
-                    'RMSE': br['metrics']['rmse'],
-                    'NRMSE': br['metrics']['nrmse'] * 100,
-                    'SSR': br['metrics']['ssr'],
-                    'Tier': result.get('Tier'),
-                    'Instrument': result.get('Instrument', ''),
-                    'Success': ('✓ (window-retry)' if best_r2 >= 0.999
-                                else ('✓ (late-amp)' if retry_is_late and best_r2 >= 0.995
-                                      else ('⚠️ timeout@' + retry_stage if retry_timed_out
-                                            else ('✓ (noisy data)' if best_r2 >= 0.995
-                                                  else '⚠️ R² below target')))),
-                    'retry_stage': retry_stage,
-                    'retry_attempts': retry_attempts,
-                    'FixedBG': '', 'Fallback': '', 'FallbackOK': '',
-                    'bg_slope_est': bg_slope_est_r,
-                    'bg_intercept_est': bg_intercept_est_r,
-                    'bl_end_meta': r_meta_bl_end_cycle,
-                    'bl_end_est': r_est_bl_end_cycle,
-                    'fit_start_cycle': float(cycles[br['start_idx']]),
-                    'fit_end_cycle': br['fit_end'],
-                    'ct_rox_mean': br['ct_rox_mean'],
-                    'fluor_data': fluor_data,
-                }
-                elapsed = time.perf_counter() - retry_t0
-                print(f"  → R²={best_r2:.4f} ({elapsed:.1f}s)")
-            else:
-                # Keep original
-                orig_r2 = result.get('R2')
-                orig_fe = result.get('fit_end_cycle')
-                orig_late = (orig_fe is not None
-                             and not (isinstance(orig_fe, float) and np.isnan(orig_fe))
-                             and float(orig_fe) >= last_cyc - min(max(1, CYCLES_AFTER_MAX), 5))
-                orig_r2_thr = 0.995 if orig_late else 0.999
-                if orig_r2 is not None and orig_r2 >= orig_r2_thr:
-                    results_list[idx]['Success'] = '✓'
-                else:
-                    orig_k = result.get('k')
-                    if orig_k is not None and orig_k > 0.5:
-                        results_list[idx]['Success'] = '⚠️ Degenerate k'
-                    elif orig_r2 is not None and orig_r2 >= 0.995:
-                        results_list[idx]['Success'] = '✓ (noisy data)'
-                    else:
-                        results_list[idx]['Success'] = '⚠️ R² below target'
-                elapsed = time.perf_counter() - retry_t0
-                print(f"  → kept original ({elapsed:.1f}s)")
-
-        except Exception as e:
-            if result['k'] is None:
-                results_list[idx]['Success'] = f'✗ Error: {str(e)[:30]}'
-            else:
-                results_list[idx]['Success'] = '⚠️ Retry failed'
-            print(f"  → retry error: {e}")
+        new_result = retry_one_well(
+            result, priors, cycles,
+            metadata=wm, rox=rox, channel_threshold=ch_thresh,
+            first_fit_cycle=FIRST_FIT_CYCLE,
+            cycles_before_max=CYCLES_BEFORE_MAX,
+            cycles_after_max=CYCLES_AFTER_MAX,
+            auto_truncate=AUTO_TRUNCATE,
+            truncate_cycle=TRUNCATE_CYCLE,
+        )
+        results_list[idx] = new_result
+        elapsed = time.perf_counter() - retry_t0
+        new_r2 = new_result.get('R2')
+        if new_r2 is None:
+            print(f"  → retry skipped ({elapsed:.1f}s)")
+        elif new_r2 != result.get('R2'):
+            print(f"  → R²={new_r2:.4f} ({elapsed:.1f}s)")
+        else:
+            print(f"  → kept original ({elapsed:.1f}s)")
 
     return results_list
 
