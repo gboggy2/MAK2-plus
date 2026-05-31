@@ -87,7 +87,7 @@ FIRST_FIT_CYCLE = 3
 # linear fit and a MAK2 sigmoid fit score equally well on the short
 # pre-inflection window. Adding ~5 more baseline cycles widens the
 # discrimination gap and recovers the borderline late amplifiers.
-CYCLES_BEFORE_MAX = 15
+CYCLES_BEFORE_MAX = 18
 CYCLES_AFTER_MAX = 4
 AUTO_TRUNCATE = True
 TRUNCATE_CYCLE = None

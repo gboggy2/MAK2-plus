@@ -1445,12 +1445,14 @@ if cycles is not None and fluorescence is not None:
         "Cycles before max slope (post-baseline)",
         min_value=3,
         max_value=25,
-        value=10,
+        value=18,
         step=1,
         help="Start fitting this many cycles before the inflection point "
              "(cycle of maximum slope). Mirrors 'Cycles after max slope'. "
              "Smaller = more focus on exponential rise, less baseline. "
-             "Default: 8."
+             "Default: 18 (matches engine default; with bg_window_size=16, "
+             "more baseline cycles converge faster on hard wells with no "
+             "D0 quality cost)."
     )
 
     cycles_after_max = st.sidebar.slider(

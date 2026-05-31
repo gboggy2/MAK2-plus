@@ -146,7 +146,7 @@ def prepare_fit_inputs(
     fluor_data,
     *,
     first_fit_cycle: float = 3.0,
-    cycles_before_max: int = 15,
+    cycles_before_max: int = 18,
     fit_bounds: dict | None = None,
 ):
     """Run the per-well preprocessing pipeline; return inputs for the optimizer.
@@ -277,7 +277,7 @@ def fit_well(
     fluor_data,
     *,
     first_fit_cycle: float = 3.0,
-    cycles_before_max: int = 15,
+    cycles_before_max: int = 18,
     cycles_after_max: int = 8,
     auto_truncate: bool = True,
     truncate_cycle: float | None = None,
