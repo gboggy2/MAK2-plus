@@ -174,10 +174,15 @@ def prepare_fit_inputs(
     else:
         baseline_end_idx = take_off_idx
 
-    # Background pre-estimation: 12-cycle window ending at baseline_end.
-    # Linearity gate falls back to early-baseline window with iterative
-    # shrink when contaminated (sharp early amps, drift-then-bend curves).
-    bg_window_size = 12
+    # Background pre-estimation: 16-cycle window ending at baseline_end.
+    # Wider windows give a less noise-sensitive linear fit of bg slope /
+    # intercept; the linearity gate below falls back to early-baseline
+    # window with iterative shrink when contamination (sharp early amps,
+    # drift-then-bend curves) makes the wider window non-linear.
+    # Bumped from 12 → 16 after the bg_window_sweep showed median R²
+    # +5e-5, D0 shifts of ~5 % in a consistent direction, and 16 %
+    # *faster* aggregate runtime on the 15 hardest-fitting wells.
+    bg_window_size = 16
     bg_pre_start = max(floor_idx, baseline_end_idx - bg_window_size)
     bg_c = cycles[bg_pre_start:baseline_end_idx]
     bg_f = fluor_data[bg_pre_start:baseline_end_idx]
