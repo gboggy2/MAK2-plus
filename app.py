@@ -2663,6 +2663,88 @@ if 'batch_results' in st.session_state:
         with st.expander("🐛 Full Optimizer Log", expanded=False):
             st.code(_raw_debug[-50000:] if len(_raw_debug) > 50000 else _raw_debug, language='text')
 
+    # ── Pre-compute standard curves so the Excel download (immediately below)
+    # ── sees them on the FIRST render after a fit.
+    #
+    # The full calibration UI section lives further down in this file (line
+    # ~2920, "📐 Standard Curve Calibration"). It calls build_standard_curve
+    # / build_ct_standard_curve and writes the per-channel session-state
+    # keys that the Excel writer reads when building chart_sheets. But
+    # Streamlit renders top-to-bottom, so on the first script execution the
+    # download button below runs BEFORE the calibration block — meaning the
+    # session state is empty on first click and the std-curve tabs are
+    # missing from the downloaded Excel. (On second click the state is
+    # populated from the previous run, which is why "download twice"
+    # appears to work.)
+    #
+    # This precompute block runs the same build_*_curve calls and populates
+    # the session-state keys before the download button reads them. The UI
+    # block further down still renders the charts; it recomputes the same
+    # calibrations (cheap — millisecond-scale) so the chart code path stays
+    # unchanged.
+    _pre_results = st.session_state.get('batch_results')
+    _pre_meta = st.session_state.get('sample_metadata')
+    if _pre_results is not None and _pre_meta is not None and any(
+        m.get('Task') == 'STANDARD' for m in _pre_meta.values()
+    ):
+        from calibration import build_standard_curve, build_ct_standard_curve
+        # Replicate the channel/target grouping logic from the UI block.
+        _pre_df = _pre_results.copy()
+        if 'Channel' not in _pre_df.columns:
+            _derived_ch = _pre_df['Sample'].map(_ch)
+            if _derived_ch[_derived_ch != 'default'].nunique() > 1:
+                _pre_df.insert(0, 'Channel', _derived_ch)
+        _pre_multi_ch = 'Channel' in _pre_df.columns and _pre_df['Channel'].nunique() > 1
+        _pre_multi_tgt = (
+            'Target' in _pre_df.columns and _pre_df['Target'].nunique() > 1
+            and not _pre_multi_ch
+        )
+        if _pre_multi_tgt:
+            _pre_tgts = sorted({m.get('_target', '') for m in _pre_meta.values()
+                                if m.get('Task') == 'STANDARD' and m.get('_target')})
+            _pre_groups = [(None, t) for t in _pre_tgts if t]
+        elif _pre_multi_ch:
+            _pre_groups = [(c, None) for c in _pre_df['Channel'].unique()]
+        else:
+            _pre_groups = [(None, None)]
+        st.session_state['_std_curve_group_keys'] = [
+            (c or t) for c, t in _pre_groups
+        ]
+        for _pc_ch, _pc_tgt in _pre_groups:
+            if _pc_ch is not None:
+                _pc_df = _pre_df[_pre_df['Channel'] == _pc_ch].copy()
+                _pc_meta = {k: v for k, v in _pre_meta.items()
+                            if k.startswith(f"{_pc_ch}_")}
+            elif _pc_tgt is not None:
+                _pc_df = _pre_df[_pre_df['Target'] == _pc_tgt].copy()
+                _pc_meta = {k: v for k, v in _pre_meta.items()
+                            if v.get('_target') == _pc_tgt
+                            or k.startswith(f"{_pc_tgt}::")}
+            else:
+                _pc_df, _pc_meta = _pre_df, _pre_meta
+            _pc_cal = build_standard_curve(_pc_df, _pc_meta)
+            _pc_ct = build_ct_standard_curve(_pc_df, _pc_meta)
+            _pc_key = _pc_ch or _pc_tgt
+            _pc_sfx = f"_{_pc_key}" if _pc_key else ""
+            if _pc_cal is not None:
+                st.session_state[f'_std_curve_d0_df{_pc_sfx}'] = _pc_cal['per_point_data'].copy()
+                st.session_state[f'_std_curve_d0_summary{_pc_sfx}'] = {
+                    'slope': _pc_cal['slope'], 'intercept': _pc_cal['intercept'],
+                    'r_squared': _pc_cal['r_squared'],
+                    'n_standards': _pc_cal['n_standards'],
+                    'n_concentrations': _pc_cal['n_concentrations'],
+                    'median_cf': _pc_cal.get('median_cf', np.nan),
+                }
+            if _pc_ct is not None:
+                st.session_state[f'_std_curve_ct_df{_pc_sfx}'] = _pc_ct['per_point_data'].copy()
+                st.session_state[f'_std_curve_ct_summary{_pc_sfx}'] = {
+                    'slope': _pc_ct['slope'], 'intercept': _pc_ct['intercept'],
+                    'r_squared': _pc_ct['r_squared'],
+                    'efficiency': _pc_ct['efficiency'],
+                    'n_standards': _pc_ct['n_standards'],
+                    'n_concentrations': _pc_ct['n_concentrations'],
+                }
+
     # Prominent download buttons at top of results
     try:
         _xl_results_top = st.session_state['batch_results']
