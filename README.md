@@ -26,7 +26,7 @@ Accurate absolute quantification of pathogens is critical for:
 
 ## ✨ The Solution: MAK2+
 
-**MAK2+ provides ddPCR-equivalent absolute quantification using:**
+**MAK2+ aims to provide ddPCR-comparable absolute quantification (validation in progress) using:**
 - ✅ Your existing qPCR machine (no new hardware!)
 - ✅ Standard qPCR reagents and protocols
 - ✅ Free, open-source computational analysis
@@ -34,7 +34,7 @@ Accurate absolute quantification of pathogens is critical for:
 
 **Cost:** $0 (vs $60,000+)  
 **Time to deploy:** Download and use immediately  
-**Accuracy:** Validation study in progress
+**Accuracy:** Head-to-head validation against ddPCR is ongoing — see the [Validation & Performance](#-validation--performance) section below for study status.
 
 ---
 
@@ -100,10 +100,11 @@ MAK2+ uses **mechanistic kinetic modeling** of the PCR amplification process:
 - Testing across 10¹-10⁷ parasite density range  
 - Multiple species and sample types (cultured + clinical)
 - Collaboration with malaria research laboratory
-- Results expected early 2025
+- Results expected upon study completion
 
 **Status:**
-- Methodology validated against published MAK2 model (Boggy & Woolf, 2010)
+- Methodology builds on the published MAK2 model (Boggy & Woolf, 2010)
+- Head-to-head ddPCR validation is in progress; equivalence has not yet been established
 - Multi-site validation in progress
 - Manuscript in preparation
 
@@ -116,7 +117,7 @@ MAK2+ uses **mechanistic kinetic modeling** of the PCR amplification process:
 We believe precision diagnostics should be accessible to **every laboratory**, regardless of location or resources.
 
 **By making MAK2+ open source:**
-- 🌍 Labs in low-resource settings can access ddPCR-quality quantification
+- 🌍 Labs in low-resource settings can access ddPCR-comparable quantification (pending validation)
 - 🔬 Researchers can verify and improve the methods
 - 📚 Scientists can cite validated, peer-reviewed techniques
 - 🤝 Community contributions accelerate innovation
@@ -153,7 +154,7 @@ If you use MAK2+ in your research, please cite:
 
 **Software:**
 ```
-Boggy, G. (2024). MAK2+: Open-source computational tool for absolute 
+Boggy, G. (2026). MAK2+: Open-source computational tool for absolute 
 nucleic acid quantification. GitHub. https://github.com/gboggy2/MAK2-plus
 ```
 
@@ -171,17 +172,17 @@ https://doi.org/10.1371/journal.pone.0012355
 
 ---
 
-## 🏆 Recognition & Support
+## 🌱 Initiative & Status
 
-This project is part of the **Open Diagnostics Initiative** (nonprofit in formation), working to democratize access to molecular diagnostics globally.
+This project is being developed as part of a forming initiative — the aspiring **Open Diagnostics Initiative** — with the long-term goal of democratizing access to molecular diagnostics globally. The organization is not yet incorporated and has no external recognition or funding at this stage.
 
 **Current status:** Beta (actively seeking validation partners and feedback)
 
-**Future funding:** Grant applications in preparation to:
-- Validate across multiple pathogen types
-- Deploy in malaria-endemic countries
-- Provide training and support
-- Expand to TB, HIV, and other critical diagnostics
+**Future funding:** Grant applications are being prepared, with the aim of supporting:
+- Validation across multiple pathogen types
+- Deployment in malaria-endemic countries
+- Training and support
+- Expansion to TB, HIV, and other critical diagnostics
 
 **Interested in partnering?** Contact gjboggy@gmail.com
 
@@ -217,25 +218,27 @@ Email gjboggy@gmail.com with subject "MAK2+ Collaboration"
 - **Built with:** Python, Streamlit, SciPy, NumPy, Plotly
 
 **Developed by:** Gregory Boggy, Ph.D.  
-**Organization:** Open Diagnostics Initiative (nonprofit in formation)
+**Affiliation:** Open Diagnostics Initiative (aspiring nonprofit, not yet incorporated)
 
 ---
 
 ## 🗺️ Roadmap
 
-**Current (December 2024 - March 2025):**
+*Project started January 2026.*
+
+**Current phase (2026, in progress):**
 - ✅ Core MAK2+ implementation complete
 - ✅ Web interface deployed
 - 🔄 ddPCR validation study (seeking partners)
 - 🔄 Manuscript preparation
 
-**Next (Q2-Q3 2025):**
+**Next (near-term):**
 - 📊 Bootstrap confidence intervals
 - 🌐 Multi-language support (French, Spanish, Portuguese)
 - 🧪 Batch processing improvements
 - 📱 Mobile interface optimization
 
-**Vision (2025-2026):**
+**Longer-term vision:**
 - 🌍 Global deployment in endemic countries
 - 🔬 Expanded pathogen validation (TB, HIV)
 - 🤝 Partnerships with global health organizations
